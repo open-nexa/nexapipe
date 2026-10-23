@@ -1457,4 +1457,132 @@ mod tests {
         assert!(over.is_none(), "the body is over");
         assert_eq!(budget.held(), 0, "the refused bytes are given back");
     }
+
+    /// A body whose first poll holds until it is let go.
+    ///
+    /// The reader is only out of the cell between one `take` and its
+    /// `put_back`, and the two sit inside a single synchronous poll — so the
+    /// only way another task finds the cell empty is if it polls while this
+    /// one is inside its poll. Holding the poll open is what makes that
+    /// window certain rather than a race.
+    struct BlockingBody {
+        /// Tells the other side that the reader is held.
+        entered: std::sync::mpsc::Sender<()>,
+        /// Lets the poll go on.
+        release: std::sync::mpsc::Receiver<()>,
+        /// Whether the next poll is the one that waits.
+        waits: bool,
+    }
+
+    impl hyper::body::Body for BlockingBody {
+        type Data = bytes::Bytes;
+        type Error = std::io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            if self.waits {
+                self.waits = false;
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+            }
+            Poll::Ready(None)
+        }
+    }
+
+    /// A second poller **waits** for the reader, and is woken when it comes
+    /// back.
+    ///
+    /// The reader is shared between the owner of a request and the copy the
+    /// request carries, and the retry path can have both alive at once. The
+    /// second one must not park a worker thread on a lock: it registers its
+    /// waker and is woken when the holder puts the reader back.
+    ///
+    /// That is the behaviour the cell exists for, and it is the one that was
+    /// not covered: the reader is only out of the cell for the length of one
+    /// synchronous poll, so the window is made wide on purpose — the body
+    /// above holds its poll until it is let go — and the assertions are that
+    /// the second poller is *waiting* and that it is woken rather than left
+    /// asleep.
+    #[tokio::test]
+    async fn a_second_poller_waits_for_the_reader_and_is_woken_when_it_comes_back() {
+        use std::future::Future;
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let budget = Arc::new(crate::conn::limits::ByteBudget::new(1024));
+        let body = Arc::new(IncomingBody::with_budget(
+            BlockingBody {
+                entered: entered_tx,
+                release: release_rx,
+                waits: true,
+            },
+            Duration::from_secs(60),
+            budget,
+        ));
+
+        // The holder takes the reader and keeps it inside its poll. It runs
+        // on a thread of its own, because the poll it is holding blocks.
+        let held = body.clone();
+        let holder = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("a runtime");
+            rt.block_on(async move {
+                let mut lent = held.lend();
+                lent.frame().await
+            })
+        });
+
+        // Wait until the reader is held.
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the reader is held");
+
+        // The second poller finds the cell empty. Its first poll is made
+        // explicitly, so that the waker the cell keeps is this task's own:
+        // a waker that is not the task's would wake nothing.
+        let (polled_tx, polled_rx) = tokio::sync::oneshot::channel();
+        let waiting = body.clone();
+        let waiter = tokio::spawn(async move {
+            let mut lent = waiting.lend();
+            let mut frame = Box::pin(lent.frame());
+            let mut polled_tx = Some(polled_tx);
+            let first = std::future::poll_fn(|cx| {
+                let polled = frame.as_mut().poll(cx);
+                // Tell the other side that the cell was found empty.
+                if let Some(tx) = polled_tx.take() {
+                    let _ = tx.send(());
+                }
+                Poll::Ready(polled)
+            })
+            .await;
+            match first {
+                Poll::Pending => frame.await,
+                Poll::Ready(value) => value,
+            }
+        });
+
+        // The poll happened, and the reader was not there.
+        tokio::time::timeout(Duration::from_secs(5), polled_rx)
+            .await
+            .expect("the second poller polled")
+            .expect("the second poller said so");
+        assert!(
+            !waiter.is_finished(),
+            "the second poller is waiting for the reader"
+        );
+
+        // The reader comes back, and the waiting task is woken.
+        release_tx.send(()).expect("the holder is let go");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiting task is woken")
+            .expect("the task finished");
+        assert!(outcome.is_none(), "the body is over");
+
+        holder.join().expect("the holder finished");
+    }
 }

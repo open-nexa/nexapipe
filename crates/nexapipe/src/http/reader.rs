@@ -4,12 +4,18 @@
 //! that carries it is shared by the request that owns the body and by the copy
 //! the request carries.
 //!
-//! **The share must not cost a thread.** A `std::sync::Mutex` taken inside a
-//! poll parks the worker thread every other task on that runtime is scheduled
-//! on, and the reader is held for the length of a poll. So the reader
-//! **leaves the cell** instead of being locked in it: the task that has it
-//! owns it outright, and a task that finds the cell empty registers its
-//! waker and is woken when the holder puts the reader back.
+//! **The share must not cost a thread.** A `std::sync::Mutex` held for the
+//! length of a poll parks the worker thread every other task on that runtime
+//! is scheduled on. So the reader **leaves the cell** instead of being locked
+//! in it: the task that has it owns it outright, and a task that finds the
+//! cell empty registers its waker and is woken when the holder puts the
+//! reader back.
+//!
+//! What this promises is that the lock is **never held across the poll of
+//! the body**: the cell's own lock is still taken, but only for the swap —
+//! nanoseconds — and never while the body is being read. A task that finds
+//! the cell empty does not take the lock at all; it registers its waker and
+//! waits to be woken.
 
 use std::sync::MutexGuard;
 use std::task::{Context, Waker};
