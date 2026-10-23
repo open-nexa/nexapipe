@@ -52,7 +52,8 @@ refused, the price of a second connection is measured now — it comes to a
 handshake, the protocol is chosen at the handshake, the pool's ceiling
 is counted per protocol, and the tunnel path runs on hyper's own HTTP/1
 codec, and a TLS hello that arrives in pieces is read until it is whole, and
-every JNI entry point catches a panic before it leaves the frame, and the TLS tunnel half-closes in both directions.
+the TLS tunnel half-closes in both directions, and every JNI entry point
+catches a panic before it leaves the frame.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -1080,6 +1081,22 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **Every JNI entry point catches a panic.** A panic that unwinds out of an
+  `extern "system"` frame is a native crash on Android, not a Java exception:
+  the process dies, and the user sees the VPN simply disappear rather than one
+  call failing. The module had the two barriers for this — `catching_panic` and
+  `with_env_or` — and most of the thirty-three entry points used them, but five
+  did not: `nativeDropConnections` and `nativePreconnect` caught only the part
+  of their body that blocks on the runtime, `nativeDestroy` caught the endpoint
+  close but not the rest of the teardown, and `nativeClearNodes` and
+  `nativeClearNodeTwoFactor` had no barrier at all.
+  Each of the five now wraps its whole body in the module's own barrier and
+  answers the failure value the module's convention says it answers with, and
+  the entry points that already had a whole-body barrier no longer catch
+  twice: every entry point has exactly one barrier, at the top. The reason a
+  panic happened is left behind as well, so the app can read it back through
+  `nativeTakeLastError`.
+
 - **The TLS tunnel half-closes in both directions.** The tunnel's two
   directions were raced against each other with a `select!`, and `select!`
   cancels the branch that loses the race. A client that shut its write side
@@ -1468,21 +1485,6 @@ lookup, which is what a config written before the key existed does.
   remembering to close, and the Kotlin side closes the descriptor only in the
   one case where it is still its own: a native method that was never entered
   at all.
-- **Every JNI entry point catches a panic.** A panic that unwinds out of an
-  `extern "system"` frame is a native crash on Android, not a Java exception:
-  the process dies, and the user sees the VPN simply disappear rather than one
-  call failing. The module had the two barriers for this — `catching_panic` and
-  `with_env_or` — and most of the thirty-three entry points used them, but five
-  did not: `nativeDropConnections` and `nativePreconnect` caught only the part
-  of their body that blocks on the runtime, `nativeDestroy` caught the endpoint
-  close but not the rest of the teardown, and `nativeClearNodes` and
-  `nativeClearNodeTwoFactor` had no barrier at all.
-  Each of the five now wraps its whole body in the module's own barrier and
-  answers the failure value the module's convention says it answers with, and
-  the entry points that already had a whole-body barrier no longer catch
-  twice: every entry point has exactly one barrier, at the top. The reason a
-  panic happened is left behind as well, so the app can read it back through
-  `nativeTakeLastError`.
 
 ### Security
 
