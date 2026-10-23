@@ -371,6 +371,10 @@ fn owning_pid(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> Opti
     };
     use windows_sys::Win32::Networking::WinSock::AF_INET;
 
+    /// What the call says when the buffer it was given is too small, and the
+    /// size it needs now is in the out-parameter.
+    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
     let local_address = ipv4_in_table_order(local.ip())?;
     let remote_address = ipv4_in_table_order(remote.ip())?;
     // The table keeps the ports in network byte order, in a 32-bit word: the
@@ -405,9 +409,7 @@ fn owning_pid(local: std::net::SocketAddr, remote: std::net::SocketAddr) -> Opti
     // the answer is taken as no: this runs for every IPC connection, and a
     // machine with ordinary connection churn would otherwise refuse a
     // legitimate client now and then.
-    const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
-
-    let mut buffer: Vec<u32> = Vec::new();
+    let mut buffer: Vec<u32>;
     let mut attempts = 0;
     loop {
         buffer = vec![0u32; (size as usize).div_ceil(std::mem::size_of::<u32>())];
