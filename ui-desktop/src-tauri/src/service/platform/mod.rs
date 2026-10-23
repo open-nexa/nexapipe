@@ -15,9 +15,13 @@
 pub const SERVICE_NAME: &str = "nexa-service";
 pub const SERVICE_DISPLAY_NAME: &str = "Nexa Service";
 
+pub mod account;
+pub mod install_owner;
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
+use crate::service::platform::account::AccountId;
 
 /// What the service manager says about the service — the three states the UI shows and the ones
 /// that decide which of install / start / stop / uninstall is offered.
@@ -59,7 +63,7 @@ use crate::service::elevate;
 /// Registers the service and starts it.
 pub fn install_service() -> Result<(), AppError> {
     #[cfg(windows)]
-    return install();
+    return install(account::AccountId::current());
 
     #[cfg(not(windows))]
     return install_elevated();
@@ -185,10 +189,71 @@ use windows::*;
 fn install_elevated() -> Result<(), AppError> {
     if elevate::is_privileged() {
         let exe_path = current_exe_string()?;
-        return dispatch_install(&exe_path);
+        let installing_by = installing_account();
+        return dispatch_install(&exe_path, installing_by.as_ref());
     }
 
-    elevate::run_self_elevated(&["--install"])
+    // The account the service is being installed for, named on the command
+    // line of the elevated child. The child cannot work it out for itself: it
+    // runs as root, and so does the account that asked for the elevation as
+    // far as the child is concerned.
+    let mut args: Vec<String> = vec!["--install".to_string()];
+    if let Some(account) = AccountId::current() {
+        args.push(elevate::INSTALL_AS_ARG.to_string());
+        args.push(account.to_text());
+    }
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    elevate::run_self_elevated(&borrowed)
+}
+
+/// The account the service is being installed for, as far as this process can
+/// tell.
+///
+/// The elevated child is told on the command line; failing that, the elevation
+/// channel says so itself — `pkexec` sets `PKEXEC_UID` and `sudo` sets
+/// `SUDO_UID`, both to the user id of the account that asked for the
+/// elevation, and neither can be set by anybody but the channel itself.
+///
+/// `None` when nothing says, and then the service is installed without an
+/// account to serve: it falls back to serving the account that owns the token
+/// it reads, and says so loudly.
+#[cfg(not(windows))]
+fn installing_account() -> Option<AccountId> {
+    installing_account_from_args(std::env::args_os().skip(1)).or_else(installing_account_from_env)
+}
+
+/// The account named on the command line, if any.
+///
+/// Public so that the parsing can be checked on any platform, including the
+/// ones whose elevation channel has no environment variable to fall back on.
+pub fn installing_account_from_args<I>(args: I) -> Option<AccountId>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        if arg.as_os_str() == std::ffi::OsStr::new(elevate::INSTALL_AS_ARG) {
+            return args
+                .next()
+                .and_then(|value| value.to_str().and_then(AccountId::parse));
+        }
+    }
+    None
+}
+
+/// The account the elevation channel says asked for it.
+#[cfg(unix)]
+fn installing_account_from_env() -> Option<AccountId> {
+    for name in ["PKEXEC_UID", "SUDO_UID"] {
+        let Ok(value) = std::env::var(name) else {
+            continue;
+        };
+        if let Ok(uid) = value.trim().parse::<u32>() {
+            return Some(AccountId::Unix(uid));
+        }
+    }
+    None
 }
 
 #[cfg(not(windows))]
@@ -255,17 +320,17 @@ fn current_exe_string() -> Result<String, AppError> {
 }
 
 #[cfg(target_os = "linux")]
-fn dispatch_install(exe_path: &str) -> Result<(), AppError> {
-    install_service_linux(exe_path)
+fn dispatch_install(exe_path: &str, installing_by: Option<&AccountId>) -> Result<(), AppError> {
+    install_service_linux(exe_path, installing_by)
 }
 
 #[cfg(target_os = "macos")]
-fn dispatch_install(exe_path: &str) -> Result<(), AppError> {
-    install_service_macos(exe_path)
+fn dispatch_install(exe_path: &str, installing_by: Option<&AccountId>) -> Result<(), AppError> {
+    install_service_macos(exe_path, installing_by)
 }
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
-fn dispatch_install(_exe_path: &str) -> Result<(), AppError> {
+fn dispatch_install(_exe_path: &str, _installing_by: Option<&AccountId>) -> Result<(), AppError> {
     Err(AppError::new(codes::SERVICE_UNSUPPORTED_PLATFORM))
 }
 

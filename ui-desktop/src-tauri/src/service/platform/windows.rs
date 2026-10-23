@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use super::{sc_state, ScState, ServiceState, SERVICE_DISPLAY_NAME, SERVICE_NAME};
 use crate::error::{codes, AppError};
+use crate::service::platform::account::AccountId;
+use crate::service::platform::install_owner;
 
 /// Text `services.msc` shows for the entry.
 const SERVICE_DESCRIPTION: &str =
@@ -68,7 +70,7 @@ enum Escalation {
     OnAccessDenied,
 }
 
-pub fn install() -> Result<(), AppError> {
+pub fn install(installing_by: Option<AccountId>) -> Result<(), AppError> {
     let bin_path = bin_path_value(&service_binary()?);
 
     // Whatever is already running has to go first — see [`stop_if_running`]. Done before
@@ -83,7 +85,7 @@ pub fn install() -> Result<(), AppError> {
     run(
         |log| {
             let redirect = format!("> \"{}\" 2>&1", log.display());
-            vec![
+            let mut lines = vec![
                 format!("sc.exe query {SERVICE_NAME} >nul 2>&1"),
                 format!(
                     "if errorlevel 1 (sc.exe create {SERVICE_NAME} binPath= \"{bin_path}\" start= auto DisplayName= \"{SERVICE_DISPLAY_NAME}\" {redirect}) else (sc.exe config {SERVICE_NAME} binPath= \"{bin_path}\" start= auto {redirect})"
@@ -91,13 +93,34 @@ pub fn install() -> Result<(), AppError> {
                 "if errorlevel 1 exit /b %errorlevel%".to_string(),
                 format!("sc.exe description {SERVICE_NAME} \"{SERVICE_DESCRIPTION}\""),
                 "if errorlevel 1 exit /b %errorlevel%".to_string(),
+            ];
+
+            // Which account this service is installed for, kept in the service's own
+            // registry key: the one place on Windows that only SYSTEM and the
+            // administrators may write, so the unprivileged desktop cannot move the
+            // service onto another account. Written after the key exists and before the
+            // service starts, because the service reads it as it comes up.
+            match installing_by.as_ref() {
+                Some(account) => {
+                    lines.push(install_owner::record_command(account));
+                    lines.push("if errorlevel 1 exit /b %errorlevel%".to_string());
+                }
+                None => tracing::warn!(
+                    "Installing the service without naming the account it is for: it will serve \
+                     any local account that owns the token it reads"
+                ),
+            }
+
+            lines.extend([
                 format!("sc.exe start {SERVICE_NAME}"),
                 // Nothing should be up at this point — [`stop_if_running`] brought the old
                 // process down first — so 1056 means the service was started again by
                 // something else, which is still the state the install asked for.
                 tolerate(ALREADY_RUNNING),
                 "exit /b %errorlevel%".to_string(),
-            ]
+            ]);
+
+            lines
         },
         "service install",
         Escalation::Always,
