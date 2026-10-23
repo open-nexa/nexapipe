@@ -2,7 +2,7 @@ use crate::ClientError;
 use crate::connection_pool::IrohConnectionPool;
 use crate::endpoint_group::EndpointGroup;
 use crate::flow::{FlowKind, FlowMeta};
-use crate::http::{is_websocket_request_static, parse_http_request_legacy};
+use crate::http::{Body, is_websocket_request_static, parse_http_request_legacy};
 use nexapipe_proto::protocol::Protocol;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -1047,6 +1047,38 @@ where
     }
 
     // Regular HTTP path
+    //
+    // **The bytes that came with the head are the body's, or they are a
+    // second request.**
+    //
+    // The head says which: a request that declares a body has one, and the
+    // bytes that came with the head are its first ones. A request that
+    // declares no body has none, so the bytes that came with the head are
+    // the head of another request.
+    //
+    // The server serves keep-alive requests on one stream, so a second
+    // request that reaches it is answered by it — while the list of proxied
+    // domains, which is the boundary the user believes they have, was
+    // consulted about the first request only. A name the user excluded would
+    // go through the tunnel anyway.
+    //
+    // So the second request is refused here rather than forwarded: the
+    // refusal says what happened, and it happens before anything is on its
+    // way to the backend. Letting the server answer it would leave the
+    // boundary in the server's hands, where the user's list is not the rule
+    // that applies.
+    let mut body = Body::declared(&request);
+    let carried = &request_buf[header_end..];
+    let carried_body = body.take(carried);
+    if carried_body < carried.len() {
+        jni_log!(
+            "[local-proxy] refusing a request that carries a second request: {} bytes of another \
+             request came with the head of this one",
+            carried.len() - carried_body
+        );
+        return write_proxy_error(&mut stream, "400 Bad Request").await;
+    }
+
     // The hop-by-hop headers go, and so do the cache validation headers that
     // would make the origin answer with a 304 and an empty body.
     let filtered_headers = filter_request_headers(&request_buf[..header_end], false);
@@ -1087,15 +1119,39 @@ where
     let client_to_backend = async move {
         let mut buf = header_buf;
         loop {
+            // The request is out: the head has gone, and the body with it.
+            // Nothing else may follow it on this connection.
+            if body.is_complete() {
+                break;
+            }
             match client_read.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    if let Err(e) = send.write_all(&buf[..n]).await {
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!("Client to backend write error: {}", e);
+                    // **Only the body's own bytes go on.**
+                    //
+                    // The bytes past the body are not the body's: they are
+                    // the head of another request, and the list of proxied
+                    // domains was consulted about the first one only. So
+                    // they are not relayed — the connection is refused
+                    // instead, which is what the refusal at the head does
+                    // with a request that arrives carrying another one.
+                    let body_bytes = body.take(&buf[..n]);
+                    if body_bytes > 0 {
+                        if let Err(e) = send.write_all(&buf[..body_bytes]).await {
+                            #[cfg(feature = "tracing")]
+                            tracing::debug!("Client to backend write error: {}", e);
+                            break;
+                        }
+                        count_to_backend.record_sent(body_bytes as u64);
+                    }
+                    if body_bytes < n {
+                        jni_log!(
+                            "[local-proxy] refusing a second request on a connection that carries one \
+                             request: {} bytes of another request came after the body",
+                            n - body_bytes
+                        );
                         break;
                     }
-                    count_to_backend.record_sent(n as u64);
                 }
                 Err(e) => {
                     #[cfg(feature = "tracing")]
@@ -1104,6 +1160,9 @@ where
                 }
             }
         }
+        // The request is over, and the server is told so. The stream it
+        // serves the request on ends with the answer, and the connection
+        // this handler holds ends with it: one request, one connection.
         let _ = send.finish();
     };
 
@@ -1208,6 +1267,12 @@ where
     // iroh connection is released immediately. Aborting also closes the client
     // TCP socket (HTTP/1.1 allows the server to close after the response),
     // so a keep-alive client socket can't pin this task.
+    //
+    // **One request, one connection.** The client is told so by the close:
+    // the request it sent is the only one this connection carries, and a
+    // client that wants another one opens another connection. The list of
+    // proxied domains is checked per request, and this is what makes the
+    // check mean what it says.
     client_task.abort();
 
     jni_log!("[DEBUG:local-proxy] Connection closed");
