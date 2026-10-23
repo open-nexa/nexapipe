@@ -1122,8 +1122,9 @@ mod tests {
     /// credential is a block the credential survived in.
     mod heap {
         use std::alloc::{GlobalAlloc, Layout, System};
+        use std::fmt;
         use std::sync::Mutex;
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         /// The bytes the probe is watching for.
         ///
@@ -1150,6 +1151,12 @@ mod tests {
 
         /// Whether the needle was seen in a block on its way out.
         static FOUND: AtomicBool = AtomicBool::new(false);
+
+        /// The size of the block the needle was seen in.
+        static FOUND_SIZE: AtomicUsize = AtomicUsize::new(0);
+
+        /// The offset of the needle in that block.
+        static FOUND_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
         /// The allocator that watches.
         struct Probe;
@@ -1184,7 +1191,7 @@ mod tests {
         /// never written, and a reference to it would be a reference to
         /// uninitialized memory.
         fn scan(ptr: *mut u8, len: usize) {
-            if !WATCHING.load(Ordering::Relaxed) || len < NEEDLE.len() {
+            if len < NEEDLE.len() {
                 return;
             }
             let needle = NEEDLE.as_bytes();
@@ -1203,20 +1210,62 @@ mod tests {
                     }
                 }
                 if matched {
+                    if std::env::var_os("NEXAPIPE_HEAP_TRACE").is_some() {
+                        eprintln!(
+                            "PROBE: needle in a freed block of {len} bytes at offset {start} (watching={})",
+                            WATCHING.load(Ordering::Relaxed)
+                        );
+                    }
                     FOUND.store(true, Ordering::SeqCst);
+                    FOUND_SIZE.store(len, Ordering::SeqCst);
+                    FOUND_OFFSET.store(start, Ordering::SeqCst);
                     return;
                 }
             }
         }
 
-        /// Runs `body` with the heap watched, and says whether the needle was
-        /// left behind in it.
-        pub fn watched<R>(body: impl FnOnce() -> R) -> bool {
+        /// Where the needle was found.
+        ///
+        /// The size of the block and the offset of the needle in it: the two
+        /// numbers that say which allocation it was. A block of a few dozen
+        /// bytes is a secret's own string; a block of a few thousand is a
+        /// buffer a message was written into.
+        #[derive(Debug)]
+        pub struct Residue {
+            /// The size of the block the needle was found in.
+            pub size: usize,
+            /// The offset of the needle in that block.
+            pub offset: usize,
+        }
+
+        impl fmt::Display for Residue {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(
+                    f,
+                    "a block of {} bytes, the credential {} bytes into it",
+                    self.size, self.offset
+                )
+            }
+        }
+
+        /// Runs `body` with the heap watched, and says what was left behind.
+        ///
+        /// `None` is the answer a test wants: nothing that holds the needle
+        /// was let go without being wiped. `Some` says where the needle was
+        /// found.
+        pub fn watched<R>(body: impl FnOnce() -> R) -> Option<Residue> {
             WATCHING.store(true, Ordering::SeqCst);
             FOUND.store(false, Ordering::SeqCst);
             body();
             WATCHING.store(false, Ordering::SeqCst);
-            !FOUND.load(Ordering::SeqCst)
+            if FOUND.load(Ordering::SeqCst) {
+                Some(Residue {
+                    size: FOUND_SIZE.load(Ordering::SeqCst),
+                    offset: FOUND_OFFSET.load(Ordering::SeqCst),
+                })
+            } else {
+                None
+            }
         }
     }
 
@@ -1461,7 +1510,7 @@ mod tests {
             public_key: None,
         };
 
-        let clean = heap::watched(|| {
+        let residue = heap::watched(|| {
             // Every form a message travels in, and the message itself.
             drop(start.to_bytes().expect("serializable"));
             drop(start.to_payload(Format::Json).expect("writable"));
@@ -1478,8 +1527,12 @@ mod tests {
         });
 
         assert!(
-            clean,
-            "the credential was still in a freed block of the heap"
+            residue.is_none(),
+            "the credential was still in a freed block of the heap: {}",
+            residue
+                .as_ref()
+                .map(heap::Residue::to_string)
+                .unwrap_or_default()
         );
     }
 
@@ -1506,7 +1559,7 @@ mod tests {
             public_key: None,
         };
 
-        let clean = heap::watched(|| {
+        let residue = heap::watched(|| {
             let result = start.to_payload(Format::Binary);
             assert!(result.is_err(), "the message is too long to be written");
             drop(result);
@@ -1514,8 +1567,13 @@ mod tests {
         });
 
         assert!(
-            clean,
-            "the credential was still in a freed block of the heap after the serialization failed"
+            residue.is_none(),
+            "the credential was still in a freed block of the heap after the \
+             serialization failed: {}",
+            residue
+                .as_ref()
+                .map(heap::Residue::to_string)
+                .unwrap_or_default()
         );
     }
 
@@ -1561,14 +1619,18 @@ mod tests {
         binary.extend_from_slice(&6u32.to_le_bytes());
         binary.extend_from_slice(&30u64.to_le_bytes());
 
-        let clean = heap::watched(|| {
+        let residue = heap::watched(|| {
             drop(AuthMessage::from_bytes(json.as_bytes()).expect("the JSON form parses"));
             drop(AuthMessage::from_payload(&binary).expect("the binary form parses"));
         });
 
         assert!(
-            clean,
-            "the credential was still in a freed block of the heap"
+            residue.is_none(),
+            "the credential was still in a freed block of the heap: {}",
+            residue
+                .as_ref()
+                .map(heap::Residue::to_string)
+                .unwrap_or_default()
         );
     }
 
