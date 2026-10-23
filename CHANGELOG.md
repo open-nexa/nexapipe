@@ -1091,6 +1091,49 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **A device that had just registered was left without a working connection.**
+  The enrollment already ends with the ordinary handshake, on the stream the
+  enrollment was made on: the server reads `ENROLL_START` and `AUTH_START` in
+  order off one bi-stream. The client fell through to the ordinary handshake
+  as well and opened a *second* stream for it, and the server serves a second
+  stream as data — so the `AUTH_START` bytes on it were parsed as an HTTP
+  request and the connection was closed with `invalid HTTP method parsed`.
+  The enrollment had succeeded and the connection died with it, and nothing
+  said which of the two had gone wrong.
+
+  The connection the enrollment was made on is the connection it
+  authenticated, and it is used as one: there is no second handshake after
+  it, on that stream or on any other.
+
+- **A registration invite that had not been answered yet read as "2FA off".**
+  A node waiting to enroll has no credential yet, but it is not off either:
+  the token is armed, and the next connect trades it for one. Reading it as
+  "off" is what made a scanned invite look like it had not been applied at
+  all — on the phone as well as on the desktop.
+
+  The 2FA state is a pure function of the credential and the enrollment now,
+  and it has three states rather than two: off, pending and on. A pending
+  enrollment says so, and the switch is left alone while one is pending — it
+  cannot be toggled into a credential that does not exist yet.
+
+- **The device key belonged to the endpoint rather than to the device.** The
+  server files a credential under a device *name*, and the name belongs to
+  the device: the endpoint is a server, it is named by the Node ID of the
+  backend, and that changes when the backend is rebuilt. A key filed per
+  endpoint is therefore a key that changes with the server, and a device
+  that came back to a rebuilt server with a different key was a different
+  device to it — the server saw the same name with another public half and
+  refused the enrollment as a takeover, for a reason that names nothing on
+  this side.
+
+  The key is kept once, for the device: the endpoint's own key when it
+  enrolled with one — the key the server holds under the device's name, and
+  it is never replaced — and the device's key for every endpoint that has
+  none. A device with no key of its own yet adopts the one an endpoint
+  enrolled with, which is the key the server already knows. The public half
+  a node is shown is still the one it enrolled with: the device's key is
+  offered to a server, not issued to a node.
+
 - **The elevated service names the account that dialled it.** The IPC ran on a
   loopback TCP port, and a loopback port says nothing about who connected:
   `SO_PEERCRED` on a TCP socket succeeds and fills the uid in with `-1`, and
