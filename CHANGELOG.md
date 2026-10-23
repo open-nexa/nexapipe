@@ -1095,6 +1095,21 @@ lookup, which is what a config written before the key existed does.
   coalesced the upgrade and the frame lost it.
 
   Both branches forward the bytes now.
+- **The desktop app's check that its commands are granted to the webview runs
+  when the command list changes.** The check reads the
+  `tauri::generate_handler!` list out of `src/lib.rs` and fails the build when a
+  command is not granted in `permissions/app-commands.toml` and
+  `capabilities/default.json`. It did not run when `src/lib.rs` changed. The
+  build script tells Cargo which files it watches, and from the moment it names
+  one, Cargo re-runs the script for those files and for nothing else — the
+  default "re-run when anything in the package changes" is gone. `src/lib.rs`
+  was not among the files it named, so the check saw the command list as it was
+  when the script last ran, and a command added without its permission reached
+  the next release unnoticed, which is the failure this check was written to
+  catch.
+
+  The file is watched now, the way the error-code check beside it already
+  watches its own inputs.
 
 - **The client and the server read the name inside a TLS `ClientHello` the
   same way now.** They each had a reader of their own, and the two did not
