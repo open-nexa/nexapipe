@@ -462,11 +462,20 @@ pub(super) const EMPTY: &str = "Empty";
 pub(super) const DNS_BACKUP_PATH: &str = "/Library/Application Support/nexapipe/dns-backup.json";
 
 #[cfg(target_os = "macos")]
-pub(super) fn set_system_dns_macos(dns_ip: &str) -> Result<()> {
-    let services = network_services()?;
+pub(super) fn set_system_dns_macos(dns_ip: &str) -> Result<DnsHijack, DnsHijackFailure> {
+    let services = match network_services() {
+        Ok(services) => services,
+        Err(e) => {
+            // Nothing was touched: the services could not even be listed.
+            return Err(DnsHijackFailure {
+                hijack: DnsHijack::None,
+                error: e,
+            });
+        }
+    };
     if services.is_empty() {
         tracing::warn!("No network services found via networksetup");
-        return Ok(());
+        return Ok(DnsHijack::Global);
     }
 
     // Recorded before the first service is touched. A process that is killed or
@@ -499,12 +508,21 @@ pub(super) fn set_system_dns_macos(dns_ip: &str) -> Result<()> {
         }
     }
     if hijacked == 0 {
-        anyhow::bail!(
-            "no network service points at {} — DNS hijack is NOT in effect",
-            dns_ip
-        );
+        // The services were written before this point was reached: some of
+        // them may carry the TUN address even though the read-back does not
+        // show it — a service whose DNS could not be read back at all counts
+        // as none. The hijack is therefore reported as installed, so the
+        // caller takes it back; the backup that was written before the first
+        // service was touched is what puts the machine's own DNS back.
+        return Err(DnsHijackFailure {
+            hijack: DnsHijack::Global,
+            error: anyhow::anyhow!(
+                "no network service points at {} — DNS hijack is NOT in effect",
+                dns_ip
+            ),
+        });
     }
-    Ok(())
+    Ok(DnsHijack::Global)
 }
 
 #[cfg(target_os = "macos")]

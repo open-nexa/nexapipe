@@ -243,7 +243,10 @@ pub(super) fn parse_resolvectl_domains(output: &str) -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn set_system_dns_linux(interface: &str, dns_ip: &str) -> Result<()> {
+pub(super) fn set_system_dns_linux(
+    interface: &str,
+    dns_ip: &str,
+) -> Result<DnsHijack, DnsHijackFailure> {
     // Prefer resolvectl (systemd-resolved) to rewriting /etc/resolv.conf: the link
     // keeps the machine's own resolver configuration for the restore to hand back.
     // The TUN resolver answers the proxied domains itself and forwards the rest
@@ -298,7 +301,7 @@ pub(super) fn set_system_dns_linux(interface: &str, dns_ip: &str) -> Result<()> 
                                     interface
                                 ),
                             }
-                            return Ok(());
+                            return Ok(DnsHijack::Global);
                         }
                         Err(e) => {
                             tracing::warn!(
@@ -364,21 +367,35 @@ pub(super) fn set_system_dns_linux(interface: &str, dns_ip: &str) -> Result<()> 
             e
         );
     }
-    std::fs::write("/etc/resolv.conf", format!("nameserver {}\n", dns_ip))
-        .map_err(|e| anyhow::anyhow!("Failed to write /etc/resolv.conf: {}", e))?;
+    std::fs::write("/etc/resolv.conf", format!("nameserver {}\n", dns_ip)).map_err(|e| {
+        // The file was truncated by the write that failed, so the machine is
+        // left without a resolver — and the backup taken just above is what
+        // puts one back. The hijack is therefore reported as installed: the
+        // caller has to undo it.
+        DnsHijackFailure {
+            hijack: DnsHijack::Global,
+            error: anyhow::anyhow!("Failed to write /etc/resolv.conf: {}", e),
+        }
+    })?;
 
     let written = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
     if !resolv_conf_nameservers(&written)
         .iter()
         .any(|server| server == dns_ip)
     {
-        anyhow::bail!(
-            "/etc/resolv.conf does not name {} — DNS hijack is NOT in effect",
-            dns_ip
-        );
+        // The file names something else — the hijack is not in effect, but the
+        // machine's own resolver is not in it either, so it is taken back
+        // rather than left as it is.
+        return Err(DnsHijackFailure {
+            hijack: DnsHijack::Global,
+            error: anyhow::anyhow!(
+                "/etc/resolv.conf does not name {} — DNS hijack is NOT in effect",
+                dns_ip
+            ),
+        });
     }
     tracing::info!("Wrote /etc/resolv.conf with nameserver {}", dns_ip);
-    Ok(())
+    Ok(DnsHijack::Global)
 }
 
 #[cfg(target_os = "linux")]
