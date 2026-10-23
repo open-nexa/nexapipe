@@ -135,8 +135,15 @@ const versionUnknown = computed(
 /// The comparison the panel cannot make any other way once the IPC is down: the service that
 /// cannot answer is exactly the one whose version has to be read from the record the install
 /// left behind.
+///
+/// The record says which build was *registered*, and it is the right answer only when the
+/// service cannot speak for itself: a service that is answering has already said which build
+/// it is, and a record left behind by a service that was removed out of band asserts a drift
+/// on a machine that has no service at all.
 const installedVersionMismatch = computed(
   () =>
+    state.value !== "not_installed" &&
+    !serviceRunning.value &&
     appVersion.value !== "" &&
     installedVersion.value !== null &&
     installedVersion.value !== appVersion.value,
@@ -162,7 +169,9 @@ const needsUpgrade = computed(
 );
 
 const needsUpgradeMessage = computed(() => {
-  if (serviceVersion.value) {
+  // On the *mismatch*, not on any answer: a service that reported this app's own build is
+  // not a mismatch, and saying so with the same string on both sides reads as nonsense.
+  if (versionMismatch.value) {
     return t("service.versionMismatch", { service: serviceVersion.value, app: appVersion.value });
   }
   if (installedVersionMismatch.value) {
