@@ -92,6 +92,57 @@ where
 /// only read once it has been given a reservation from it.
 pub(super) const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 
+/// The headers one message names in its own `Connection` header.
+///
+/// RFC 9110 §7.6.1: the hop-by-hop headers are the fixed list **and** every
+/// header the message's `Connection` header names. A header named there is
+/// hop-by-hop for that message alone and must not be forwarded — a request
+/// that says `Connection: X-Internal-Token` is saying that the header is for
+/// this hop only, and forwarding it hands the backend something the client
+/// asked not to have forwarded.
+///
+/// The names belong to the message that carries them: a request's `Connection`
+/// names the request's hop-by-hop headers and a response's names the
+/// response's. So this is built per message rather than being a property of
+/// the filter, and each direction reads its own.
+pub(super) struct ConnectionNamed {
+    /// The names the `Connection` header gave.
+    names: Vec<String>,
+}
+
+impl ConnectionNamed {
+    /// The names the `Connection` header of these headers gives.
+    ///
+    /// The value is a comma-separated list of header names, and the header may
+    /// appear more than once, so every one of its values is read. The names
+    /// are compared without regard to case, as header names are.
+    pub(super) fn of(headers: &::http::HeaderMap) -> Self {
+        let mut names = Vec::new();
+        for value in headers.get_all("connection") {
+            // A value that is not text names nothing this proxy could forward:
+            // the names it could name are not readable.
+            let Ok(value) = value.to_str() else {
+                continue;
+            };
+            for name in value.split(',') {
+                let name = name.trim();
+                if name.is_empty() {
+                    continue;
+                }
+                names.push(name.to_string());
+            }
+        }
+        Self { names }
+    }
+
+    /// Whether the `Connection` header named this header.
+    pub(super) fn names(&self, name: &str) -> bool {
+        self.names
+            .iter()
+            .any(|named| named.eq_ignore_ascii_case(name))
+    }
+}
+
 /// Whether a request header may be forwarded to the backend.
 ///
 /// Two groups are dropped. Hop-by-hop headers describe one connection, not the
@@ -113,10 +164,13 @@ pub(super) const MAX_REQUEST_BODY: usize = 64 * 1024 * 1024;
 /// before sending its body waits until the body's deadline. Forwarding the
 /// header would only tell the backend to wait as well.
 ///
+/// The third group is what the request's own `Connection` header names, and
+/// `connection` is the header that names it — see [`ConnectionNamed`].
+///
 /// The WebSocket handshake does not use this: it is the one request that
 /// *must* carry `upgrade` and `connection`, because switching protocols is
 /// exactly what it is asking the backend for.
-pub(super) fn forwards_request_header(name: &str) -> bool {
+pub(super) fn forwards_request_header(name: &str, connection: &ConnectionNamed) -> bool {
     ![
         "connection",
         "proxy-connection",
@@ -131,6 +185,7 @@ pub(super) fn forwards_request_header(name: &str) -> bool {
     ]
     .iter()
     .any(|hop| name.eq_ignore_ascii_case(hop))
+        && !connection.names(name)
 }
 
 /// A response body that keeps its backend busy until the body is done.

@@ -385,6 +385,68 @@ async fn hello_backend() -> u16 {
     port
 }
 
+/// A backend that answers every request with the bytes it was given.
+///
+/// A raw socket rather than a hyper server: what is being checked is the
+/// headers the backend sends, and a hyper server writes its own framing and
+/// its own `connection` header rather than the awkward ones.
+async fn backend_answering(reply: &'static str) -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let port = listener.local_addr().expect("an address").port();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    port
+}
+
+/// A backend that answers with the bytes it was given and records the head
+/// of the request it was given.
+async fn backend_recording(reply: &'static str) -> (u16, Arc<std::sync::Mutex<Vec<u8>>>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let port = listener.local_addr().expect("an address").port();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let sink = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let sink = sink.clone();
+            tokio::spawn(async move {
+                // The head, up to the blank line that ends it.
+                let mut head = Vec::new();
+                let mut buffer = [0u8; 1024];
+                loop {
+                    let read = stream.read(&mut buffer).await.expect("the request");
+                    if read == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&buffer[..read]);
+                    if head.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                sink.lock()
+                    .expect("the requests seen")
+                    .extend_from_slice(&head);
+                let _ = stream.write_all(reply.as_bytes()).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+
+    (port, seen)
+}
+
 /// An address nothing is listening on.
 ///
 /// The port is taken by a UDP socket, so the connection to it is refused
@@ -735,6 +797,93 @@ async fn a_get_that_reached_a_backend_is_tried_again() {
         accepted.load(std::sync::atomic::Ordering::Relaxed),
         2,
         "a GET may be sent twice, so it was"
+    );
+}
+
+/// The plaintext path does not hand the client the backend's own hop
+/// headers.
+///
+/// The tunnel path has dropped them for a while; the plaintext path did not,
+/// so a `connection: keep-alive` from the backend described a link the client
+/// does not have, and a `proxy-authenticate` from the backend was a challenge
+/// the client never asked for.
+///
+/// The header the answer's own `Connection` header names goes with them: the
+/// answer says it is for this hop only.
+#[tokio::test]
+async fn the_plaintext_path_drops_the_backends_own_hop_headers() {
+    let port = backend_answering(
+        "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: keep-alive, x-internal\r\nkeep-alive: timeout=5\r\nproxy-authenticate: Basic realm=\"backend\"\r\nx-internal: secret\r\nx-kept: yes\r\n\r\nhello",
+    )
+    .await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let response = proxy_request(&clients, get_request("retry.test"), config)
+        .await
+        .expect("the backend answers");
+
+    for dropped in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        // Named in the answer's own `Connection` header.
+        "x-internal",
+    ] {
+        assert!(
+            response.headers().get(dropped).is_none(),
+            "the hop header arrived: {dropped}"
+        );
+    }
+    assert_eq!(
+        response
+            .headers()
+            .get("x-kept")
+            .map(|value| value.to_str().unwrap()),
+        Some("yes"),
+        "a header that is not hop-by-hop was dropped"
+    );
+}
+
+/// A header the client named in its own `Connection` header does not reach
+/// the backend.
+///
+/// RFC 9110 §7.6.1: the hop-by-hop headers are the fixed list **and** every
+/// header the message's `Connection` header names. A client that says
+/// `Connection: X-Internal-Token` is saying that the header is for the hop to
+/// this proxy only.
+#[tokio::test]
+async fn a_header_the_client_named_does_not_reach_the_backend() {
+    let (port, seen) = backend_recording("HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n").await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let config = route_table(vec![backend], 1);
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(1), None).expect("the clients");
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("http://retry.test/")
+        .header("host", "retry.test")
+        .header("connection", "x-internal-token")
+        .header("x-internal-token", "secret")
+        .header("x-kept", "yes")
+        .body(Full::new(bytes::Bytes::new()))
+        .expect("a request");
+
+    proxy_request(&clients, request, config)
+        .await
+        .expect("the backend answers");
+
+    let head = String::from_utf8_lossy(&seen.lock().expect("the requests seen")).to_lowercase();
+    assert!(
+        !head.contains("x-internal-token"),
+        "the header the client named was forwarded: {head}"
+    );
+    assert!(
+        head.contains("x-kept"),
+        "a header the client did not name was dropped: {head}"
     );
 }
 

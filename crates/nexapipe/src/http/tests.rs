@@ -167,6 +167,7 @@ fn legacy_response_parser_rejects_a_response_with_no_end_of_headers() {
 
 #[test]
 fn hop_by_hop_headers_do_not_reach_the_backend() {
+    let no_named = ConnectionNamed::of(&::http::HeaderMap::new());
     for dropped in [
         "connection",
         "Proxy-Connection",
@@ -183,13 +184,131 @@ fn hop_by_hop_headers_do_not_reach_the_backend() {
         "proxy-authenticate",
     ] {
         assert!(
-            !forwards_request_header(dropped),
+            !forwards_request_header(dropped, &no_named),
             "{dropped} belongs to this hop only"
         );
     }
     for kept in ["host", "accept", "content-length", "sec-websocket-key"] {
-        assert!(forwards_request_header(kept), "{kept} is the message's own");
+        assert!(
+            forwards_request_header(kept, &no_named),
+            "{kept} is the message's own"
+        );
     }
+}
+
+/// The response direction has a list of its own.
+///
+/// It is not the request direction's list: a request carries `expect` and
+/// `proxy-connection`, which are not response headers. The two are kept apart
+/// deliberately, so this pins the response one.
+#[test]
+fn hop_by_hop_response_headers_do_not_reach_the_client() {
+    let no_named = ConnectionNamed::of(&::http::HeaderMap::new());
+    for dropped in [
+        "connection",
+        "Keep-Alive",
+        "proxy-authenticate",
+        "Proxy-Authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        assert!(
+            !forwards_response_header(dropped, &no_named),
+            "{dropped} belongs to this hop only"
+        );
+    }
+    for kept in ["content-type", "content-length", "etag"] {
+        assert!(
+            forwards_response_header(kept, &no_named),
+            "{kept} is the message's own"
+        );
+    }
+}
+
+/// A header the request's own `Connection` header names is hop-by-hop.
+///
+/// RFC 9110 §7.6.1: the hop-by-hop headers are the fixed list **and** every
+/// header the message's `Connection` header names. A request that says
+/// `Connection: X-Internal-Token` is saying that the header is for this hop
+/// only, and forwarding it hands the backend something the client asked not
+/// to have forwarded.
+#[test]
+fn a_header_named_in_the_requests_connection_header_does_not_reach_the_backend() {
+    let mut headers = ::http::HeaderMap::new();
+    headers.insert("connection", "x-internal-token".parse().unwrap());
+    let connection = ConnectionNamed::of(&headers);
+
+    assert!(
+        !forwards_request_header("x-internal-token", &connection),
+        "a header the request names is for this hop only"
+    );
+    assert!(
+        forwards_request_header("x-kept", &connection),
+        "a header the request does not name is the message's own"
+    );
+}
+
+/// The same rule in the response direction, read from the response's own
+/// `Connection` header.
+#[test]
+fn a_header_named_in_the_responses_connection_header_does_not_reach_the_client() {
+    let mut headers = ::http::HeaderMap::new();
+    headers.insert("connection", "x-internal".parse().unwrap());
+    let connection = ConnectionNamed::of(&headers);
+
+    assert!(
+        !forwards_response_header("x-internal", &connection),
+        "a header the answer names is for this hop only"
+    );
+    assert!(
+        forwards_response_header("x-kept", &connection),
+        "a header the answer does not name is the message's own"
+    );
+}
+
+/// The two directions are read apart.
+///
+/// A request's `Connection` names the request's hop-by-hop headers and a
+/// response's names the response's — so the names one of them gives are not
+/// the names the other is held to.
+#[test]
+fn the_requests_connection_header_does_not_name_the_responses_headers() {
+    let mut request_headers = ::http::HeaderMap::new();
+    request_headers.insert("connection", "x-request-only".parse().unwrap());
+    let request = ConnectionNamed::of(&request_headers);
+    let response = ConnectionNamed::of(&::http::HeaderMap::new());
+
+    assert!(
+        !forwards_request_header("x-request-only", &request),
+        "the request names it"
+    );
+    assert!(
+        forwards_response_header("x-request-only", &response),
+        "the request's names are the request's own"
+    );
+}
+
+/// A `Connection` header is a list: several names in one value, odd spacing,
+/// mixed case, and the header itself may be there more than once.
+#[test]
+fn a_connection_header_is_read_as_a_list_of_names() {
+    let mut headers = ::http::HeaderMap::new();
+    headers.append("connection", "X-One, x-two".parse().unwrap());
+    headers.append("connection", "  X-Three  ".parse().unwrap());
+    let connection = ConnectionNamed::of(&headers);
+
+    for named in ["x-one", "X-One", "x-two", "X-TWO", "x-three"] {
+        assert!(
+            !forwards_request_header(named, &connection),
+            "{named} is named by the connection header"
+        );
+    }
+    assert!(
+        forwards_request_header("x-four", &connection),
+        "a header nobody named is the message's own"
+    );
 }
 
 /// A body that produces `frames` frames and then goes silent.
