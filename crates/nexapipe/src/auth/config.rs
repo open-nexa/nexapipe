@@ -446,8 +446,9 @@ impl std::fmt::Debug for DeviceAuth {
     }
 }
 
-/// Shared with the loader in `crates/nexapipe/src/config.rs`, which fills in
-/// the same "issued now" for a client or a device the file does not date.
+/// Shared with the loader in `crates/nexapipe/src/config/auth_file.rs`, which
+/// fills in the same "issued now" for a client or a device the file does not
+/// date.
 pub(crate) fn default_created_at() -> String {
     unix_now().to_string()
 }

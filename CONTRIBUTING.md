@@ -99,7 +99,7 @@ Bounded, real, and each one is useful on its own. Comments welcome before you
 start — say which one you are taking.
 
 **1. Drop the hop-by-hop headers a `Connection` header names** —
-`forwards_request_header` (`crates/nexapipe/src/http/mod.rs`) drops the fixed
+`forwards_request_header` (`crates/nexapipe/src/http/body.rs`) drops the fixed
 RFC 7230 §6.1 set, which is half of what the RFC asks for: a request that says
 `Connection: x-trace` also makes `x-trace` hop-by-hop, and that one is still
 forwarded. Parse the `Connection` value and drop what it names, on the way out
