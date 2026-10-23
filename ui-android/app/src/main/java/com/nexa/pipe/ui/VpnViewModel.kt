@@ -2,8 +2,6 @@ package com.nexa.pipe.ui
 
 import android.content.Context
 import android.content.Intent
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.net.VpnService
 import android.util.Log
 import androidx.lifecycle.ViewModel
@@ -17,8 +15,6 @@ import com.nexa.pipe.SecretStore
 import com.nexa.pipe.SettingsManager
 import com.nexa.pipe.locale.AppStrings
 import com.nexa.pipe.vpn.NexaVpnService
-import com.nexa.pipe.vpn.UnderlyingNetworkSelector
-import com.nexa.pipe.vpn.VpnSlot
 import com.nexa.pipe.vpn.VpnTakeoverChoice
 import com.nexa.pipe.vpn.VpnTakeoverDecision
 import com.nexa.pipe.vpn.VpnTakeoverPolicy
@@ -26,8 +22,6 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
@@ -41,214 +35,6 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.withTimeoutOrNull
-import java.net.InetAddress
-
-import kotlinx.serialization.Serializable
-
-/**
- * The 2FA credentials of one endpoint.
- *
- * They belong to the endpoint, not to the app: every server keeps its own
- * `[auth].clients` table, so a second server either needs its own pair or has
- * to be handed the first one's secret. [secret] is only ever persisted in the
- * prefs file that backup excludes — see `SettingsManager`.
- */
-@Serializable
-data class NodeTwoFactor(
-    val enabled: Boolean = true,
-    val clientId: String = "",
-    val secret: String = "",
-    val algorithm: String = "sha1", // "sha1", "sha256", "sha512"
-    /**
-     * The device this credential was issued to, when the server said which.
-     *
-     * Null or blank means it is the client's shared secret rather than one
-     * device's — what every pair saved before this existed is, and what the
-     * field stays until the endpoint is enrolled under a name. The server
-     * cannot revoke one device of a client through a credential nobody owns.
-     */
-    val device: String? = null,
-    /**
-     * The public half of this device's own key, when the credential is a key.
-     *
-     * Null for a credential that is a secret, and that is how the two are told
-     * apart. The public half is not a secret — the server holds it too — so it
-     * lives here, next to the credential it belongs to, and is shown so an
-     * operator can tell which key a server has on file.
-     *
-     * The private half is the credential and never appears in this model: it is
-     * sealed in the file backup excludes, and it is read from there when a
-     * connection needs it. A model that is serialized into the backed-up
-     * endpoint list is the wrong place for a half that must never leave the
-     * device.
-     */
-    val publicKey: String? = null
-)
-
-/**
- * A one-time enrollment token, in place of credentials.
- *
- * The token is spent by the first connection, which answers with the secret this
- * device then keeps — and rotates the one the server held, so a code that leaked
- * on its way here stops working the moment it is used.
- */
-@Serializable
-data class NodeEnrollment(
-    val clientId: String = "",
-    val token: String = ""
-)
-
-@Serializable
-data class NodeConfig(
-    val nodeId: String,
-    val domains: List<String> = emptyList(),
-    val twoFactor: NodeTwoFactor? = null,
-    /**
-     * A token to spend instead of presenting credentials. Cleared once the
-     * issued secret has landed in [twoFactor], so an endpoint never holds both.
-     */
-    val enrollment: NodeEnrollment? = null
-)
-
-/**
- * The bearer token of a custom relay, and the relay it was issued for.
- *
- * A token is issued by one relay and is good for that relay alone: it is a
- * bearer credential, and a relay that is handed a token it never issued
- * learns it — and can use it against the relay that did issue it. So the
- * token is kept together with the URL of the relay it belongs to, and that
- * URL is what decides whether the token may still be sent.
- *
- * The URL is the one the token was issued for, not the one in use: a mode
- * that does not use a relay URL at all leaves the token alone.
- */
-data class RelayToken(
-    /** The token itself. Empty when there is none. */
-    val token: String = "",
-    /** The URL of the relay the token was issued for. Empty when there is none. */
-    val relayUrl: String = ""
-)
-
-/**
- * What a change of the relay configuration does to the token.
- *
- * Named rather than a nullable string, because "the token stays" and "the
- * token goes" are two different things and a caller has to say which one it
- * means. A parameter that defaulted to the stored token carried a credential
- * over to whatever relay came next — which is how an invite could take a
- * bearer token to a host of its choosing.
- */
-sealed interface RelayTokenChange {
-    /**
-     * The token stays bound to the relay it was issued for.
-     *
-     * It is kept while that relay is the one being configured, and dropped
-     * when the configuration names another relay: a token does not follow a
-     * change of relay.
-     */
-    data object Bound : RelayTokenChange
-
-    /**
-     * The token goes, whatever the relay is.
-     *
-     * For a change that brings no token of its own: an invite names a relay
-     * and carries no token for it, so the token this phone holds goes with
-     * the import rather than travelling to the relay the invite names.
-     */
-    data object Drop : RelayTokenChange
-
-    /** The token is this one, and it was issued for the relay being configured. */
-    data class Set(val token: String) : RelayTokenChange
-}
-
-/**
- * The token that goes with a relay after a change of the configuration.
- *
- * The rule: a token belongs to the relay it was issued for, so it survives
- * only while that relay is the one being configured. An explicit token
- * belongs to the relay it comes with — that is where the user typed it — and
- * a change that brings no token of its own takes the stored one with it.
- *
- * The URL is compared trimmed, because that is how the native side reads it:
- * two spellings of one URL are one relay, and a token that goes to a
- * different spelling of the same relay goes to the same relay.
- */
-internal fun relayTokenAfter(
-    /** The URL of the relay being configured. */
-    url: String,
-    /** The token as it stands, and the relay it was issued for. */
-    stored: RelayToken,
-    /** What the change does to the token. */
-    change: RelayTokenChange
-): RelayToken {
-    val token = when (change) {
-        is RelayTokenChange.Set -> change.token
-        RelayTokenChange.Drop -> ""
-        RelayTokenChange.Bound ->
-            if (stored.token.isNotBlank() && stored.relayUrl.trim() == url.trim()) {
-                stored.token
-            } else {
-                ""
-            }
-    }
-    return RelayToken(token = token, relayUrl = if (token.isBlank()) "" else url.trim())
-}
-
-/**
- * The token to hand to the native side for a relay.
- *
- * A token is sent to the relay it was issued for and to no other: one whose
- * relay is not the one being configured is not sent at all. The native side
- * has no way of knowing which relay issued a token, so the answer has to be
- * given here.
- */
-internal fun relayTokenToSend(stored: RelayToken, url: String): String =
-    if (stored.relayUrl.trim() == url.trim()) stored.token else ""
-
-/**
- * Whether the tunnel of a start is up.
- *
- * The two things that say so, and only them: the service reported the
- * establish as done, and the service's own flag says a tunnel is there.
- *
- * The request being delivered says nothing — `startForegroundService()`
- * returns as soon as the request is delivered — and treating it as a tunnel
- * is what made the UI say "connected" over a tunnel that was never
- * established, and keep saying it when the establish failed.
- *
- * @param reportedUp what the service reported about the establish.
- * @param serviceActive whether the service says a tunnel is there.
- */
-internal fun tunnelIsUp(reportedUp: Boolean, serviceActive: Boolean): Boolean =
-    reportedUp && serviceActive
-
-/**
- * Waits for the service to report whether the tunnel it was asked to build
- * came up.
- *
- * Bounded, because a service that says nothing at all must not leave the UI
- * saying "connecting" forever — and because a start nobody answered is not a
- * tunnel: the attempt is a failure and is retried like any other.
- *
- * @param outcome what the service will report about the start.
- * @param timeoutMs how long to wait for that report.
- * @param log where the line about a wait that ran out goes.
- * @return what the service reported: true when the tunnel is up.
- */
-internal suspend fun awaitTunnelUp(
-    outcome: CompletableDeferred<Boolean>,
-    timeoutMs: Long,
-    log: (String) -> Unit
-): Boolean {
-    return try {
-        withTimeout(timeoutMs) { outcome.await() }
-    } catch (e: TimeoutCancellationException) {
-        // The service was asked and never answered. Not a cancellation of
-        // the caller: the wait is over, and the attempt failed.
-        log("The tunnel did not come up within ${timeoutMs}ms")
-        false
-    }
-}
 
 class VpnViewModel : ViewModel() {
     private val TAG = "VpnViewModel"
@@ -693,30 +479,6 @@ class VpnViewModel : ViewModel() {
     }
 
     /**
-     * One settings write, captured whole at the moment it was asked for.
-     *
-     * A snapshot rather than a re-read on the far side of the queue: this is
-     * called between two keystrokes, and a write that re-read the state when
-     * it finally ran would store whatever the field held by then rather than
-     * what the user typed.
-     */
-    private data class SettingsWrite(
-        val nodes: List<NodeConfig>,
-        val relayMode: String,
-        val relayUrl: String,
-        val relayToken: String,
-        val discoveryMode: String,
-        /**
-         * Set when the user has just answered the consent question, so the
-         * re-queued write is the one thing allowed to store a credential in the
-         * clear. Carried on the write rather than read from the ViewModel at
-         * the moment it runs, because the answer and the write it applies to
-         * have to be the same one.
-         */
-        val allowPlaintextOverride: Boolean = false
-    )
-
-    /**
      * Writes waiting to run.
      *
      * Conflated, so a burst of typing collapses to the last state rather than
@@ -805,7 +567,7 @@ class VpnViewModel : ViewModel() {
      */
     private suspend fun needsConsentFor(write: SettingsWrite): Boolean {
         if (plaintextAccepted) return false
-        if (!carriesCredential(write.nodes, write.relayToken)) return false
+        if (!write.carriesCredential()) return false
         val manager = settingsManager ?: return false
         return !probeCredentialProtection(manager)
     }
@@ -849,14 +611,6 @@ class VpnViewModel : ViewModel() {
         if (probed) canProtectCached = true
         return probed
     }
-
-    /**
-     * Whether writing these settings would put a credential on disk.
-     */
-    private fun carriesCredential(nodes: List<NodeConfig>, relayToken: String): Boolean =
-        nodes.any {
-            !it.enrollment?.token.isNullOrBlank() || !it.twoFactor?.secret.isNullOrBlank()
-        } || relayToken.isNotBlank()
 
     /**
      * Agrees that credentials may be stored unencrypted. The write that was
@@ -1065,26 +819,12 @@ class VpnViewModel : ViewModel() {
      */
     private fun collectIssuedCredential() {
         val encoded = IrohProxy.nativeTakeIssuedCredential() ?: return
-        val parts = encoded.split("\n")
-        if (parts.size < 3) {
+        val issued = parseIssuedCredential(encoded)
+        if (issued == null) {
             addLog("Enrollment answered with a credential this app cannot read")
             return
         }
-        val clientId = parts[0]
-        val secret = parts[1]
-        val algorithm = parts[2]
-        // A fourth line names the device the server enrolled; it answers with
-        // three when it does not name devices at all. Left null rather than
-        // blank, because what it records is "no name was given" — the state
-        // that leaves this pair indistinguishable from the client's shared
-        // secret, and the one the page offers to re-enroll out of.
-        val device = parts.getOrNull(3)?.takeIf { it.isNotBlank() }
-        // A fifth line carries the public half of a device key. It is what
-        // tells a key credential from a secret one: a key answers with an
-        // empty secret and an empty algorithm, and the half the server holds
-        // is the only thing that says which key it is.
-        val publicKey = parts.getOrNull(4)?.takeIf { it.isNotBlank() }
-        val node = nodes.value.firstOrNull { it.enrollment?.clientId == clientId }
+        val node = nodes.value.firstOrNull { it.enrollment?.clientId == issued.clientId }
             ?: nodes.value.firstOrNull { it.enrollment != null }
         if (node == null) {
             // Dropping a secret is the safe outcome, but doing it silently is
@@ -1094,14 +834,14 @@ class VpnViewModel : ViewModel() {
         }
         val twoFactor = NodeTwoFactor(
             enabled = true,
-            clientId = clientId,
-            secret = secret,
+            clientId = issued.clientId,
+            secret = issued.secret,
             // A key credential has no TOTP at all, so the server names no
             // algorithm; the default keeps the record well-formed, and the
             // public key is what says which kind of credential this is.
-            algorithm = algorithm.ifBlank { "sha1" },
-            device = device,
-            publicKey = publicKey
+            algorithm = issued.algorithm.ifBlank { "sha1" },
+            device = issued.device,
+            publicKey = issued.publicKey
         )
         updateNodeTwoFactor(node.nodeId, twoFactor)
         updateNodeEnrollment(node.nodeId, null)
@@ -1111,7 +851,7 @@ class VpnViewModel : ViewModel() {
         // hold — and one that a later enrollment would offer as if it had never
         // been used. Dropped here, which is the one moment that knows the offer
         // was ignored; enrolling again mints a key of its own.
-        if (publicKey == null) {
+        if (issued.publicKey == null) {
             val leftover = settingsManager?.deviceKeyFor(node.nodeId).orEmpty()
             if (leftover.isNotBlank()) {
                 settingsManager?.clearDeviceKey(node.nodeId)
@@ -1126,7 +866,7 @@ class VpnViewModel : ViewModel() {
         // here would be a claim about a write that has not run yet — and on the
         // decline path the token is gone and this secret with it.
         addLog(
-            if (publicKey != null) {
+            if (issued.publicKey != null) {
                 "Enrolled: the token is spent and this device's key is being stored"
             } else {
                 "Enrolled: the token is spent and the issued secret is being stored"
@@ -1291,30 +1031,6 @@ class VpnViewModel : ViewModel() {
     }
 
     /**
-     * Who owns the platform VPN slot, as seen from the UI.
-     *
-     * Runs off the main thread: both reads go through a binder. Our own session
-     * is [VpnSlot.OwnSession] — the set of VPN networks does not say which one
-     * is ours, and the service is the only side that can tell, so a connect
-     * that starts while our tunnel is up is never treated as a takeover.
-     */
-    private suspend fun vpnSlot(context: Context): VpnSlot = withContext(Dispatchers.IO) {
-        if (NexaVpnService.isServiceActive) return@withContext VpnSlot.OwnSession
-        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            ?: return@withContext VpnSlot.Free
-        if (UnderlyingNetworkSelector.vpnNetworks(cm).isEmpty()) {
-            return@withContext VpnSlot.Free
-        }
-        val alwaysOn = UnderlyingNetworkSelector.alwaysOnVpnPackage(context)
-            ?: return@withContext VpnSlot.ForeignVpn
-        if (VpnTakeoverPolicy.isForeignAlwaysOn(alwaysOn, context.packageName)) {
-            VpnSlot.AlwaysOnVpn(alwaysOn)
-        } else {
-            VpnSlot.ForeignVpn
-        }
-    }
-
-    /**
      * What a connect may do about the VPN slot, before anything is started.
      *
      * The refusal cases are reported here as well as returned: the caller only
@@ -1322,7 +1038,7 @@ class VpnViewModel : ViewModel() {
      * [VpnTakeoverDecision.Ask], the latter being the one that needs a UI.
      */
     suspend fun takeoverCheck(context: Context): VpnTakeoverDecision {
-        val decision = VpnTakeoverPolicy.decide(vpnSlot(context), vpnTakeoverChoice.value)
+        val decision = VpnTakeoverPolicy.decide(readVpnSlot(context), vpnTakeoverChoice.value)
         when (decision) {
             is VpnTakeoverDecision.RefuseAlwaysOn -> {
                 errorMessage.value = AppStrings.get(R.string.error_vpn_always_on, decision.packageName)
@@ -1404,7 +1120,7 @@ class VpnViewModel : ViewModel() {
                 // arrives without one — a widget, a future entry point, a
                 // stale UI — refuses rather than kicking the other VPN off.
                 val decision = VpnTakeoverPolicy.decide(
-                    vpnSlot(context),
+                    readVpnSlot(context),
                     if (allowTakeover) VpnTakeoverChoice.TakeOver else VpnTakeoverChoice.Cancel
                 )
                 if (decision != VpnTakeoverDecision.Proceed) {
@@ -1592,17 +1308,6 @@ class VpnViewModel : ViewModel() {
             }
         }
     }
-
-    /**
-     * What to tell the user when a start did not bring the tunnel up.
-     *
-     * The reason the service refused with, when there is one: another VPN
-     * app owning the slot is something the user can act on, and a generic
-     * "connection failed" would hide it.
-     */
-    private fun tunnelUpFailedMessage(): String =
-        NexaVpnService.lastRevokeReason
-            ?: AppStrings.get(R.string.error_connection_failed)
 
     fun disconnect(context: Context) {
         viewModelScope.launch(Dispatchers.IO) {
