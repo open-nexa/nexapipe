@@ -553,8 +553,8 @@ impl TunProxy {
     /// - `tun_fd`: the descriptor Kotlin's `ParcelFileDescriptor.detachFd()`
     ///   handed over. **This function owns it**: it duplicates it into a
     ///   read/write pair and closes the original, on every path including the
-    ///   ones that fail. The caller must not close it again — see
-    ///   [`dup_tun_fds`].
+    ///   ones that fail. The caller must not close it again — the parameter is
+    ///   an [`OwnedFd`], so it is closed when this returns.
     /// - `endpoint_group`: the `Arc<EndpointGroup>` cloned from `ProxyState`, used for iroh connections.
     /// - `proxy_domains`: the list of domains to proxy (already split from comma-separated input).
     /// - `custom_dns_servers`: the system DNS server list (read from `CUSTOM_DNS_SERVERS`).
@@ -931,3 +931,63 @@ impl Drop for TunProxy {
 // ============================================================
 
 // ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_TCP_WINDOW, MIN_TCP_WINDOW, resolve_tcp_window};
+
+    /// The caller's own window is the one the stack gets: a library user
+    /// knows what it is doing, and the environment is for the operator.
+    #[test]
+    fn the_callers_window_wins() {
+        assert_eq!(
+            resolve_tcp_window(Some(256 * 1024), Some("1024")),
+            256 * 1024
+        );
+    }
+
+    /// With no window of its own, the stack gets the client's default.
+    #[test]
+    fn the_window_falls_back_to_the_default() {
+        assert_eq!(resolve_tcp_window(None, None), DEFAULT_TCP_WINDOW);
+    }
+
+    /// The environment is the operator's way of choosing the window.
+    #[test]
+    fn the_environment_chooses_the_window() {
+        assert_eq!(resolve_tcp_window(None, Some("262144")), 262_144);
+        assert_eq!(
+            resolve_tcp_window(None, Some(" 262144 ")),
+            262_144,
+            "a value with whitespace around it is still a number"
+        );
+    }
+
+    /// A window that cannot work is ignored rather than obeyed: the flow on
+    /// it would crawl instead of failing, and nothing would say why.
+    #[test]
+    fn a_window_that_cannot_work_is_ignored() {
+        for bad in ["0", "-1", "lots", "", "1024"] {
+            assert_eq!(
+                resolve_tcp_window(None, Some(bad)),
+                DEFAULT_TCP_WINDOW,
+                "{bad:?} is not a window"
+            );
+        }
+        assert_eq!(
+            resolve_tcp_window(Some(1024), None),
+            DEFAULT_TCP_WINDOW,
+            "a caller's window is held to the same floor"
+        );
+    }
+
+    /// The floor is the point: a window below it cannot carry a segment and a
+    /// half.
+    #[test]
+    fn a_window_at_the_floor_is_used() {
+        assert_eq!(
+            resolve_tcp_window(Some(MIN_TCP_WINDOW), None),
+            MIN_TCP_WINDOW
+        );
+    }
+}
