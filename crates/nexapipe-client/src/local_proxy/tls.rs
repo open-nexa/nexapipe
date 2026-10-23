@@ -218,6 +218,53 @@ fn now_millis(start: Instant) -> u64 {
     start.elapsed().as_millis() as u64
 }
 
+/// The tunnel's own clock.
+///
+/// The three facts it holds belong to the tunnel rather than to one of its
+/// directions: when the tunnel started, when something last moved, and how
+/// long the tunnel may be silent. Both directions read the same clock, and
+/// that is what makes the idle window a window over the two of them together.
+struct TunnelClock {
+    /// When the tunnel started.
+    start: Instant,
+    /// When something last moved, in milliseconds since the tunnel started.
+    last_traffic: AtomicU64,
+    /// How long the tunnel may be silent, in both directions at once.
+    idle: Duration,
+}
+
+impl TunnelClock {
+    /// The clock of a tunnel that starts now.
+    fn new(idle: Duration) -> Self {
+        Self {
+            start: Instant::now(),
+            last_traffic: AtomicU64::new(0),
+            idle,
+        }
+    }
+
+    /// The milliseconds since the tunnel started.
+    fn now(&self) -> u64 {
+        now_millis(self.start)
+    }
+
+    /// Records that something moved.
+    fn touch(&self) {
+        self.last_traffic.store(self.now(), Ordering::Relaxed);
+    }
+
+    /// Whether nothing has moved for a whole idle window.
+    ///
+    /// The window is measured over both directions, so a direction that is
+    /// quiet on its own is not the end of anything.
+    fn is_idle(&self) -> bool {
+        let quiet_for = self
+            .now()
+            .saturating_sub(self.last_traffic.load(Ordering::Relaxed));
+        quiet_for >= self.idle.as_millis() as u64
+    }
+}
+
 /// Copies one direction of the tunnel until it ends.
 ///
 /// The direction ends when the peer stops sending, when the transport fails,
@@ -227,9 +274,7 @@ async fn copy_one_way<R, W>(
     writer: &mut W,
     buf: &mut Vec<u8>,
     counter: &FlowCounter,
-    last_traffic: &AtomicU64,
-    start: Instant,
-    idle: Duration,
+    clock: &TunnelClock,
     leg: Leg,
 ) -> DirectionEnd
 where
@@ -240,7 +285,7 @@ where
         // The read is bound by the idle window, and the window is measured
         // over both directions: a direction that is quiet on its own is not
         // the end of anything.
-        let n = match tokio::time::timeout(idle, reader.read(buf.as_mut_slice())).await {
+        let n = match tokio::time::timeout(clock.idle, reader.read(buf.as_mut_slice())).await {
             Ok(Ok(0)) => return DirectionEnd::Finished,
             Ok(Ok(n)) => n,
             Ok(Err(e)) => {
@@ -255,9 +300,7 @@ where
                 // This direction has been quiet for a whole window. The
                 // tunnel ends when nothing has moved in either direction for
                 // that long; until then the other side is still using it.
-                let quiet_for =
-                    now_millis(start).saturating_sub(last_traffic.load(Ordering::Relaxed));
-                if quiet_for >= idle.as_millis() as u64 {
+                if clock.is_idle() {
                     return DirectionEnd::Idle;
                 }
                 // The other side is still talking: wait for more, with the
@@ -266,7 +309,7 @@ where
             }
         };
 
-        last_traffic.store(now_millis(start), Ordering::Relaxed);
+        clock.touch();
         if let Err(e) = writer.write_all(&buf[..n]).await {
             jni_log!(
                 "[DEBUG:local-proxy] TLS tunnel {} write error: {}",
@@ -304,12 +347,11 @@ async fn forward_tunnel<C, B, F>(
     let (mut client_read, mut client_write) = tokio::io::split(client);
     let (mut backend_read, mut backend_write) = tokio::io::split(backend);
 
-    // When the last byte moved, in milliseconds since the tunnel started.
-    // Both directions write to it, and a direction that has been quiet for a
-    // whole window reads it to find out whether the other one is still
-    // talking.
-    let start = Instant::now();
-    let last_traffic = AtomicU64::new(0);
+    // The tunnel's clock: when it started, when something last moved, and how
+    // long it may be silent. Both directions write to it, and a direction that
+    // has been quiet for a whole window reads it to find out whether the
+    // other one is still talking.
+    let clock = TunnelClock::new(idle);
 
     // The two directions, and the half-close that goes with each of them.
     //
@@ -323,9 +365,7 @@ async fn forward_tunnel<C, B, F>(
             &mut backend_write,
             &mut client_buf,
             &count_to_backend,
-            &last_traffic,
-            start,
-            idle,
+            &clock,
             Leg::ClientToIroh,
         )
         .await;
@@ -342,9 +382,7 @@ async fn forward_tunnel<C, B, F>(
             &mut client_write,
             &mut buf,
             &count_from_backend,
-            &last_traffic,
-            start,
-            idle,
+            &clock,
             Leg::IrohToClient,
         )
         .await;
