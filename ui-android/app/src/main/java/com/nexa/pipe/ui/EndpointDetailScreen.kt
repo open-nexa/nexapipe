@@ -2,28 +2,17 @@ package com.nexa.pipe.ui
 
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.nexa.pipe.R
 import com.nexa.pipe.locale.rememberLocalizedContext
@@ -40,6 +29,11 @@ import kotlinx.coroutines.launch
  * (also wired to the system back gesture). [onRenamed] lets the caller keep
  * tracking the node while its endpoint ID is edited here, since the page is
  * keyed by node ID.
+ *
+ * The page itself is the wiring: the state, the actions, and the order the
+ * sections appear in. Each section is its own composable — the identity card,
+ * the link card, the 2FA card, the domain list — and each dialog is its own
+ * too.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -338,52 +332,16 @@ fun EndpointDetailScreen(
             // Identity card: the recognisable short form plus the full ID,
             // copyable in one tap.
             item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceContainerLow
-                    )
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = shortenNodeId(node.nodeId),
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = node.nodeId,
-                                style = MaterialTheme.typography.bodySmall.copy(
-                                    fontFamily = FontFamily.Monospace
-                                ),
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                        IconButton(
-                            onClick = {
-                                copyConfirmed(
-                                    node.nodeId,
-                                    localizedContext.getString(R.string.clipboard_label_endpoint_id),
-                                    R.string.credential_lock_copy_id_subtitle
-                                )
-                            }
-                        ) {
-                            Icon(
-                                Icons.Default.Share,
-                                contentDescription = stringResource(R.string.action_copy),
-                                modifier = Modifier.size(18.dp)
-                            )
-                        }
+                EndpointIdentityCard(
+                    nodeId = node.nodeId,
+                    onCopy = {
+                        copyConfirmed(
+                            node.nodeId,
+                            localizedContext.getString(R.string.clipboard_label_endpoint_id),
+                            R.string.credential_lock_copy_id_subtitle
+                        )
                     }
-                }
+                )
             }
 
             // How traffic is reaching this backend right now. Only rendered while there is a
@@ -391,48 +349,10 @@ fun EndpointDetailScreen(
             // would be worse than none.
             linkKindOf(linkReadings.kinds, node.nodeId)?.let { linkKind ->
                 item {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
-                        )
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(16.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            LinkKindIcon(linkKind, iconSize = 20.dp)
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = stringResource(R.string.link_title, linkKindLabel(linkKind)),
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    fontWeight = FontWeight.Medium
-                                )
-                                // How far the path is, when iroh has measured it. A path
-                                // with no sample says nothing at all rather than "0 ms",
-                                // which would read as a measurement.
-                                linkRttOf(linkReadings.rtts, node.nodeId)?.let { rtt ->
-                                    Text(
-                                        text = stringResource(R.string.link_rtt, rtt),
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                                Text(
-                                    text = when (linkKind) {
-                                        LinkKind.DIRECT -> stringResource(R.string.link_direct_body)
-                                        LinkKind.RELAY -> stringResource(R.string.link_relay_body)
-                                        LinkKind.UNKNOWN -> stringResource(R.string.link_connecting_body)
-                                    },
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    }
+                    EndpointLinkCard(
+                        linkKind = linkKind,
+                        rtt = linkRttOf(linkReadings.rtts, node.nodeId)
+                    )
                 }
             }
 
@@ -440,478 +360,57 @@ fun EndpointDetailScreen(
             // [auth.clients] table, so a second server needs its own pair —
             // sharing one secret would mean handing this server's key to it.
             item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceContainerLow
-                    )
-                ) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Icon(Icons.Default.Lock, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = stringResource(R.string.two_factor_title),
-                                    style = MaterialTheme.typography.titleSmall
-                                )
-                                Text(
-                                    text = if (twoFactor.enabled) {
-                                        stringResource(R.string.two_factor_on)
-                                    } else {
-                                        stringResource(R.string.two_factor_off)
-                                    },
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                            Switch(
-                                checked = twoFactor.enabled,
-                                onCheckedChange = { enabled ->
-                                    // Switching this off stops the endpoint
-                                    // from presenting a token at all, and
-                                    // switching it on hands this app's
-                                    // credentials to it — both are a change to
-                                    // how this endpoint authenticates, so both
-                                    // are asked for. The switch still shows
-                                    // what the state is; only moving it takes
-                                    // a confirmation.
-                                    credentialUnlock.requestIfLocked(
-                                        localizedContext,
-                                        R.string.credential_lock_two_factor_subtitle
-                                    ) {
-                                        updateTwoFactor { current -> current.copy(enabled = enabled) }
-                                    }
-                                }
-                            )
-                        }
-
-                        if (node.enrollment != null) {
-                            // A token is waiting to be spent, so there are no credentials to
-                            // edit yet: the first connect trades it for the secret this page
-                            // then shows.
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = stringResource(
-                                    R.string.two_factor_enrollment_pending,
-                                    node.enrollment!!.clientId
-                                ),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        } else if (!twoFactor.enabled) {
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = stringResource(R.string.two_factor_off_body),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        } else {
-                            Spacer(modifier = Modifier.height(12.dp))
-                            OutlinedTextField(
-                                value = twoFactor.clientId,
-                                onValueChange = { value ->
-                                    twoFactorImportWarning = null
-                                    updateTwoFactor { current -> current.copy(clientId = value) }
-                                },
-                                label = { Text(stringResource(R.string.two_factor_client_id)) },
-                                placeholder = {
-                                    Text(stringResource(R.string.two_factor_client_id_placeholder))
-                                },
-                                modifier = Modifier.fillMaxWidth(),
-                                singleLine = true
-                            )
-
-                            if (twoFactor.publicKey != null) {
-                                // A credential that is a key has no secret to
-                                // show and no algorithm to choose: the public
-                                // half below is what the server holds, and the
-                                // private half never leaves this device. The
-                                // scan and share buttons are gone with it —
-                                // there is nothing here to copy to another
-                                // device, and a scanned secret would be a
-                                // different kind of credential entirely.
-                                Spacer(modifier = Modifier.height(12.dp))
-                                Text(
-                                    stringResource(R.string.two_factor_credential_type),
-                                    style = MaterialTheme.typography.labelMedium
-                                )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    stringResource(R.string.two_factor_type_key),
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Text(
-                                    stringResource(R.string.two_factor_public_key),
-                                    style = MaterialTheme.typography.labelMedium
-                                )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                OutlinedTextField(
-                                    value = twoFactor.publicKey,
-                                    onValueChange = {},
-                                    readOnly = true,
-                                    label = { Text(stringResource(R.string.two_factor_public_key)) },
-                                    textStyle = MaterialTheme.typography.bodySmall.copy(
-                                        fontFamily = FontFamily.Monospace
-                                    ),
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                                // A text button rather than a copy glyph: the
-                                // core icon set has no copy icon, and the one
-                                // this would borrow says "share" instead.
-                                TextButton(
-                                    onClick = {
-                                        copyToClipboard(
-                                            twoFactor.publicKey,
-                                            localizedContext.getString(
-                                                R.string.two_factor_public_key
-                                            )
-                                        )
-                                    }
-                                ) {
-                                    Text(
-                                        text = stringResource(R.string.two_factor_public_key_copy),
-                                        style = MaterialTheme.typography.labelMedium
-                                    )
-                                }
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = stringResource(R.string.two_factor_key_hint),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            } else {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                val secretLocked =
-                                    storedSecretPresent && !secretReplaced && !credentialUnlock.unlocked
-                                OutlinedTextField(
-                                // Locked only while the field still holds the
-                                // secret this page opened with, and only until
-                                // the device confirms who is asking. A field
-                                // with nothing to disclose — one the user is
-                                // typing into — stays editable.
-                                value = if (secretLocked) SECRET_MASK else twoFactor.secret,
-                                onValueChange = { value ->
-                                    if (secretLocked) return@OutlinedTextField
-                                    // Whatever is here from now on is theirs.
-                                    secretReplaced = true
-                                    twoFactorImportWarning = null
-                                    updateTwoFactor { current -> current.copy(secret = value) }
-                                },
-                                label = { Text(stringResource(R.string.two_factor_secret)) },
-                                placeholder = {
-                                    Text(stringResource(R.string.two_factor_secret_placeholder))
-                                },
-                                visualTransformation = PasswordVisualTransformation(),
-                                trailingIcon = {
-                                    if (secretLocked) {
-                                        IconButton(
-                                            onClick = {
-                                                credentialUnlock.request(
-                                                    localizedContext.getString(R.string.credential_lock_title),
-                                                    localizedContext.getString(
-                                                        R.string.credential_lock_secret_subtitle
-                                                    )
-                                                )
-                                            }
-                                        ) {
-                                            Icon(
-                                                Icons.Default.Lock,
-                                                contentDescription = stringResource(
-                                                    R.string.credential_lock_reveal
-                                                ),
-                                                modifier = Modifier.size(18.dp)
-                                            )
-                                        }
-                                    }
-                                },
-                                readOnly = secretLocked,
-                                modifier = Modifier.fillMaxWidth(),
-                                singleLine = true
-                            )
-
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                stringResource(R.string.two_factor_algorithm),
-                                style = MaterialTheme.typography.labelMedium
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            listOf(
-                                "sha1" to R.string.two_factor_sha1,
-                                "sha256" to R.string.two_factor_sha256,
-                                "sha512" to R.string.two_factor_sha512
-                            ).forEach { (alg, label) ->
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .padding(vertical = 2.dp)
-                                    ) {
-                                        RadioButton(
-                                            selected = twoFactor.algorithm == alg,
-                                            onClick = {
-                                                twoFactorImportWarning = null
-                                                updateTwoFactor { current -> current.copy(algorithm = alg) }
-                                            }
-                                        )
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        Text(
-                                            stringResource(label),
-                                            style = MaterialTheme.typography.bodySmall
-                                        )
-                                    }
-                                }
-
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                OutlinedButton(
-                                    // A scan writes credentials into this
-                                    // endpoint, replacing whatever is there
-                                    // now — which is the other half of the
-                                    // disclosure the field is gated for. The
-                                    // camera is asked for only once confirmed.
-                                    onClick = {
-                                        credentialUnlock.requestIfLocked(
-                                            localizedContext,
-                                            R.string.credential_lock_scan_secret_subtitle
-                                        ) { showTwoFactorScanner = true }
-                                    },
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Icon(
-                                        Icons.Default.Search,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = stringResource(R.string.two_factor_scan),
-                                        style = MaterialTheme.typography.labelMedium,
-                                        maxLines = 1
-                                    )
-                                }
-                                OutlinedButton(
-                                    // The QR code carries the secret in full,
-                                    // so exporting is the same disclosure as
-                                    // showing the field and needs the same
-                                    // thing in front of it.
-                                    onClick = {
-                                        if (credentialUnlock.unlocked) {
-                                            showTwoFactorExport = true
-                                        } else {
-                                            credentialUnlock.request(
-                                                localizedContext.getString(R.string.credential_lock_title),
-                                                localizedContext.getString(
-                                                    R.string.credential_lock_export_subtitle
-                                                )
-                                            ) {
-                                                showTwoFactorExport = true
-                                            }
-                                        }
-                                    },
-                                    enabled = twoFactor.clientId.isNotBlank() && twoFactor.secret.isNotBlank(),
-                                    modifier = Modifier.weight(1f)
-                                ) {
-                                    Icon(
-                                        Icons.Default.Share,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = stringResource(R.string.two_factor_share_qr),
-                                        style = MaterialTheme.typography.labelMedium,
-                                        maxLines = 1
-                                    )
-                                }
-                            }
-                            }
-
-                            twoFactorImportWarning?.let { warning ->
-                                Spacer(modifier = Modifier.height(8.dp))
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Icon(
-                                        Icons.Default.Warning,
-                                        contentDescription = null,
-                                        tint = MaterialTheme.colorScheme.error,
-                                        modifier = Modifier.size(16.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = warning,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.error
-                                    )
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(12.dp))
-                            DeviceRow(device = twoFactor.device)
-
-                            if (twoFactor.device.isNullOrBlank()) {
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = stringResource(R.string.two_factor_reenroll_hint),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
-                                OutlinedButton(
-                                    onClick = {
-                                        // Credentials are dropped here, not
-                                        // edited, so the door stands in front
-                                        // of the tap that asks — the way it
-                                        // does for every other action on this
-                                        // page that touches what is saved.
-                                        // The dialog only confirms it.
-                                        credentialUnlock.requestIfLocked(
-                                            localizedContext,
-                                            R.string.credential_lock_reenroll_subtitle
-                                        ) { showReenrollConfirm = true }
-                                    },
-                                    modifier = Modifier.fillMaxWidth()
-                                ) {
-                                    Icon(
-                                        Icons.Default.Refresh,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = stringResource(R.string.two_factor_reenroll),
-                                        style = MaterialTheme.typography.labelMedium,
-                                        maxLines = 1
-                                    )
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = stringResource(R.string.two_factor_per_endpoint_note),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                        }
-                    }
-                }
+                EndpointTwoFactorCard(
+                    twoFactor = twoFactor,
+                    enrollment = node.enrollment,
+                    storedSecretPresent = storedSecretPresent,
+                    secretReplaced = secretReplaced,
+                    importWarning = twoFactorImportWarning,
+                    credentialUnlock = credentialUnlock,
+                    localizedContext = localizedContext,
+                    onUpdateTwoFactor = { transform -> updateTwoFactor(transform) },
+                    onSecretReplaced = { secretReplaced = true },
+                    onImportWarningCleared = { twoFactorImportWarning = null },
+                    onCopyToClipboard = { text, label -> copyToClipboard(text, label) },
+                    onScanSecret = { showTwoFactorScanner = true },
+                    onExportSecret = { showTwoFactorExport = true },
+                    onReenroll = { showReenrollConfirm = true }
+                )
             }
 
             item {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        stringResource(R.string.domains_title),
-                        style = MaterialTheme.typography.titleMedium
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Surface(
-                        shape = RoundedCornerShape(50),
-                        color = MaterialTheme.colorScheme.surfaceContainerHighest
-                    ) {
-                        Text(
-                            text = node.domains.size.toString(),
-                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 2.dp),
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
+                EndpointDomainsHeader(domainCount = node.domains.size)
             }
 
             if (node.domains.isEmpty()) {
                 item {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
-                        )
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 32.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
-                        ) {
-                            Icon(
-                                Icons.Default.Add,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                                modifier = Modifier.size(36.dp)
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                stringResource(R.string.endpoint_domains_none),
-                                style = MaterialTheme.typography.titleSmall
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = stringResource(R.string.domain_empty_body),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                textAlign = TextAlign.Center
-                            )
-                            Spacer(modifier = Modifier.height(16.dp))
-                            FilledTonalButton(onClick = { addDomainConfirmed() }) {
-                                Icon(
-                                    Icons.Default.Add,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(stringResource(R.string.domain_add))
-                            }
-                        }
-                    }
+                    EndpointDomainsEmptyCard(onAdd = { addDomainConfirmed() })
                 }
             } else {
                 // One list card: rows separated by hairlines that respect the
                 // leading monogram so the domains read as a column.
                 item {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
-                        )
-                    ) {
-                        Column {
-                            node.domains.forEachIndexed { index, domain ->
-                                DomainRow(
-                                    domain = domain,
-                                    onCopy = {
-                                        copyConfirmed(
-                                            domain,
-                                            localizedContext.getString(R.string.clipboard_label_domain),
-                                            R.string.credential_lock_copy_domain_subtitle
-                                        )
-                                    },
-                                    // Removing changes where this domain goes
-                                    // as surely as adding does. The undo is a
-                                    // convenience for the user, not a reason
-                                    // to leave the door open: what is undone
-                                    // has already been done once.
-                                    onRemove = {
-                                        credentialUnlock.requestIfLocked(
-                                            localizedContext,
-                                            R.string.credential_lock_remove_domain_subtitle
-                                        ) { removeDomain(domain) }
-                                    }
-                                )
-                                if (index < node.domains.lastIndex) {
-                                    HorizontalDivider(
-                                        modifier = Modifier.padding(start = 60.dp),
-                                        thickness = 1.dp,
-                                        color = MaterialTheme.colorScheme.outlineVariant
-                                    )
-                                }
-                            }
+                    EndpointDomainsCard(
+                        domains = node.domains,
+                        onCopy = { domain ->
+                            copyConfirmed(
+                                domain,
+                                localizedContext.getString(R.string.clipboard_label_domain),
+                                R.string.credential_lock_copy_domain_subtitle
+                            )
+                        },
+                        // Removing changes where this domain goes
+                        // as surely as adding does. The undo is a
+                        // convenience for the user, not a reason
+                        // to leave the door open: what is undone
+                        // has already been done once.
+                        onRemove = { domain ->
+                            credentialUnlock.requestIfLocked(
+                                localizedContext,
+                                R.string.credential_lock_remove_domain_subtitle
+                            ) { removeDomain(domain) }
                         }
-                    }
+                    )
                 }
             }
         }
@@ -945,37 +444,15 @@ fun EndpointDetailScreen(
     }
 
     if (showDeleteDialog) {
-        AlertDialog(
-            onDismissRequest = { showDeleteDialog = false },
-            title = { Text(stringResource(R.string.endpoint_delete_title)) },
-            text = {
-                Text(
-                    stringResource(
-                        R.string.endpoint_delete_body,
-                        nodeId,
-                        node.domains.size
-                    )
-                )
+        EndpointDeleteDialog(
+            nodeId = nodeId,
+            domainCount = node.domains.size,
+            onConfirm = {
+                viewModel.removeNode(nodeId)
+                showDeleteDialog = false
+                onBack()
             },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        viewModel.removeNode(nodeId)
-                        showDeleteDialog = false
-                        onBack()
-                    },
-                    colors = ButtonDefaults.textButtonColors(
-                        contentColor = MaterialTheme.colorScheme.error
-                    )
-                ) {
-                    Text(stringResource(R.string.action_delete))
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showDeleteDialog = false }) {
-                    Text(stringResource(R.string.action_cancel))
-                }
-            }
+            onDismiss = { showDeleteDialog = false }
         )
     }
 
@@ -1002,29 +479,13 @@ fun EndpointDetailScreen(
     }
 
     pendingTwoFactorImport?.let { scanned ->
-        AlertDialog(
-            onDismissRequest = { pendingTwoFactorImport = null },
-            title = { Text(stringResource(R.string.two_factor_replace_title)) },
-            text = {
-                Text(
-                    stringResource(R.string.two_factor_replace_body, scanned.clientId)
-                )
+        EndpointReplaceCredentialDialog(
+            clientId = scanned.clientId,
+            onConfirm = {
+                applyTwoFactorImport(scanned)
+                pendingTwoFactorImport = null
             },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        applyTwoFactorImport(scanned)
-                        pendingTwoFactorImport = null
-                    }
-                ) {
-                    Text(stringResource(R.string.action_replace))
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { pendingTwoFactorImport = null }) {
-                    Text(stringResource(R.string.action_cancel))
-                }
-            }
+            onDismiss = { pendingTwoFactorImport = null }
         )
     }
 
@@ -1049,29 +510,18 @@ fun EndpointDetailScreen(
     }
 
     if (showReenrollConfirm) {
-        AlertDialog(
-            onDismissRequest = { showReenrollConfirm = false },
-            title = { Text(stringResource(R.string.two_factor_reenroll_title)) },
-            text = { Text(stringResource(R.string.two_factor_reenroll_body)) },
-            confirmButton = {
-                TextButton(onClick = {
-                    showReenrollConfirm = false
-                    // Dropped rather than emptied: an endpoint with no
-                    // credential at all performs no handshake, so a failure to
-                    // enroll again leaves a connection that fails closed
-                    // instead of one that still answers under a shared secret
-                    // nobody intended to hand out.
-                    viewModel.updateNodeTwoFactor(nodeId, null)
-                    viewModel.addLog("Re-enrolling: dropped the credential of " + nodeId.take(8))
-                }) {
-                    Text(stringResource(R.string.two_factor_reenroll_confirm))
-                }
+        EndpointReenrollDialog(
+            onConfirm = {
+                showReenrollConfirm = false
+                // Dropped rather than emptied: an endpoint with no
+                // credential at all performs no handshake, so a failure to
+                // enroll again leaves a connection that fails closed
+                // instead of one that still answers under a shared secret
+                // nobody intended to hand out.
+                viewModel.updateNodeTwoFactor(nodeId, null)
+                viewModel.addLog("Re-enrolling: dropped the credential of " + nodeId.take(8))
             },
-            dismissButton = {
-                TextButton(onClick = { showReenrollConfirm = false }) {
-                    Text(stringResource(R.string.action_cancel))
-                }
-            }
+            onDismiss = { showReenrollConfirm = false }
         )
     }
 
@@ -1087,193 +537,4 @@ fun EndpointDetailScreen(
     if (credentialUnlock.unavailable) {
         CredentialUnavailableDialog(credentialUnlock)
     }
-}
-
-/**
- * Stands in for a secret the user has not authenticated to see.
- *
- * Deliberately longer than a real one and of a fixed length, so the field
- * cannot be used to measure the credential behind it.
- */
-private val SECRET_MASK = "•".repeat(16)
-
-/**
- * The device this endpoint's credential belongs to, or the absence of one.
- *
- * Read-only, and shown even when there is nothing to say, because "no name" is
- * the answer the user has to be able to see in order to act on it: it is the
- * state that leaves this pair answering as the client rather than as one device
- * of it, which is the one thing on this card re-enrolling changes.
- */
-@Composable
-private fun DeviceRow(device: String?) {
-    val name = device?.takeIf { it.isNotBlank() }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(
-            text = stringResource(R.string.two_factor_device_label),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(modifier = Modifier.width(6.dp))
-        Text(
-            text = name ?: stringResource(R.string.two_factor_device_none),
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-    }
-}
-
-/**
- * One domain row: a monogram so long lists scan visually, the domain itself
- * (tap to copy), and a trailing remove button.
- */
-@Composable
-private fun DomainRow(
-    domain: String,
-    onCopy: () -> Unit,
-    onRemove: () -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onCopy)
-            .padding(horizontal = 16.dp, vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Box(
-            modifier = Modifier
-                .size(32.dp)
-                .clip(CircleShape)
-                .background(MaterialTheme.colorScheme.secondaryContainer),
-            contentAlignment = Alignment.Center
-        ) {
-            Text(
-                text = domain.firstOrNull()?.uppercaseChar()?.toString() ?: "?",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onSecondaryContainer
-            )
-        }
-        Spacer(modifier = Modifier.width(12.dp))
-        Text(
-            text = domain,
-            style = MaterialTheme.typography.bodyLarge,
-            modifier = Modifier.weight(1f),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        IconButton(onClick = onRemove, modifier = Modifier.size(28.dp)) {
-            Icon(
-                Icons.Default.Close,
-                contentDescription = stringResource(R.string.domain_remove_cd, domain),
-                modifier = Modifier.size(16.dp),
-                tint = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-    }
-}
-
-@Composable
-private fun AddDomainDialog(
-    onDismiss: () -> Unit,
-    onAdd: (String) -> Unit
-) {
-    var domain by remember { mutableStateOf("") }
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.domain_add_title)) },
-        text = {
-            OutlinedTextField(
-                value = domain,
-                onValueChange = { domain = it },
-                label = { Text(stringResource(R.string.domain_label)) },
-                placeholder = { Text(stringResource(R.string.domain_placeholder)) },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
-            )
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                    val value = domain.trim()
-                    if (value.isNotEmpty()) {
-                        onAdd(value)
-                        onDismiss()
-                    }
-                }
-            ) {
-                Text(stringResource(R.string.action_add))
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text(stringResource(R.string.action_cancel))
-            }
-        }
-    )
-}
-
-/**
- * Edits the endpoint ID of an existing node. The node's domains are kept.
- * [onSave] returns null on success or an error message to be shown inline.
- */
-@Composable
-private fun EditNodeDialog(
-    nodeId: String,
-    existingNodeIds: Set<String>,
-    onDismiss: () -> Unit,
-    onSave: (String) -> String?
-) {
-    val context = LocalContext.current
-    val localizedContext = rememberLocalizedContext()
-    var value by remember { mutableStateOf(nodeId) }
-    var error by remember { mutableStateOf<String?>(null) }
-
-    AlertDialog(
-        onDismissRequest = onDismiss,
-        title = { Text(stringResource(R.string.endpoint_edit_id)) },
-        text = {
-            Column {
-                OutlinedTextField(
-                    value = value,
-                    onValueChange = {
-                        value = it
-                        error = null
-                    },
-                    label = { Text(stringResource(R.string.endpoint_id_label)) },
-                    isError = error != null,
-                    supportingText = error?.let { message -> { Text(message) } },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = stringResource(R.string.endpoint_id_current, nodeId),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(
-                onClick = {
-                    val newId = value.trim()
-                    if (newId.isEmpty()) {
-                        error = localizedContext.getString(R.string.error_endpoint_id_empty)
-                    } else if (newId != nodeId && existingNodeIds.contains(newId)) {
-                        error = localizedContext.getString(R.string.error_endpoint_id_exists, newId)
-                    } else {
-                        val failure = onSave(newId)
-                        if (failure != null) error = failure else onDismiss()
-                    }
-                }
-            ) {
-                Text(stringResource(R.string.action_save))
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onDismiss) {
-                Text(stringResource(R.string.action_cancel))
-            }
-        }
-    )
 }
