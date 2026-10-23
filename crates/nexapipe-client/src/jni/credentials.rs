@@ -243,10 +243,10 @@ fn take_issued_credential(env: &mut Env<'_>) -> jstring {
                     };
                     guard.endpoint_group.clone()
                 };
-                if let Some(group) = group {
-                    if let Some(issued) = group.take_issued_credential().await {
-                        return Some(issued);
-                    }
+                if let Some(group) = group
+                    && let Some(issued) = group.take_issued_credential().await
+                {
+                    return Some(issued);
                 }
                 let pool = {
                     let guard = match state.lock() {

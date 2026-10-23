@@ -23,7 +23,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeInit(
     mut unowned_env: EnvUnowned,
     _class: JClass,
 ) -> jint {
-    with_env_or(&mut unowned_env, -1, |env| native_init(env))
+    with_env_or(&mut unowned_env, -1, native_init)
 }
 
 #[unsafe(no_mangle)]
@@ -41,7 +41,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeStartProxy(
     mut unowned_env: EnvUnowned,
     _class: JClass,
 ) -> jint {
-    with_env_or(&mut unowned_env, -1, |env| start_proxy(env))
+    with_env_or(&mut unowned_env, -1, start_proxy)
 }
 
 #[unsafe(no_mangle)]
@@ -148,17 +148,17 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeDestroy(
 
     // Phase 4: explicitly close the endpoint. conn_pool.close_all() now only closes the pool's own
     // endpoint (new()); the shared global endpoint is closed here.
-    if let Some(ep) = endpoint {
-        if let Some(r) = get_runtime() {
-            // Caught for the same reason as above: closing blocks on the
-            // runtime, and an unwind out of this frame is a crash.
-            let _ = catching_panic("nativeDestroy", || {
-                r.block_on(async {
-                    let _ = tokio::time::timeout(CLOSE_ALL_TIMEOUT, ep.close()).await;
-                })
-            });
-            jni_log!("[DEBUG:jni] Endpoint closed");
-        }
+    if let Some(ep) = endpoint
+        && let Some(r) = get_runtime()
+    {
+        // Caught for the same reason as above: closing blocks on the
+        // runtime, and an unwind out of this frame is a crash.
+        let _ = catching_panic("nativeDestroy", || {
+            r.block_on(async {
+                let _ = tokio::time::timeout(CLOSE_ALL_TIMEOUT, ep.close()).await;
+            })
+        });
+        jni_log!("[DEBUG:jni] Endpoint closed");
     }
     result
 }
@@ -275,14 +275,14 @@ fn start_iroh(env: &mut Env<'_>) -> jstring {
 
     // Fast path: if an endpoint already exists, return immediately. Holds the lock briefly without crossing any await.
     {
-        if let Ok(guard) = ENDPOINT.lock() {
-            if let Some(ep) = guard.as_ref() {
-                let id = ep.id().to_string();
-                return match env.new_string(id) {
-                    Ok(s) => s.into_raw(),
-                    Err(_) => std::ptr::null_mut(),
-                };
-            }
+        if let Ok(guard) = ENDPOINT.lock()
+            && let Some(ep) = guard.as_ref()
+        {
+            let id = ep.id().to_string();
+            return match env.new_string(id) {
+                Ok(s) => s.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            };
         }
     }
 
@@ -519,14 +519,14 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         runtime.block_on(async move {
-            let endpoint_group: EndpointGroup;
 
-            if !domain_mappings.is_empty() {
+
+            let endpoint_group: EndpointGroup = if !domain_mappings.is_empty() {
                 jni_log!(
                     "[DEBUG:jni] Using domain_mappings ({} entries)",
                     domain_mappings.len()
                 );
-                endpoint_group = match tokio::time::timeout(
+                match tokio::time::timeout(
                     START_PROXY_TIMEOUT,
                     EndpointGroup::new_with_domain_mappings_and_endpoint(
                         domain_mappings,
@@ -549,7 +549,7 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
                         );
                         return Err("Endpoint group creation timed out".to_string());
                     }
-                };
+                }
             } else if !nodes.is_empty() {
                 jni_log!("[DEBUG:jni] Using nodes ({} entries)", nodes.len());
 
@@ -563,7 +563,7 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
                     return Err("No domains configured for nodes".to_string());
                 }
 
-                endpoint_group = match tokio::time::timeout(
+                match tokio::time::timeout(
                     START_PROXY_TIMEOUT,
                     EndpointGroup::new_with_nodes_and_endpoint(
                         nodes,
@@ -586,11 +586,11 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
                         );
                         return Err("Endpoint group creation timed out".to_string());
                     }
-                };
+                }
             } else {
                 jni_log!("No nodes or domain mappings configured");
                 return Err("No nodes or domain mappings configured".to_string());
-            }
+            };
 
             // 2FA: push the Kotlin-injected credentials to the connection group; new connections run the auth handshake first.
             // The global pair goes to every pool first, then each endpoint's own
@@ -791,7 +791,7 @@ fn stop_proxy() -> jint {
     // Phase 3: close the endpoint group / pool, each with its own timeout, without holding the state lock.
     if let Some(r) = runtime {
         if let Some(group) = endpoint_group.as_ref() {
-            let _ = r.block_on(async {
+            r.block_on(async {
                 match tokio::time::timeout(CLOSE_ALL_TIMEOUT, group.close_all()).await {
                     Ok(_) => jni_log!("[DEBUG:jni] endpoint_group close_all done"),
                     Err(_) => jni_log!(
@@ -802,7 +802,7 @@ fn stop_proxy() -> jint {
             });
         }
         if let Some(pool) = conn_pool.as_ref() {
-            let _ = r.block_on(async {
+            r.block_on(async {
                 match tokio::time::timeout(CLOSE_ALL_TIMEOUT, pool.close_all()).await {
                     Ok(_) => jni_log!("[DEBUG:jni] conn_pool close_all done"),
                     Err(_) => jni_log!(

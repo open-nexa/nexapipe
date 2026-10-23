@@ -271,24 +271,24 @@ pub(crate) fn first_invalid_node_id(
     nodes: &[NodeConfig],
 ) -> Option<String> {
     for mapping in domain_mappings {
-        if let Some(node_id) = mapping.server_node_id.as_deref() {
-            if let Some(reason) = node_id_error(node_id) {
-                return Some(format!(
-                    "Invalid endpoint ID '{node_id}' for domain '{}': {reason}. \
+        if let Some(node_id) = mapping.server_node_id.as_deref()
+            && let Some(reason) = node_id_error(node_id)
+        {
+            return Some(format!(
+                "Invalid endpoint ID '{node_id}' for domain '{}': {reason}. \
                      Endpoint IDs are 64 hexadecimal characters.",
-                    mapping.domain
-                ));
-            }
+                mapping.domain
+            ));
         }
     }
     for node in nodes {
-        if let Some(node_id) = node.server_node_id.as_deref() {
-            if let Some(reason) = node_id_error(node_id) {
-                return Some(format!(
-                    "Invalid endpoint ID '{node_id}': {reason}. \
+        if let Some(node_id) = node.server_node_id.as_deref()
+            && let Some(reason) = node_id_error(node_id)
+        {
+            return Some(format!(
+                "Invalid endpoint ID '{node_id}': {reason}. \
                      Endpoint IDs are 64 hexadecimal characters."
-                ));
-            }
+            ));
         }
     }
     None
@@ -306,7 +306,7 @@ pub(crate) struct ProxyState {
 }
 
 pub(crate) fn get_runtime() -> Option<&'static Runtime> {
-    RUNTIME.get_or_try_init(|| Runtime::new()).ok()
+    RUNTIME.get_or_try_init(Runtime::new).ok()
 }
 
 pub(crate) fn get_endpoint() -> Option<Endpoint> {

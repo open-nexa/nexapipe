@@ -66,7 +66,7 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeTraffic(
     mut unowned_env: EnvUnowned,
     _class: JClass,
 ) -> jstring {
-    with_env_or(&mut unowned_env, std::ptr::null_mut(), |env| traffic(env))
+    with_env_or(&mut unowned_env, std::ptr::null_mut(), traffic)
 }
 fn read_last_error(env: &mut Env<'_>) -> jstring {
     let message = match take_last_error() {
