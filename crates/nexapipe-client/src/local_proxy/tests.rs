@@ -448,6 +448,90 @@ async fn a_half_closed_client_still_receives_the_reply() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
 }
 
+/// A `ClientHello` that arrives in pieces is still a hello.
+///
+/// The record's length is in its first five bytes, so a hello whose first
+/// read carried fewer than five had nothing to measure — and the reading
+/// stopped there, because the loop that reads the rest was inside the
+/// check. The truncated hello was then parsed as if it were the whole one,
+/// which is a hello with no name in it, and the session was closed with no
+/// retry and no tunnel.
+///
+/// The stream here hands over three bytes and the rest a moment later, which
+/// is what a path that segments the first record does.
+#[tokio::test]
+async fn a_hello_that_arrives_in_pieces_is_still_proxied() {
+    use tokio::io::AsyncWriteExt;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // The far side.
+    let server = Endpoint::builder(presets::N0)
+        .alpns(vec![TLS_ALPN.to_vec()])
+        .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap()
+        .bind()
+        .await
+        .expect("the far side binds");
+    let server_addr = server.addr();
+    tokio::spawn(serve_a_tunnel_that_reads_the_hello(server, seen.clone()));
+
+    // This side: an endpoint, a pool over it, and the group over that.
+    let client = Endpoint::builder(presets::N0)
+        .alpns(vec![TLS_ALPN.to_vec()])
+        .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap()
+        .bind()
+        .await
+        .expect("this side binds");
+    let pool = crate::IrohConnectionPool::new_with_endpoint(client, server_addr);
+    let endpoint_group = crate::endpoint_group::EndpointGroup::new_with_single_pool(pool).await;
+
+    // The hello, in two pieces: three bytes, and the rest a moment later.
+    let hello = hello_with_server_names(&[(0x00, HOST)]);
+    let (mut far, near) = tokio::io::duplex(4096);
+    let rest = hello[3..].to_vec();
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        far.write_all(&rest)
+            .await
+            .expect("the rest of the hello goes out");
+        // Held open: the tunnel's copy loop reads from this end.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    super::tls::handle_tls_tunnel(
+        near,
+        hello[..3].to_vec(),
+        vec![0u8; super::STREAM_BUF_SIZE],
+        Arc::new(endpoint_group),
+        Arc::new(vec![HOST.to_string()]),
+        None,
+    )
+    .await
+    .expect("the hello is proxied");
+
+    // The far side must see the whole hello: the client read the name out of
+    // it and forwarded all of it.
+    let forwarded = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let bytes = seen.lock().expect("the lock is not held").clone();
+            if bytes.len() >= hello.len() {
+                break bytes;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the hello never reached the far side");
+    assert_eq!(
+        forwarded, hello,
+        "the far side did not get the hello the client was given"
+    );
+
+    writer.abort();
+}
+
 /// The far side of a tunnel that records what the client forwards.
 ///
 /// The tunnel carries a preface and then the bytes, so the preface is read
@@ -1783,4 +1867,83 @@ async fn a_body_after_the_head_is_forwarded() {
 
     proxy.stop();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
+}
+
+/// A backend that goes quiet ends the response, and the exchange with it.
+///
+/// The bound is a **quiet window** and not a total: a backend that stops
+/// talking for a whole window is cut, and it is cut at the *gap* — not at
+/// some total measured from the moment the request went out. A backend that
+/// has been silent for two minutes is dead, not slow.
+///
+/// The clock is paused, so "a whole window" is exact rather than
+/// approximate, and the test does not sit out the window to find out.
+#[tokio::test(start_paused = true)]
+async fn a_backend_that_goes_quiet_ends_the_response() {
+    let (mut backend, mut origin) = tokio::io::duplex(4096);
+
+    // The origin answers and then says nothing more. Its side stays open:
+    // the backend is quiet, not gone.
+    tokio::spawn(async move {
+        let _ = origin
+            .write_all(b"HTTP/1.1 200 OK\r\n\r\nthe first chunk")
+            .await;
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    });
+
+    let mut relayed = Vec::new();
+    let outcome = relay_the_response(&mut backend, &mut relayed, RESPONSE_IDLE, &mut |_| {}).await;
+
+    assert!(
+        matches!(outcome, ResponseRelay::Quiet),
+        "a backend that went quiet must end the exchange: {outcome:?}"
+    );
+    assert_eq!(
+        relayed, b"HTTP/1.1 200 OK\r\n\r\nthe first chunk",
+        "the bytes that did arrive have to reach the client"
+    );
+}
+
+/// A backend that keeps sending is not cut off, however long it takes.
+///
+/// The bound is a quiet window and not a clock over the whole exchange, so a
+/// response that keeps arriving keeps the exchange alive: the total here is
+/// several times the window, and every gap between two chunks is shorter
+/// than it. A total bound would have cut this exchange in the middle.
+#[tokio::test(start_paused = true)]
+async fn a_backend_that_keeps_sending_is_not_cut_off() {
+    let (mut backend, mut origin) = tokio::io::duplex(4096);
+
+    /// How many chunks the origin sends.
+    const CHUNKS: usize = 10;
+    /// The gap between two chunks: shorter than the window, so no chunk is
+    /// ever late.
+    const GAP: Duration = Duration::from_secs(30);
+
+    tokio::spawn(async move {
+        for i in 0..CHUNKS {
+            let _ = origin.write_all(format!("chunk {i}\n").as_bytes()).await;
+            tokio::time::sleep(GAP).await;
+        }
+        let _ = origin.shutdown().await;
+    });
+
+    let mut relayed = Vec::new();
+    let outcome = relay_the_response(&mut backend, &mut relayed, RESPONSE_IDLE, &mut |_| {}).await;
+
+    assert!(
+        matches!(outcome, ResponseRelay::Complete),
+        "a backend that kept sending must not be cut off: {outcome:?}"
+    );
+    let relayed = String::from_utf8_lossy(&relayed);
+    for i in 0..CHUNKS {
+        assert!(
+            relayed.contains(&format!("chunk {i}\n")),
+            "the chunk {i} did not arrive: {relayed}"
+        );
+    }
+    assert!(
+        CHUNKS as u64 * GAP.as_secs() > RESPONSE_IDLE.as_secs(),
+        "the exchange has to outlast the window, or the test proves nothing"
+    );
 }
