@@ -33,6 +33,23 @@ const appVersion = ref("");
 /// instead, which is the case the notice is for.
 const serviceVersion = ref<string | null>(null);
 
+/**
+ * The timer that takes a success message off the screen.
+ *
+ * A failure is not on a timer at all: it stays until the next action replaces it. It is the
+ * only thing that says why the panel did not change, and a message that disappears after
+ * three seconds is a message nobody reads — which is exactly what an uninstall that left the
+ * service registered looked like.
+ */
+let messageTimer: number | undefined;
+
+function clearMessageTimer() {
+  if (messageTimer !== undefined) {
+    window.clearTimeout(messageTimer);
+    messageTimer = undefined;
+  }
+}
+
 /// A service can die on its own, so the panel re-reads the state instead of trusting the last
 /// action it performed.
 const POLL_INTERVAL_MS = 10_000;
@@ -120,6 +137,11 @@ async function run(
 ) {
   if (isLoading.value) return;
 
+  // Whatever the previous action said goes away with it: a message still on screen while the
+  // next attempt runs describes an attempt that is over.
+  clearMessageTimer();
+  message.value = "";
+
   isLoading.value = true;
   busyWith.value = action;
 
@@ -139,9 +161,13 @@ async function run(
     void refreshServiceRunning();
     isLoading.value = false;
     busyWith.value = "";
-    setTimeout(() => {
-      message.value = "";
-    }, 3000);
+    // Only a success is on a timer. A failure waits for the next action to replace it.
+    if (messageType.value === "success") {
+      messageTimer = window.setTimeout(() => {
+        message.value = "";
+        messageTimer = undefined;
+      }, 3000);
+    }
   }
 }
 
@@ -182,6 +208,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   if (poll !== undefined) window.clearInterval(poll);
+  clearMessageTimer();
 });
 </script>
 
