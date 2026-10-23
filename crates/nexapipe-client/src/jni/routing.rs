@@ -37,6 +37,16 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativePreconnect(
     _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
+    // The body drives the runtime, and unwinding out of an `extern "system"`
+    // frame is a native crash on Android rather than something the JVM can
+    // turn into an exception. So the catch is around the whole body, not
+    // around the one part of it that blocks.
+    catching_panic("nativePreconnect", preconnect).unwrap_or(-1)
+}
+
+/// The body of `nativePreconnect`, split out so the catch has something to
+/// wrap.
+fn preconnect() -> jint {
     jni_log!("[DEBUG:jni] nativePreconnect called");
 
     let runtime = match get_runtime() {
@@ -74,42 +84,31 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativePreconnect(
         }
     };
 
-    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        runtime.block_on(async move {
-            match tokio::time::timeout(PRECONNECT_TIMEOUT, endpoint_group.preconnect_report()).await
-            {
-                Ok(report) => {
-                    // A backend that answered and then refused the connection
-                    // for missing 2FA is counted as unreachable, which on its
-                    // own reads like "server down". Say what actually happened:
-                    // the credentials are missing on this side.
-                    if report.any_auth_required() && !report.any_reachable() {
-                        jni_log!("[DEBUG:jni] nativePreconnect: backend requires 2FA");
-                        set_last_error(AUTH_REQUIRED_MESSAGE);
-                    }
-                    report.reachable.len() as jint
+    let count = runtime.block_on(async move {
+        match tokio::time::timeout(PRECONNECT_TIMEOUT, endpoint_group.preconnect_report()).await {
+            Ok(report) => {
+                // A backend that answered and then refused the connection
+                // for missing 2FA is counted as unreachable, which on its
+                // own reads like "server down". Say what actually happened:
+                // the credentials are missing on this side.
+                if report.any_auth_required() && !report.any_reachable() {
+                    jni_log!("[DEBUG:jni] nativePreconnect: backend requires 2FA");
+                    set_last_error(AUTH_REQUIRED_MESSAGE);
                 }
-                Err(_) => {
-                    jni_log!("[DEBUG:jni] nativePreconnect timed out");
-                    -1
-                }
+                report.reachable.len() as jint
             }
-        })
-    }));
+            Err(_) => {
+                jni_log!("[DEBUG:jni] nativePreconnect timed out");
+                -1
+            }
+        }
+    });
 
-    match result {
-        Ok(count) => {
-            jni_log!(
-                "[DEBUG:jni] nativePreconnect finished: {} backend(s) warmed",
-                count
-            );
-            count
-        }
-        Err(_) => {
-            jni_log!("[DEBUG:jni] Panic occurred during nativePreconnect");
-            -1
-        }
-    }
+    jni_log!(
+        "[DEBUG:jni] nativePreconnect finished: {} backend(s) warmed",
+        count
+    );
+    count
 }
 
 #[unsafe(no_mangle)]
@@ -136,6 +135,16 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeClearNodes(
     _env: EnvUnowned,
     _class: JClass,
 ) -> jint {
+    // Nothing in this body can fail on its own — it takes a lock and clears
+    // two lists — but the frame it runs in cannot survive an unwind, so the
+    // catch is here all the same: a panic must be a failed call rather than a
+    // dead process.
+    catching_panic("nativeClearNodes", clear_nodes).unwrap_or(-1)
+}
+
+/// The body of `nativeClearNodes`, split out so the catch has something to
+/// wrap.
+fn clear_nodes() -> jint {
     let state = match get_state() {
         Some(s) => s,
         None => return 0,

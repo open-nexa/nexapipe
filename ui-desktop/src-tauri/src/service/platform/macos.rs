@@ -2,6 +2,8 @@
 //! process and handed to `launchctl`.
 
 use super::*;
+#[cfg(target_os = "macos")]
+use crate::service::platform::account::AccountId;
 
 /// The launchd job definition.
 ///
@@ -86,7 +88,10 @@ pub fn macos_install_commands(plist_path: &str) -> [Vec<String>; 2] {
 }
 
 #[cfg(target_os = "macos")]
-pub fn install_service_macos(exe_path: &str) -> Result<(), AppError> {
+pub fn install_service_macos(
+    exe_path: &str,
+    installing_by: Option<&AccountId>,
+) -> Result<(), AppError> {
     use std::fs::{self, File};
     use std::io::Write;
     use std::path::Path;
@@ -116,6 +121,19 @@ pub fn install_service_macos(exe_path: &str) -> Result<(), AppError> {
 
     file.write_all(plist_content.as_bytes())
         .map_err(|e| AppError::cause(codes::SERVICE_DEFINITION_FAILED, e))?;
+
+    // Which account this service is installed for, written where the
+    // unprivileged desktop cannot change it: the service runs as root, so it
+    // serves that account and refuses every other one. Written before the
+    // job is registered, because the service reads it as it comes up.
+    if let Some(account) = installing_by {
+        install_owner::record_installed_by(account)?;
+    } else {
+        tracing::warn!(
+            "Installing the service without naming the account it is for: it will serve any local \
+             account that owns the token it reads"
+        );
+    }
 
     let output = Command::new("launchctl")
         .args(&bootstrap)
@@ -153,6 +171,10 @@ pub fn uninstall_service_macos() -> Result<(), AppError> {
     wait_for_service_exit(|| !is_service_running_macos());
 
     let _ = fs::remove_file(&plist_path);
+
+    // The record of which account the service served goes with it: a service
+    // that is no longer installed has no account to serve.
+    install_owner::forget_installed_by();
 
     Ok(())
 }

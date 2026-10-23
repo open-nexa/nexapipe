@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Thirty-three things land in this cycle so far: the device credential can be a **key**
+Thirty-five things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -51,7 +51,9 @@ connection rather than three, a 2FA code from a step that has gone by is
 refused, the price of a second connection is measured now — it comes to a
 handshake, the protocol is chosen at the handshake, the pool's ceiling
 is counted per protocol, and the tunnel path runs on hyper's own HTTP/1
-codec, and a TLS hello that arrives in pieces is read until it is whole.
+codec, and a TLS hello that arrives in pieces is read until it is whole, and
+the TLS tunnel half-closes in both directions, and every JNI entry point
+catches a panic before it leaves the frame.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -1078,6 +1080,40 @@ lookup, which is what a config written before the key existed does.
   five consecutive connect failures, where it used to return 502 each time.
 
 ### Fixed
+
+- **Every JNI entry point catches a panic.** A panic that unwinds out of an
+  `extern "system"` frame is a native crash on Android, not a Java exception:
+  the process dies, and the user sees the VPN simply disappear rather than one
+  call failing. The module had the two barriers for this — `catching_panic` and
+  `with_env_or` — and most of the thirty-three entry points used them, but five
+  did not: `nativeDropConnections` and `nativePreconnect` caught only the part
+  of their body that blocks on the runtime, `nativeDestroy` caught the endpoint
+  close but not the rest of the teardown, and `nativeClearNodes` and
+  `nativeClearNodeTwoFactor` had no barrier at all.
+  Each of the five now wraps its whole body in the module's own barrier and
+  answers the failure value the module's convention says it answers with, and
+  the entry points that already had a whole-body barrier no longer catch
+  twice: every entry point has exactly one barrier, at the top. The reason a
+  panic happened is left behind as well, so the app can read it back through
+  `nativeTakeLastError`.
+
+- **The TLS tunnel half-closes in both directions.** The tunnel's two
+  directions were raced against each other with a `select!`, and `select!`
+  cancels the branch that loses the race. A client that shut its write side
+  down — a half-close, which is a request and not an ending — ended the
+  direction that carried its bytes, and the direction carrying the backend's
+  answer was dropped a microsecond later. The client never saw the answer it
+  was waiting for, and the backend saw the connection disappear rather than a
+  clean end of stream.
+
+  The two directions are joined now rather than raced: each one shuts the
+  peer's write side down as it ends, and the tunnel waits for both. A
+  half-close is a request, not an ending, so the answer that follows it still
+  arrives. A direction that **fails** ends the tunnel at once — the transport
+  is broken and there is nothing to wait for — and a direction that ends
+  cleanly is given thirty seconds to finish before the tunnel gives up on it.
+  The idle window is measured over both directions, so a direction that is
+  quiet on its own does not end a tunnel the other one is still using.
 
 - **A TLS `ClientHello` that arrives in pieces is read until it is whole.** The
   record's length is in its first five bytes, so a hello whose first read
