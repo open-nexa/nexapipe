@@ -1079,6 +1079,39 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The local proxy no longer drops the bytes that came with the request
+  head.** The head reader keeps everything it read, so a client that wrote the
+  request head and the first bytes of the tunnel in one go has both in the
+  buffer by the time the head is complete. The ordinary HTTP path forwarded
+  them; the CONNECT and WebSocket paths did not, and they read the socket
+  again from there — and the socket had already given those bytes up, so they
+  were gone.
+
+  A CONNECT tunnel therefore began in the middle of whatever the client had
+  sent: a TLS client that pipelined its first record into the CONNECT got a
+  stream the far side could not read, and the failure surfaced as a TLS error
+  behind a `200 Connection Established` that had promised the tunnel was up. A
+  WebSocket lost its first frame for the same reason, and a browser that
+  coalesced the upgrade and the frame lost it.
+
+  Both branches forward the bytes now.
+
+- **The desktop app's check that its commands are granted to the webview runs
+  when the command list changes.** The check reads the
+  `tauri::generate_handler!` list out of `src/lib.rs` and fails the build when a
+  command is not granted in `permissions/app-commands.toml` and
+  `capabilities/default.json`. It did not run when `src/lib.rs` changed. The
+  build script tells Cargo which files it watches, and from the moment it names
+  one, Cargo re-runs the script for those files and for nothing else — the
+  default "re-run when anything in the package changes" is gone. `src/lib.rs`
+  was not among the files it named, so the check saw the command list as it was
+  when the script last ran, and a command added without its permission reached
+  the next release unnoticed, which is the failure this check was written to
+  catch.
+
+  The file is watched now, the way the error-code check beside it already
+  watches its own inputs.
+
 - **The client and the server read the name inside a TLS `ClientHello` the
   same way now.** They each had a reader of their own, and the two did not
   agree. The server's walked the whole `server_name` list and took the entry
@@ -1096,6 +1129,16 @@ lookup, which is what a config written before the key existed does.
   hello whose host name sits behind another entry type is proxied rather than
   dropped, and a hello whose name carries a control character is closed
   rather than logged.
+
+  It reads the record and nothing past it as well. The record's own length
+  says where the `ClientHello` ends, and the two ends of the tunnel do not
+  have the same buffer: the client has whatever its read pulled in, the server
+  has what arrived on the tunnel, and the tunnel path's own sniffer has the
+  record and nothing else. A hello whose record understates the message
+  inside it could therefore be read as one name on one end and as another on
+  the other — and a name sitting in the bytes after the record could be read
+  as the name of the hello at all. The reader stops at the record's end now,
+  so the answer is about the `ClientHello` and about nothing else.
 
 - **The client's own documentation builds without a warning.** `cargo doc -p
   nexapipe-client` reported sixteen. Fifteen of them were links that pointed at
