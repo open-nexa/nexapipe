@@ -9,8 +9,9 @@
 //!   `host_pattern` and against a client's `allow_hosts`;
 //! - the **client library**, deciding whether a `CONNECT` target is one it
 //!   proxies and whether a DNS query is for a name that belongs in the tunnel;
-//! - the **desktop app**, which answers the question through the client's own
-//!   DNS server rather than through a second copy of it.
+//! - the **desktop app**, which runs its own local DNS server and answers
+//!   through the client's shared DNS handling rather than through a copy of
+//!   the rule of its own.
 //!
 //! They drifted, and the drift was not cosmetic. The server's rule is strict —
 //! `*.example.com` is the subdomains and not the apex — while the client's was
@@ -25,7 +26,9 @@
 //! on Windows the query was local-delivered to the app's own resolver and on
 //! macOS and Linux it traversed the TUN and reached the library's. The same
 //! config, the same name, two different answers, decided by the platform.
-//! There is one DNS server now — the client's — and the desktop asks it.
+//! The desktop runs a local DNS server now — it binds the address its queries
+//! arrive at — and answers them through the client's shared handling, so the
+//! answer is the same on every platform.
 //!
 //! So the rule lives here, in the crate both sides already link, and there is
 //! exactly one of it.
