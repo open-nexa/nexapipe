@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 
-use hyper::body::{Frame, Incoming};
+pub use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 
@@ -428,19 +428,21 @@ async fn forward(
                 // The backend answered, so it is up: the circuit is told, and a
                 // backend that was out of rotation comes back into it.
                 backend.report_success();
-                let elapsed_ms = started.elapsed().as_millis() as u64;
-                crate::metrics::METRICS.record_request(answer.status().as_u16(), elapsed_ms);
-                crate::log::log_access(
-                    &ctx.request_id,
-                    &ctx.peer,
-                    method.as_str(),
-                    request_target,
-                    answer.status().as_u16(),
-                    elapsed_ms,
-                    answer.bytes_sent(),
-                    Some(&ctx.who),
-                );
-                return Ok(answer);
+                let status = answer.status().as_u16();
+                crate::metrics::METRICS
+                    .record_request(status, started.elapsed().as_millis() as u64);
+                // The access line is written by the answer's body, when the
+                // answer is over: the bytes it reports are the bytes that
+                // reached the client, and they are not known until then.
+                return Ok(answer.with_report(crate::http::server::AccessReport {
+                    request_id: ctx.request_id.clone(),
+                    peer: ctx.peer.clone(),
+                    method: method.as_str().to_string(),
+                    request_target: request_target.to_string(),
+                    status,
+                    started,
+                    who: ctx.who.clone(),
+                }));
             }
             Err(failure) => failure,
         };
@@ -537,7 +539,7 @@ fn head_size(request: &Request<()>) -> usize {
 ///   read as the backend asks for them. A body that declared a length is
 ///   this one: the length is known, so the upload never has to be held, and
 ///   the backend can start on the first byte.
-pub enum RequestBody {
+pub enum RequestBody<B = Incoming> {
     /// The bytes are here, and they can be sent again.
     Whole {
         bytes: bytes::Bytes,
@@ -545,10 +547,14 @@ pub enum RequestBody {
         reservation: crate::conn::limits::ByteReservation,
     },
     /// Still on the client's stream.
-    Streaming(IncomingBody),
+    Streaming(IncomingBody<B>),
 }
 
-impl RequestBody {
+impl<B> RequestBody<B>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin + Send + 'static,
+    B::Error: Into<BoxError>,
+{
     /// Whether the request may be tried again.
     ///
     /// A body that is here can be sent again; one that is still on the
@@ -680,22 +686,47 @@ async fn read_request_body(
 /// before the body was read has to be able to send the body again, and the
 /// client's bytes are the only place they are. The lock is held for the
 /// length of one poll and for nothing else.
-pub struct IncomingBody {
+pub struct IncomingBody<B = Incoming> {
     /// Hyper's stream, shared with the copy the request carries.
-    reader: Arc<std::sync::Mutex<Incoming>>,
+    reader: Arc<std::sync::Mutex<B>>,
     /// What the owner of the request needs to know about this body.
     state: Arc<crate::http::body::BodyState>,
     /// When the body has to be finished by.
     deadline: tokio::time::Instant,
+    /// The budget the bytes are charged to.
+    ///
+    /// The process-wide one is what a request is charged against. A caller
+    /// with a budget of its own — a test that must not disturb the shared one
+    /// — names it here.
+    budget: Arc<crate::conn::limits::ByteBudget>,
 }
 
-impl IncomingBody {
+impl<B> IncomingBody<B>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin + Send + 'static,
+    B::Error: Into<BoxError>,
+{
     /// The body, and the deadline it is held to.
-    pub fn new(inner: Incoming, body_deadline: Duration) -> Self {
+    pub fn new(inner: B, body_deadline: Duration) -> Self {
+        Self::with_budget(
+            inner,
+            body_deadline,
+            crate::conn::limits::body_budget().clone(),
+        )
+    }
+
+    /// The body, the deadline it is held to, and the budget it is charged
+    /// against.
+    pub fn with_budget(
+        inner: B,
+        body_deadline: Duration,
+        budget: Arc<crate::conn::limits::ByteBudget>,
+    ) -> Self {
         Self {
             reader: Arc::new(std::sync::Mutex::new(inner)),
             state: Arc::new(crate::http::body::BodyState::default()),
             deadline: tokio::time::Instant::now() + body_deadline,
+            budget,
         }
     }
 
@@ -720,13 +751,14 @@ impl IncomingBody {
     ///
     /// The body is **lent** rather than given away: the request that fails
     /// before the body was read has to be able to send it again.
-    pub fn lend(&self) -> LentBody {
+    pub fn lend(&self) -> LentBody<B> {
         LentBody {
             reader: self.reader.clone(),
             state: self.state.clone(),
             deadline: self.deadline,
             timer: None,
-            reservation: crate::conn::limits::ByteReservation::empty(),
+            reservation: crate::conn::limits::ByteReservation::take_from(&self.budget, 0)
+                .expect("a reservation of nothing is always available"),
         }
     }
 }
@@ -736,9 +768,9 @@ impl IncomingBody {
 /// It reads the shared stream, charges the bytes it reads to the process-wide
 /// budget, and records that they were read — which is what the retry rule
 /// asks, and what the access log's byte count is made of.
-pub struct LentBody {
+pub struct LentBody<B = Incoming> {
     /// Hyper's stream, shared with the owner of the request.
-    reader: Arc<std::sync::Mutex<Incoming>>,
+    reader: Arc<std::sync::Mutex<B>>,
     /// What the owner of the request needs to know about this body.
     state: Arc<crate::http::body::BodyState>,
     /// When the body has to be finished by.
@@ -758,7 +790,11 @@ pub struct LentBody {
     reservation: crate::conn::limits::ByteReservation,
 }
 
-impl hyper::body::Body for LentBody {
+impl<B> hyper::body::Body for LentBody<B>
+where
+    B: hyper::body::Body<Data = bytes::Bytes> + Unpin + Send + 'static,
+    B::Error: Into<BoxError>,
+{
     type Data = bytes::Bytes;
     type Error = BoxError;
 
@@ -795,7 +831,7 @@ impl hyper::body::Body for LentBody {
                 }
                 Poll::Ready(Some(Ok(frame)))
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(BoxError::from(e)))),
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e.into()))),
             Poll::Ready(None) => {
                 this.state.mark_sent();
                 Poll::Ready(None)
@@ -803,6 +839,30 @@ impl hyper::body::Body for LentBody {
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+/// What the access log says about a request that was answered.
+///
+/// It travels with the answer's body, because the answer is not over until
+/// the body is: the bytes that reached the client are counted as they go
+/// out, and the line is written when the last of them has gone. A line
+/// written when the head went out would report a body of nothing, and a
+/// duration that stopped before the answer did.
+pub struct AccessReport {
+    /// The id of the request.
+    pub request_id: String,
+    /// Who sent it.
+    pub peer: String,
+    /// The method.
+    pub method: String,
+    /// What was asked for.
+    pub request_target: String,
+    /// The status the client is being answered with.
+    pub status: u16,
+    /// When the request started: the duration is the whole exchange.
+    pub started: std::time::Instant,
+    /// Who the connection authenticated as.
+    pub who: crate::conn::peers::PeerIdentity,
 }
 
 /// The backend's answer, counted as it goes out.
@@ -825,17 +885,47 @@ pub struct CountedBody {
     idle: Duration,
     /// The timer that ends the answer when the backend goes quiet.
     timer: Pin<Box<tokio::time::Sleep>>,
+    /// What the access log says, once the answer is over.
+    report: Option<AccessReport>,
 }
 
 impl CountedBody {
     /// The answer, and where the count is kept.
-    pub fn new(inner: Incoming, bytes_sent: Arc<AtomicUsize>, idle: Duration) -> Self {
+    pub fn new(
+        inner: Incoming,
+        bytes_sent: Arc<AtomicUsize>,
+        idle: Duration,
+        report: Option<AccessReport>,
+    ) -> Self {
         Self {
             inner,
             bytes_sent,
             idle,
             timer: Box::pin(tokio::time::sleep(idle)),
+            report,
         }
+    }
+}
+
+impl Drop for CountedBody {
+    fn drop(&mut self) {
+        // The answer is over: whatever reached the client is what the line
+        // says, and a body that died half way is reported as the half that
+        // arrived.
+        let Some(report) = self.report.take() else {
+            return;
+        };
+        let bytes_sent = self.bytes_sent.load(Ordering::Relaxed);
+        crate::log::log_access(
+            &report.request_id,
+            &report.peer,
+            &report.method,
+            &report.request_target,
+            report.status,
+            report.started.elapsed().as_millis() as u64,
+            bytes_sent,
+            Some(&report.who),
+        );
     }
 }
 
@@ -864,6 +954,9 @@ impl hyper::body::Body for CountedBody {
             Poll::Ready(Some(Ok(frame))) => {
                 if let Some(data) = frame.data_ref() {
                     this.bytes_sent.fetch_add(data.len(), Ordering::Relaxed);
+                    // The process-wide total counts what left for the client,
+                    // and it counts it as it leaves.
+                    crate::metrics::METRICS.record_bytes_sent(data.len() as u64);
                 }
                 Poll::Ready(Some(Ok(frame)))
             }

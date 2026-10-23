@@ -276,23 +276,4 @@ impl ProxyFailure {
             retry,
         }
     }
-
-    /// A failure that happened `written` bytes into a `status` response.
-    ///
-    /// Used on the paths where the count is of bytes the client actually
-    /// received: a buffer that was filled but never flushed has not arrived, so
-    /// it is not in here.
-    pub(crate) fn after(status: StatusCode, written: usize, error: anyhow::Error) -> Self {
-        ProxyFailure {
-            error,
-            partial: Some(ProxySummary {
-                status: status.as_u16(),
-                bytes_sent: written,
-            }),
-            // The client has part of the answer, so there is nothing to try
-            // again: it would be a second answer to a request that was already
-            // answered.
-            retry: Retryability::Never,
-        }
-    }
 }

@@ -1,11 +1,13 @@
 //! The hand-written HTTP/1 parser.
 //!
-//! The tunnel path cannot use hyper's own codec, because it has to have the
-//! whole head before it can answer — and hyper's server consumes the head
-//! as it parses it. So the request is parsed here, by hand, and a response is
-//! read back the same way.
+//! The **request** is hyper's now: the tunnel path runs on hyper's codec, so
+//! the head is parsed by hyper and there is nothing left to parse by hand.
+//!
+//! The **response** is still read here, because it is the backend's answer to
+//! a WebSocket upgrade — and that one is read off a connection of its own,
+//! before hyper is involved at all.
 
-use ::http::{Request, Response};
+use ::http::Response;
 
 pub fn parse_http_response_legacy(response: &[u8]) -> Result<Response<Vec<u8>>, anyhow::Error> {
     // The end of the header block is looked for in the bytes, never measured
@@ -70,55 +72,4 @@ pub fn parse_http_response_legacy(response: &[u8]) -> Result<Response<Vec<u8>>, 
 /// both check here, and both answer 400.
 pub fn names_more_than_one_host(headers: &::http::HeaderMap) -> bool {
     headers.get_all("host").iter().count() > 1
-}
-
-/// The request as it arrived, parsed out of the bytes.
-///
-/// The head only, because the body is read separately and this is the only
-/// place the head exists as bytes.
-///
-/// A request that names more than one host is refused here rather than
-/// downstream: the route and the access check read the first `Host` header,
-/// and the backend would be handed all of them, so the request that is
-/// authorised and the request that is served would be two different requests.
-/// See [`names_more_than_one_host`].
-pub fn parse_http_request_legacy(buf: &[u8]) -> Result<Request<()>, anyhow::Error> {
-    let request_str = String::from_utf8_lossy(buf);
-    let mut lines = request_str.split("\r\n");
-
-    let request_line = lines
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("invalid HTTP request: missing request line"))?;
-
-    let parts: Vec<&str> = request_line.split_whitespace().collect();
-    if parts.len() < 2 {
-        return Err(anyhow::anyhow!("invalid HTTP request line"));
-    }
-
-    let method = http::Method::from_bytes(parts[0].as_bytes())
-        .map_err(|e| anyhow::anyhow!("invalid HTTP method: {}", e))?;
-    let uri = http::Uri::try_from(parts[1]).map_err(|e| anyhow::anyhow!("invalid URI: {}", e))?;
-
-    let mut builder = Request::builder().method(method).uri(uri);
-    let mut hosts = 0usize;
-
-    for line in lines {
-        if line.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            let name = name.trim();
-            if name.eq_ignore_ascii_case("host") {
-                hosts += 1;
-                if hosts > 1 {
-                    return Err(anyhow::anyhow!(
-                        "the request carries more than one Host header"
-                    ));
-                }
-            }
-            builder = builder.header(name, value.trim());
-        }
-    }
-
-    Ok(builder.body(())?)
 }
