@@ -57,7 +57,7 @@ pub(super) struct Entries {
 
 impl Store {
     /// The store for this installation.
-    fn open() -> Result<Self, AppError> {
+    pub(super) fn open() -> Result<Self, AppError> {
         let dir = store_dir();
         std::fs::create_dir_all(&dir)
             .map_err(|e| AppError::cause(codes::CREDENTIALS_STORE_FAILED, e))?;

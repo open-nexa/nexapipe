@@ -771,17 +771,35 @@ class VpnViewModel : ViewModel() {
         // A key belongs to the device, not to the credential it proves: the
         // server holds the public half under this device's name, so replacing
         // the key would leave the server holding one key and this phone
-        // signing with another. It is kept, then, and a new one is minted
-        // only for a node that has none.
-        if (manager.deviceKeyFor(nodeId).isNotBlank()) {
+        // signing with another.
+        //
+        // **The endpoint's own key comes first**, because the server holds
+        // *that* one under this device's name: offering another would be a
+        // different device as far as the server is concerned, and the
+        // enrollment would be refused as a takeover. It is also adopted as the
+        // device's key when the device has none yet — so that the endpoint
+        // this phone enrolls with next offers the key the server already
+        // knows, instead of a new one no server has ever seen.
+        val own = manager.deviceKeyForNode(nodeId)
+        if (own.isNotBlank()) {
+            manager.adoptDeviceKeyIfEmpty(own)
             addLog("Kept the device key of ${nodeId.take(8)}")
+            return
+        }
+        // The device's own key, when it has one: this phone answers as one
+        // device to every server, and a key per endpoint would make it a
+        // different device to each of them. The name the server files a
+        // credential under does not change when the endpoint does, so the key
+        // must not either.
+        if (manager.deviceKey().isNotBlank()) {
+            addLog("Kept this device's key for ${nodeId.take(8)}")
             return
         }
         val privateKey = IrohProxy.nativeGenerateDeviceKey() ?: run {
             addLog("No device key for ${nodeId.take(8)}: this endpoint will enroll with a secret")
             return
         }
-        if (!manager.saveDeviceKey(nodeId, privateKey)) {
+        if (!manager.saveDeviceKeyForDevice(privateKey)) {
             addLog("Device key not kept for ${nodeId.take(8)}: this device cannot store one")
             return
         }
@@ -851,8 +869,13 @@ class VpnViewModel : ViewModel() {
         // hold — and one that a later enrollment would offer as if it had never
         // been used. Dropped here, which is the one moment that knows the offer
         // was ignored; enrolling again mints a key of its own.
+        //
+        // The endpoint's own key is what goes: it was what this enrollment
+        // offered and what the server did not take. The device's key stays —
+        // it belongs to the phone, and the other endpoints of it answer with
+        // it.
         if (issued.publicKey == null) {
-            val leftover = settingsManager?.deviceKeyFor(node.nodeId).orEmpty()
+            val leftover = settingsManager?.deviceKeyForNode(node.nodeId).orEmpty()
             if (leftover.isNotBlank()) {
                 settingsManager?.clearDeviceKey(node.nodeId)
                 addLog(
@@ -897,6 +920,10 @@ class VpnViewModel : ViewModel() {
         // this endpoint is about to enroll again, in which case the key is
         // what the enrollment will offer and dropping it now would leave the
         // device with nothing to prove itself with.
+        //
+        // The endpoint's own key is what goes: it was what that credential
+        // answered with. The device's key stays — it belongs to the phone,
+        // and the other endpoints of it answer with it.
         val enrolling = nodes.value[index].enrollment != null
         if (previous?.publicKey != null && twoFactor?.publicKey == null && !enrolling) {
             settingsManager?.clearDeviceKey(nodeId)

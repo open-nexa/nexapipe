@@ -38,6 +38,7 @@
 // encrypted file, the master key that file is sealed with, the files they
 // live in, and the bytes they are made of.
 mod bytes;
+mod device_key;
 mod files;
 mod master_key;
 mod store;
@@ -48,6 +49,37 @@ mod tests;
 
 pub use store::{get, keys, put, remove, status};
 pub use types::{mask, secret_key, CredentialKind, KeySource};
+
+use crate::error::AppError;
+
+/// The key a node has of its own: the one it enrolled with.
+///
+/// `None` when it has none — a node that was added without a registration
+/// invite, or one whose key was dropped with its credential.
+pub fn node_device_key(node_id: &str) -> Result<Option<String>, AppError> {
+    device_key::node_device_key(&store::Store::open()?, node_id)
+}
+
+/// The key this machine proves itself with.
+///
+/// The machine's own key, and — for a machine that has none yet — the key of a
+/// node that has one, adopted into the machine's own slot so that every node
+/// after it answers with the same key.
+pub fn machine_device_key() -> Result<Option<String>, AppError> {
+    device_key::machine_device_key(&store::Store::open()?)
+}
+
+/// The key a node proves itself with: its own when it has one, and the
+/// machine's when it does not.
+pub fn effective_device_key(node_id: &str) -> Result<Option<String>, AppError> {
+    device_key::effective_device_key(&store::Store::open()?, node_id)
+}
+
+/// Keeps a key as the node's own, and as the machine's when the machine has
+/// none.
+pub fn file_device_key(node_id: &str, private_key_hex: &str) -> Result<(), AppError> {
+    device_key::file_device_key(&store::Store::open()?, node_id, private_key_hex)
+}
 
 // The private halves of the pieces, named here so that the test module can
 // reach them under the names it has always used.
