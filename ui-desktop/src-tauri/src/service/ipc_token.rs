@@ -189,7 +189,7 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 /// writable by group or other: a directory that is already private keeps the
 /// mode it has, so a stricter one set by hand survives.
 ///
-/// A directory that cannot be stat'ed is left alone, and the error is
+/// A directory that cannot be stat'ed is not touched, and the error is
 /// reported: the caller asked for a directory it could not make private, and
 /// saying so is better than a token written into a directory whose mode
 /// nobody knows.
