@@ -1,3 +1,4 @@
+use super::enrollment::refused_enrollment_message;
 use super::{
     DeviceKey, Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth, TwoFactorConfig,
     device_id_is_usable, message::read_message_bytes,
@@ -367,6 +368,53 @@ fn an_enrollment_offering_a_key_round_trips_byte_exactly() {
         other => panic!("expected ENROLL_START, got {other:?}"),
     }
     assert_eq!(*start.to_bytes().unwrap(), wire.to_vec());
+}
+
+/// A refused enrollment says which device asked, because that is what the
+/// server's own log names and what an operator has to act on.
+///
+/// The server answers every refusal with the same string — whether the token
+/// was unknown, already spent or the device was already enrolled is not
+/// information a stranger is owed — so the client is what puts the two logs
+/// together.
+#[test]
+fn a_refused_enrollment_names_the_device_it_asked_under() {
+    let message = refused_enrollment_message(
+        "the enrollment token was not accepted",
+        "xm17",
+        Some("phone-1a2b3c4d"),
+    );
+
+    assert!(message.contains("xm17"), "{message}");
+    assert!(message.contains("phone-1a2b3c4d"), "{message}");
+    assert!(
+        message.contains("nexapipe client revoke xm17 --device phone-1a2b3c4d"),
+        "{message}"
+    );
+}
+
+/// Without a device name there is nothing to name but the client — and
+/// nothing to revoke, so the message does not point at a command.
+#[test]
+fn a_refused_enrollment_without_a_device_names_the_client() {
+    let message = refused_enrollment_message("the enrollment token was not accepted", "xm17", None);
+
+    assert!(message.contains("xm17"), "{message}");
+    assert!(!message.contains("client revoke"), "{message}");
+}
+
+/// An enrollment that offers a key names the device it offered it under: that
+/// is the name the server files the key under, and the one it refuses to take
+/// over.
+#[test]
+fn an_enrollment_that_offers_a_key_carries_the_device_name() {
+    let key = iroh::SecretKey::generate();
+    let enrollment = Enrollment::new("xm17", "tok")
+        .with_device("phone-1a2b3c4d")
+        .with_key(key.clone());
+
+    assert_eq!(enrollment.device_id(), Some("phone-1a2b3c4d"));
+    assert_eq!(enrollment.client_id(), "xm17");
 }
 
 /// The offer is made of the public half, lowercase hex — the spelling the
