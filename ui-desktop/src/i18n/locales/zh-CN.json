@@ -248,9 +248,11 @@
     "relayDisabled": "停用（完全不使用中继）",
     "relayCustom": "自定义 URL（独占）",
     "relayUrl": "中继 URL",
-    "relayUrlHint": "必填，且只使用这一个，不再使用 N0 中继。下次启动时生效。",
+    "relayUrlHint": "必填，且只使用这一个，不再使用 N0 中继。下次启动时生效。修改它会清除中继鉴权令牌。",
     "relayAuthToken": "中继鉴权令牌",
-    "relayAuthTokenHint": "仅当中继需要时才填写；服务端需要使用相同的令牌。",
+    "relayAuthTokenHint": "仅当中继需要时才填写；服务端需要使用相同的令牌。令牌只属于签发它的中继：改了上面的中继，令牌就会被清除。",
+    "relayAuthTokenBoundTo": "签发给 {relay}。",
+    "relayTokenCleared": "中继鉴权令牌已清除：令牌只属于签发它的中继。如果这个中继需要令牌，请重新填写。",
     "loadExample": "载入示例",
     "clearConfig": "清空配置",
     "nodeFallback": "节点 {index}"

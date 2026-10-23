@@ -1869,6 +1869,396 @@ async fn a_body_after_the_head_is_forwarded() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
 }
 
+/// A second request that came with the head is refused.
+///
+/// The list of proxied domains is consulted about the first request, and the
+/// server serves keep-alive requests on one stream — so a second request that
+/// reaches the server is answered by it, and the list was never consulted
+/// about it. The bytes that came with the head are refused when they are
+/// another request rather than a body.
+#[tokio::test]
+async fn a_second_request_that_came_with_the_head_is_refused() {
+    let (proxy, addr) = listening_proxy_for(&[HOST]).await;
+    let runner = spawn_run(&proxy);
+
+    let mut client = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("the proxy is listening");
+    client
+        .write_all(
+            format!(
+                "GET /a HTTP/1.1\r\nHost: {HOST}\r\n\r\nGET /b HTTP/1.1\r\nHost: other.test\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("the request is written");
+
+    let mut answer = Vec::new();
+    let _read = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        client.read_to_end(&mut answer),
+    )
+    .await
+    .expect("the client read never returned")
+    .expect("the client read failed");
+
+    proxy.stop();
+    let _ = runner.await;
+
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(
+        answer.starts_with("HTTP/1.1 400"),
+        "the request was refused with: {answer}"
+    );
+}
+
+/// A request that declares no body has no body, whatever its method says.
+///
+/// RFC 9112 §6.3 gives a message with no framing header a body of zero
+/// bytes, so the bytes that came with the head are another request's head.
+/// A length of zero says the same thing.
+#[tokio::test]
+async fn a_request_without_a_declared_length_has_no_body() {
+    let (proxy, addr) = listening_proxy_for(&[HOST]).await;
+    let runner = spawn_run(&proxy);
+
+    for head in [
+        format!("POST /a HTTP/1.1\r\nHost: {HOST}\r\n\r\n"),
+        format!("POST /a HTTP/1.1\r\nHost: {HOST}\r\ncontent-length: 0\r\n\r\n"),
+    ] {
+        let mut client = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("the proxy is listening");
+        client
+            .write_all(head.as_bytes())
+            .await
+            .expect("the request is written");
+        client
+            .write_all(b"GET /b HTTP/1.1\r\nHost: other.test\r\n\r\n")
+            .await
+            .expect("the second request is written");
+
+        let mut answer = Vec::new();
+        let _read = tokio::time::timeout(
+            tokio::time::Duration::from_secs(5),
+            client.read_to_end(&mut answer),
+        )
+        .await
+        .expect("the client read never returned")
+        .expect("the client read failed");
+
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(
+            answer.starts_with("HTTP/1.1 400"),
+            "a request that declares no body was answered with: {answer}"
+        );
+    }
+
+    proxy.stop();
+    let _ = runner.await;
+}
+
+/// A body that is longer than it declares is a second request.
+///
+/// The length is what the request says about its body, and the bytes past
+/// it are not the body's: they are the head of another request.
+#[tokio::test]
+async fn a_body_longer_than_it_declares_is_refused() {
+    let (proxy, addr) = listening_proxy_for(&[HOST]).await;
+    let runner = spawn_run(&proxy);
+
+    let mut client = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("the proxy is listening");
+    client
+        .write_all(
+            format!(
+                "POST /a HTTP/1.1\r\nHost: {HOST}\r\ncontent-length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\n\
+                 Host: other.test\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("the request is written");
+
+    let mut answer = Vec::new();
+    let _read = tokio::time::timeout(
+        tokio::time::Duration::from_secs(5),
+        client.read_to_end(&mut answer),
+    )
+    .await
+    .expect("the client read never returned")
+    .expect("the client read failed");
+
+    proxy.stop();
+    let _ = runner.await;
+
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(
+        answer.starts_with("HTTP/1.1 400"),
+        "the request was refused with: {answer}"
+    );
+}
+
+/// The bytes that came with the head are the body's when the head says the
+/// request has one.
+///
+/// The two cases are told apart by the head, and the head is what says it: a
+/// request that declares a body has one, and the bytes that came with the
+/// head are its first ones. A body that arrives with the head is forwarded
+/// like any other body.
+#[tokio::test]
+async fn a_body_that_came_with_the_head_is_forwarded() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let server = Endpoint::builder(presets::N0)
+        .alpns(vec![ALPN.to_vec()])
+        .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap()
+        .bind()
+        .await
+        .expect("the far side binds");
+    let server_addr = server.addr();
+    tokio::spawn(serve_an_http_backend(server));
+
+    let (proxy, proxy_addr) = proxy_over(server_addr).await;
+    let runner = spawn_run(&proxy);
+
+    // The head and the body, in one write.
+    let body = b"the body";
+    let mut request = format!(
+        "POST / HTTP/1.1\r\nHost: {HOST}\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+
+    let mut stream = TcpStream::connect(proxy_addr)
+        .await
+        .expect("the proxy accepts");
+    stream
+        .write_all(&request)
+        .await
+        .expect("the request goes out");
+
+    let mut answer = Vec::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_to_end(&mut answer),
+    )
+    .await;
+    assert!(read.is_ok(), "the answer never arrived");
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(
+        answer.starts_with("HTTP/1.1 200"),
+        "the request was not served: {answer}"
+    );
+    assert!(
+        answer.contains(&format!("body={}", body.len())),
+        "the body did not arrive whole: {answer}"
+    );
+
+    proxy.stop();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
+}
+
+/// A body that is shorter than it declares is still the body's.
+///
+/// The length says how much may follow the head, not that all of it is there
+/// already: the first bytes of a body are the body's, and the rest of it may
+/// come later.
+#[tokio::test]
+async fn a_body_shorter_than_it_declares_is_still_the_body() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let server = Endpoint::builder(presets::N0)
+        .alpns(vec![ALPN.to_vec()])
+        .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap()
+        .bind()
+        .await
+        .expect("the far side binds");
+    let server_addr = server.addr();
+    tokio::spawn(serve_an_http_backend(server));
+
+    let (proxy, proxy_addr) = proxy_over(server_addr).await;
+    let runner = spawn_run(&proxy);
+
+    // The head and the first bytes of the body, in one write.
+    let body = b"hello world";
+    let mut request = format!(
+        "POST / HTTP/1.1\r\nHost: {HOST}\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(b"hello");
+
+    let mut stream = TcpStream::connect(proxy_addr)
+        .await
+        .expect("the proxy accepts");
+    stream
+        .write_all(&request)
+        .await
+        .expect("the request goes out");
+    // And the rest of it, later.
+    stream
+        .write_all(b" world")
+        .await
+        .expect("the rest of the body goes out");
+
+    let mut answer = Vec::new();
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        stream.read_to_end(&mut answer),
+    )
+    .await;
+    assert!(read.is_ok(), "the answer never arrived");
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(
+        answer.starts_with("HTTP/1.1 200"),
+        "the request was not served: {answer}"
+    );
+    assert!(
+        answer.contains(&format!("body={}", body.len())),
+        "the body did not arrive whole: {answer}"
+    );
+
+    proxy.stop();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
+}
+
+/// The far side: an HTTP server over an iroh bi-stream that records every
+/// byte it is given and answers the first head it reads.
+///
+/// The answer is late, so a test can send a second request while the first
+/// one is still waiting for it.
+async fn serve_an_http_backend_that_records(
+    endpoint: Endpoint,
+    seen: Arc<std::sync::Mutex<Vec<u8>>>,
+    delay: Duration,
+) {
+    while let Some(incoming) = endpoint.accept().await {
+        let seen = seen.clone();
+        tokio::spawn(async move {
+            let Ok(accepting) = incoming.accept() else {
+                return;
+            };
+            let Ok(connection) = accepting.await else {
+                return;
+            };
+            loop {
+                let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                    return;
+                };
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let mut head = Vec::new();
+                    loop {
+                        let n = match recv.read(&mut buf).await {
+                            Ok(Some(n)) => n,
+                            Ok(None) | Err(_) => return,
+                        };
+                        head.extend_from_slice(&buf[..n]);
+                        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    seen.lock()
+                        .expect("the lock is not held")
+                        .extend_from_slice(&head);
+
+                    // The answer, late enough for the test to send another
+                    // request while this one is waiting for it.
+                    tokio::time::sleep(delay).await;
+                    let _ = send
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                        .await;
+                    let _ = send.finish();
+
+                    // And everything else the proxy sends is recorded.
+                    loop {
+                        let n = match recv.read(&mut buf).await {
+                            Ok(Some(n)) => n,
+                            Ok(None) | Err(_) => break,
+                        };
+                        seen.lock()
+                            .expect("the lock is not held")
+                            .extend_from_slice(&buf[..n]);
+                    }
+                });
+            }
+        });
+    }
+}
+
+/// A second request that arrives after the head is not relayed.
+///
+/// The copy loop keeps forwarding whatever the client sends, so a client
+/// that sends its second request a moment later — after the first one is on
+/// its way — would get it through as well. The connection carries one
+/// request, and the bytes past the body's are refused.
+#[tokio::test]
+async fn a_second_request_sent_while_the_first_one_is_waiting_is_not_relayed() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let server = Endpoint::builder(presets::N0)
+        .alpns(vec![ALPN.to_vec()])
+        .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap()
+        .bind()
+        .await
+        .expect("the far side binds");
+    let server_addr = server.addr();
+    tokio::spawn(serve_an_http_backend_that_records(
+        server,
+        seen.clone(),
+        Duration::from_millis(500),
+    ));
+
+    let (proxy, proxy_addr) = proxy_over(server_addr).await;
+    let runner = spawn_run(&proxy);
+
+    let mut stream = TcpStream::connect(proxy_addr)
+        .await
+        .expect("the proxy accepts");
+    stream
+        .write_all(format!("GET /a HTTP/1.1\r\nHost: {HOST}\r\n\r\n").as_bytes())
+        .await
+        .expect("the first request goes out");
+
+    // The second request, once the head is behind us and the first answer
+    // is still to come.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = stream
+        .write_all(b"GET /b HTTP/1.1\r\nHost: other.test\r\n\r\n")
+        .await;
+
+    let mut answer = Vec::new();
+    let read = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut answer)).await;
+    assert!(read.is_ok(), "the answer never arrived");
+    let answer = String::from_utf8_lossy(&answer);
+    assert!(
+        answer.starts_with("HTTP/1.1 200"),
+        "the first request was not served: {answer}"
+    );
+
+    let seen = seen.lock().expect("the lock is not held").clone();
+    assert!(
+        !String::from_utf8_lossy(&seen).contains("other.test"),
+        "a second request went through without the list being consulted about it: {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+
+    proxy.stop();
+    let _ = tokio::time::timeout(Duration::from_secs(5), runner).await;
+}
 /// A backend that goes quiet ends the response, and the exchange with it.
 ///
 /// The bound is a **quiet window** and not a total: a backend that stops

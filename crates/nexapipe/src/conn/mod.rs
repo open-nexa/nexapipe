@@ -348,6 +348,28 @@ pub async fn handle_connection(
     let (mut revoked_rx, _peer) = match registered {
         Some((guard, revoked)) => (revoked, guard),
         None => {
+            // **The gate may have come on since the check above.** A reload
+            // that turns 2FA on closes the connections that never
+            // authenticated, and this one is not in the registry yet — so it
+            // has to be refused here, or it would go on serving with no
+            // credential at all.
+            //
+            // The value is read again rather than carried from the check
+            // above: that check is what decided this connection skipped the
+            // handshake, and it is stale by the time the handshake would
+            // have been over.
+            let gated_now = match &auth_state {
+                Some(auth) => auth.config().read().await.enabled,
+                None => false,
+            };
+            if gated_now {
+                tracing::warn!(
+                    "Connection from {} refused, 2FA was turned on while it was connecting",
+                    peer_id
+                );
+                conn.close(auth_close_code::REQUIRED.into(), b"2FA required");
+                return;
+            }
             let (revoked_tx, revoked_rx) = tokio::sync::watch::channel(false);
             (
                 revoked_rx,
