@@ -147,8 +147,8 @@ secret = "JBSWY3DPEHPK3PXP"
 ///
 /// An inline `[iroh]` key is a credential on its own, and the files this
 /// server actually ships — `config.toml.example`, the generated first-run
-/// template — have no `[auth]` at all. A warning that only ran when an
-/// `AuthConfig` existed was silent for exactly those.
+/// template — carry one. A warning that only ran when an `AuthConfig`
+/// existed was silent for exactly those.
 #[cfg(unix)]
 #[test]
 fn an_inline_key_without_an_auth_section_is_warned_about() {
