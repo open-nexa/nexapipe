@@ -6,7 +6,7 @@
 
 use crate::routes::{BackendInfo, BackendLookup, RoutingTable};
 
-use ::http::header::{HeaderMap, HeaderValue};
+use ::http::header::HeaderValue;
 use ::http::{Method, Request, Response, StatusCode};
 
 use http_body_util::combinators::UnsyncBoxBody;
@@ -258,11 +258,14 @@ pub(super) async fn attempt_backend(
 
     let mut builder = Request::builder().method(method.clone()).uri(new_uri);
 
+    // The headers the client named in its own `Connection` header are
+    // hop-by-hop for this request, and they do not go to the backend.
+    let connection = ConnectionNamed::of(headers);
     for (name, value) in headers.iter() {
         // Preserve the client's original Host header so backend virtual-host
         // routing works; drop the rest that only meant something for the hop
         // from the client to here.
-        if !forwards_request_header(name.as_str()) {
+        if !forwards_request_header(name.as_str(), &connection) {
             continue;
         }
         builder = builder.header(name, value);
@@ -277,7 +280,19 @@ pub(super) async fn attempt_backend(
     );
 
     match tokio::time::timeout(response_deadline, client.request(proxied_req)).await {
-        Ok(Ok(response)) => Ok(response),
+        Ok(Ok(response)) => {
+            // The headers the client may see: the ones that describe the
+            // answer rather than the hop, and the same ones the tunnel path
+            // forwards — a backend's `connection: keep-alive` describes the
+            // backend's link to this process, not the client's.
+            //
+            // The filter is applied here, where the answer arrives, so that
+            // the compressed answer and the plain one are filtered alike.
+            let mut response = response;
+            let headers = forwarded_response_headers(response.headers());
+            *response.headers_mut() = headers;
+            Ok(response)
+        }
         Ok(Err(e)) => Err(ProxyFailure {
             error: anyhow::anyhow!("backend request failed: {e}"),
             partial: None,
@@ -354,12 +369,15 @@ fn backend_request_builder(
     // proxy states it again rather than passing the client's own header on.
     let declares_own_length = content_length.is_some();
 
+    // The headers the client named in its own `Connection` header are
+    // hop-by-hop for this request, and they do not go to the backend.
+    let connection = ConnectionNamed::of(req.headers());
     for (name, value) in req.headers() {
         // Preserve the client's original Host header so backend virtual-host
         // routing works. The body below is sent with a length of the proxy's
         // own — whole, or streamed — so `transfer-encoding` and friends must
         // not claim otherwise.
-        if !forwards_request_header(name.as_str()) {
+        if !forwards_request_header(name.as_str(), &connection) {
             continue;
         }
         // Dropped rather than overwritten: a second `content-length` on one
@@ -586,20 +604,12 @@ pub async fn proxy_to_backend(
     let (parts, body) = response.into_parts();
 
     // The headers the client may see: the ones that describe the answer
-    // rather than the hop. `forwards_response_header` drops the hop-by-hop
+    // rather than the hop. `forwarded_response_headers` drops the hop-by-hop
     // ones, and the id the caller gave this request is the one that goes out
     // — a second one from the backend would leave whoever reads the response
     // guessing which to quote.
-    let mut headers = HeaderMap::new();
-    for (name, value) in parts.headers.iter() {
-        if !forwards_response_header(name.as_str()) {
-            continue;
-        }
-        if name.as_str() == "x-request-id" {
-            continue;
-        }
-        headers.append(name.clone(), value.clone());
-    }
+    let mut headers = forwarded_response_headers(&parts.headers);
+    headers.remove("x-request-id");
     headers.insert(
         "x-request-id",
         HeaderValue::from_str(request_id).unwrap_or_else(|_| HeaderValue::from_static("")),
