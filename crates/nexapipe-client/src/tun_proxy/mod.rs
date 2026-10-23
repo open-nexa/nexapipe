@@ -650,11 +650,20 @@ impl TunProxy {
             // A failure here has to stop what `start_stack_services` already
             // spawned: dropping a `JoinHandle` detaches its task rather than
             // cancelling it, and `stopped` is the only signal those tasks hear.
-            let async_fd = match AsyncFd::new(file) {
+            // SAFETY: the `File` owns the descriptor it was built from, and it is
+            // moved into the `AsyncFd` — so the descriptor stays open and refers
+            // to the same file description for as long as the `AsyncFd` lives.
+            // Nothing else holds it: `take()` took it out of `fds`, and from
+            // here on the `File` is its only owner.
+            let async_fd = match unsafe { AsyncFd::register(file) } {
                 Ok(async_fd) => async_fd,
                 Err(e) => {
+                    // The file comes back with the error, and dropping it closes
+                    // the descriptor — which is what the path that took the
+                    // descriptor by value did too.
+                    let (_file, cause) = e.into_parts();
                     stop_started_tasks(&tasks, &stopped);
-                    return Err(e.into());
+                    return Err(cause.into());
                 }
             };
             let stopped_clone = stopped.clone();
@@ -708,11 +717,20 @@ impl TunProxy {
             let file = unsafe {
                 std::fs::File::from_raw_fd(fds.write.take().expect("still held").into_raw_fd())
             };
-            let async_fd = match AsyncFd::new(file) {
+            // SAFETY: the `File` owns the descriptor it was built from, and it is
+            // moved into the `AsyncFd` — so the descriptor stays open and refers
+            // to the same file description for as long as the `AsyncFd` lives.
+            // Nothing else holds it: `take()` took it out of `fds`, and from
+            // here on the `File` is its only owner.
+            let async_fd = match unsafe { AsyncFd::register(file) } {
                 Ok(async_fd) => async_fd,
                 Err(e) => {
+                    // The file comes back with the error, and dropping it closes
+                    // the descriptor — which is what the path that took the
+                    // descriptor by value did too.
+                    let (_file, cause) = e.into_parts();
                     stop_started_tasks(&tasks, &stopped);
-                    return Err(e.into());
+                    return Err(cause.into());
                 }
             };
             let stopped_clone = stopped.clone();
