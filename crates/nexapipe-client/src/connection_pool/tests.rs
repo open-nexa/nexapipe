@@ -8,8 +8,8 @@ use super::link_status::is_measured_rtt;
 use super::paths::PathHealth;
 use super::{
     BorrowState, CONNECTION_IDLE_TIMEOUT, DialOutcome, IrohConnectionPool, LinkKind, LinkStatus,
-    MAX_CONNECTIONS_PER_PROTOCOL, PoolRefusal, connections_for, drop_stale_connections,
-    encode_link_status, identity_changed, may_pool, may_publish,
+    MAX_CONNECTIONS_PER_PROTOCOL, PRECONNECT_CONNECT_TIMEOUT, PoolRefusal, connections_for,
+    drop_stale_connections, encode_link_status, identity_changed, may_pool, may_publish,
 };
 use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
 #[cfg(feature = "local-proxy")]
@@ -1356,5 +1356,22 @@ fn a_connection_whose_path_is_gone_has_nothing_left_to_send_on() {
     assert!(
         !paths.all_gone(),
         "a connection whose path came back is live again"
+    );
+}
+
+/// The connect budget has to cover a QUIC handshake over a relayed path.
+///
+/// The handshake was measured at about seven seconds on the path this client
+/// uses — four when the relay was quick, and more than the old six-second
+/// budget when it was not. A budget shorter than the handshake abandons it
+/// half way: the client gives up and reports the backend unreachable for
+/// being slow, and the server — which is still waiting for a handshake that
+/// will never finish — logs the abandoned one as a timeout of its own.
+#[test]
+fn the_connect_budget_covers_a_relayed_handshake() {
+    assert!(
+        PRECONNECT_CONNECT_TIMEOUT >= Duration::from_secs(10),
+        "the connect budget is {}s, which is shorter than a relayed handshake",
+        PRECONNECT_CONNECT_TIMEOUT.as_secs(),
     );
 }
