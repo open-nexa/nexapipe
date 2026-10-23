@@ -36,10 +36,13 @@
 //! asked, and an answer to another question is dropped and the wait goes on.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::time::Duration;
+
+pub mod server;
 
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
@@ -70,6 +73,214 @@ pub const PER_SERVER_TIMEOUT: Duration = Duration::from_millis(800);
 
 /// The whole chain is given this long, whatever it is made of.
 pub const OVERALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+// ---------------------------------------------------------------------------
+// The wire format
+//
+// The question a client asks and the answer this proxy gives it. It was
+// written down twice — once here for the TUN's own DNS server, and once in the
+// desktop app, which runs a DNS server of its own — and the two copies were
+// free to disagree about what a question is and what an answer looks like.
+// One copy, and both sides link it.
+// ---------------------------------------------------------------------------
+
+/// The only QCLASS this proxy answers: everything it serves — a virtual
+/// address, or a record forwarded from a real resolver — belongs to it.
+pub const DNS_CLASS_IN: u16 = 1;
+
+/// The two QTYPEs this proxy answers itself: A and AAAA.
+pub const DNS_TYPE_A: u16 = 1;
+pub const DNS_TYPE_AAAA: u16 = 28;
+
+/// How many compression pointers one name may follow before the name is
+/// declared unreadable. A real name needs one; more than that is a loop.
+const MAX_DNS_POINTER_JUMPS: usize = 4;
+
+/// A DNS query, parsed.
+///
+/// The parts an answer needs: the name that was asked for, the type and class
+/// of the question, and the question section verbatim — a response echoes the
+/// question back, and a name written with a compression pointer in it cannot
+/// be rebuilt from the labels alone.
+#[derive(Debug, Clone)]
+pub struct Query {
+    /// The transaction ID the answer has to carry.
+    pub id: u16,
+    /// The name the question asks for.
+    pub domain: String,
+    /// The question type: [`DNS_TYPE_A`] and [`DNS_TYPE_AAAA`] are the ones
+    /// answered here.
+    pub qtype: u16,
+    /// The question class: [`DNS_CLASS_IN`] is the one answered here.
+    pub qclass: u16,
+    /// The question section, verbatim.
+    pub question: Vec<u8>,
+}
+
+/// Parse a DNS query.
+///
+/// `None` when the packet is not a question this proxy can read: too short,
+/// no question in it, a name that cannot be read as text, a compression
+/// pointer that loops, or a type and class that are cut off.
+pub fn parse_query(payload: &[u8]) -> Option<Query> {
+    if payload.len() < 12 {
+        return None;
+    }
+
+    let id = u16::from_be_bytes([payload[0], payload[1]]);
+    let qdcount = u16::from_be_bytes([payload[4], payload[5]]);
+    if qdcount == 0 {
+        return None;
+    }
+
+    // The Question section's domain name, as length-prefixed labels.
+    let mut pos = 12;
+    let question_start = pos;
+    let mut labels: Vec<&str> = Vec::new();
+    let mut jumps = 0usize;
+    // Where QTYPE sits once the name is over. It follows the terminating zero
+    // byte for an uncompressed name, but the two pointer bytes when the name
+    // jumped (RFC 1035 4.1.4): the labels those bytes point at live somewhere
+    // else entirely, and reading on from there would land inside another
+    // section.
+    let mut after_name: Option<usize> = None;
+
+    while pos < payload.len() {
+        let len = payload[pos] as usize;
+
+        if len == 0 {
+            pos += 1; // Skip the null terminator.
+            break;
+        }
+
+        // A compression pointer (RFC 1035 4.1.4): the two top bits are set and
+        // the rest, with the byte after, is an offset into the message — an
+        // earlier label list that this name continues with. Reading it as a
+        // length gives a nonsense label, and from there a nonsense domain: what
+        // decides whether the name is proxied was silently wrong. Rare in a
+        // query, legal, and some stacks do it.
+        if len & 0xC0 == 0xC0 {
+            if pos + 1 >= payload.len() {
+                return None;
+            }
+            let offset = ((len & 0x3F) << 8) | payload[pos + 1] as usize;
+            if offset >= payload.len() {
+                return None;
+            }
+            // A pointer that points at another pointer forever is a loop; stop
+            // after a few hops rather than spin.
+            jumps += 1;
+            if jumps > MAX_DNS_POINTER_JUMPS {
+                return None;
+            }
+            if after_name.is_none() {
+                after_name = Some(pos + 2);
+            }
+            pos = offset;
+            continue;
+        }
+
+        // The remaining two label types (0x40, 0x80) are reserved or unused;
+        // a name using one cannot be read as text.
+        if len & 0xC0 != 0 {
+            return None;
+        }
+
+        // Prevent out-of-bounds access.
+        if pos + 1 + len > payload.len() {
+            return None;
+        }
+        let label = std::str::from_utf8(&payload[pos + 1..pos + 1 + len]).ok()?;
+        labels.push(label);
+        pos += 1 + len;
+    }
+
+    let qtype_pos = after_name.unwrap_or(pos);
+    // QTYPE first, then QCLASS — two pairs that sit together after the name.
+    // The class is read rather than assumed: an answer cached for `IN` must not
+    // answer a query made in another class, and a key without it cannot tell
+    // those apart. Both have to be there: a question whose type is cut off is
+    // not a question this proxy can answer.
+    if qtype_pos + 4 > payload.len() {
+        return None;
+    }
+
+    Some(Query {
+        id,
+        domain: labels.join("."),
+        qtype: u16::from_be_bytes([payload[qtype_pos], payload[qtype_pos + 1]]),
+        qclass: u16::from_be_bytes([payload[qtype_pos + 2], payload[qtype_pos + 3]]),
+        question: payload[question_start..qtype_pos + 4].to_vec(),
+    })
+}
+
+/// Build a response resolving the queried name to `addr`.
+///
+/// The record type follows the address: an IPv4 address answers an A query
+/// with 4 bytes of RDATA, an IPv6 address answers an AAAA query with 16.
+/// Anything else — an AAAA question answered from the IPv4 pool, an MX, a type
+/// this proxy has no address for — gets an empty answer (ANCOUNT=0) so the
+/// client falls back to a query it can use.
+pub fn build_response(parsed: &Query, addr: IpAddr) -> Vec<u8> {
+    let (rtype, rdata): (u16, &[u8]) = match (addr, parsed.qtype) {
+        (IpAddr::V4(ip), DNS_TYPE_A) => (DNS_TYPE_A, &ip.octets()),
+        (IpAddr::V6(ip), DNS_TYPE_AAAA) => (DNS_TYPE_AAAA, &ip.octets()),
+        _ => return build_empty_response(parsed),
+    };
+
+    let mut response = Vec::with_capacity(parsed.question.len() + rdata.len() + 16);
+
+    // Header
+    response.extend_from_slice(&parsed.id.to_be_bytes()); // ID
+    // Flags: QR=1, Opcode=0, AA=0, TC=0, RD=1, RA=1, Z=0, RCODE=0
+    response.extend_from_slice(&[0x81, 0x80]);
+    // QDCOUNT=1
+    response.extend_from_slice(&1u16.to_be_bytes());
+    // ANCOUNT=1
+    response.extend_from_slice(&1u16.to_be_bytes());
+    // NSCOUNT=0
+    response.extend_from_slice(&0u16.to_be_bytes());
+    // ARCOUNT=0
+    response.extend_from_slice(&0u16.to_be_bytes());
+
+    // Question section (copied verbatim from the original query's question)
+    response.extend_from_slice(&parsed.question);
+
+    // Answer section
+    // Name pointer (points at the domain name in the question section)
+    response.extend_from_slice(&[0xC0, 0x0C]);
+    // TYPE=A (1) or AAAA (28)
+    response.extend_from_slice(&rtype.to_be_bytes());
+    // CLASS=IN
+    response.extend_from_slice(&1u16.to_be_bytes());
+    // TTL=60
+    response.extend_from_slice(&60u32.to_be_bytes());
+    // RDLENGTH=4 for A, 16 for AAAA
+    response.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+    // RDATA=IP
+    response.extend_from_slice(rdata);
+
+    response
+}
+
+/// Build a response that answers the question and carries no records.
+///
+/// For a question this proxy does not answer itself: an AAAA question asked
+/// of a machine with no IPv6 block, a type that is not an address at all, or a
+/// question asked in a class this proxy does not serve.
+pub fn build_empty_response(parsed: &Query) -> Vec<u8> {
+    let mut response = Vec::with_capacity(parsed.question.len() + 16);
+    // Header: ID + QR=1, RD=1, RA=1, RCODE=0 + QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+    response.extend_from_slice(&parsed.id.to_be_bytes());
+    response.extend_from_slice(&[0x81, 0x80]);
+    response.extend_from_slice(&1u16.to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes());
+    response.extend_from_slice(&0u16.to_be_bytes());
+    // Question section (copied verbatim)
+    response.extend_from_slice(&parsed.question);
+    response
+}
 
 /// How often a reader looks at the stop flag while it waits for a datagram.
 const STOP_POLL_INTERVAL: Duration = Duration::from_secs(1);

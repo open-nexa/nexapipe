@@ -198,6 +198,33 @@ pub fn init_tracing(prefix: &str) -> tracing_appender::non_blocking::WorkerGuard
 /// Returns nothing on success: the success text this used to return was English prose that the
 /// frontend discarded, so the UI now renders its own localized confirmation. Failures come back
 /// as an [`AppError`] whose code the frontend translates and whose detail it can log.
+/// Ask the service for something, and say whether it answered.
+///
+/// `Some` is the service's answer. `None` is "it could not answer": the
+/// caller then does the same thing in this process, which is what the app has
+/// always done — a service that is not installed, not running or not answering
+/// leaves the app usable.
+///
+/// The reason it could not answer is logged here, so that every command that
+/// goes through the service says so the same way. The rule was written out
+/// once per command, and a change to it — what a fallback means, when it is
+/// allowed — was a change in eleven places.
+async fn ask_service<T, S>(use_service: bool, what: &str, service: S) -> Option<T>
+where
+    S: std::future::Future<Output = Result<T, AppError>>,
+{
+    if !use_service {
+        return None;
+    }
+    match service.await {
+        Ok(value) => Some(value),
+        Err(e) => {
+            tracing::warn!("Failed to {what} via service, falling back to process mode: {e}");
+            None
+        }
+    }
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn start_proxy(
@@ -292,6 +319,9 @@ async fn start_proxy(
             Err(e) => {
                 // With TUN requested, a service failure is reported instead of falling back:
                 // the fallback would start a local proxy while the user asked for a tunnel.
+                //
+                // This is the one command that does not go through `ask_service`, because
+                // here the fallback is not allowed at all rather than merely unwanted.
                 if use_tun {
                     tracing::error!("TUN requested but service start failed: {}", e);
                     return Err(e);
@@ -438,16 +468,11 @@ async fn start_proxy(
 async fn stop_proxy(use_service: Option<bool>) -> Result<(), AppError> {
     let use_service = use_service.unwrap_or(false);
 
-    if use_service {
-        match IpcClient::stop_proxy().await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to stop proxy via service, trying process mode: {}",
-                    e
-                );
-            }
-        }
+    if ask_service(use_service, "stop proxy", IpcClient::stop_proxy())
+        .await
+        .is_some()
+    {
+        return Ok(());
     }
 
     // Clear the registration as well as stopping the instance. A manager that is still registered
@@ -466,16 +491,8 @@ async fn stop_proxy(use_service: Option<bool>) -> Result<(), AppError> {
 async fn get_proxy_status(use_service: Option<bool>) -> Result<ProxyStatus, AppError> {
     let use_service = use_service.unwrap_or(false);
 
-    if use_service {
-        match IpcClient::get_status().await {
-            Ok(status) => return Ok(status),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to get status via service, falling back to process mode: {}",
-                    e
-                );
-            }
-        }
+    if let Some(status) = ask_service(use_service, "get status", IpcClient::get_status()).await {
+        return Ok(status);
     }
 
     let proxy_manager = PROXY_MANAGER.read().await;
@@ -519,16 +536,8 @@ async fn reveal_node_id(use_service: Option<bool>) -> Result<String, AppError> {
 async fn node_id(use_service: Option<bool>) -> Result<String, AppError> {
     let use_service = use_service.unwrap_or(false);
 
-    if use_service {
-        match IpcClient::get_node_id().await {
-            Ok(id) => return Ok(id),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to get node ID via service, falling back to process mode: {}",
-                    e
-                );
-            }
-        }
+    if let Some(id) = ask_service(use_service, "get node ID", IpcClient::get_node_id()).await {
+        return Ok(id);
     }
 
     let proxy_manager = PROXY_MANAGER.read().await;
@@ -549,16 +558,14 @@ async fn node_id(use_service: Option<bool>) -> Result<String, AppError> {
 async fn get_endpoint_links(use_service: Option<bool>) -> Result<Vec<EndpointLink>, AppError> {
     let use_service = use_service.unwrap_or(false);
 
-    if use_service {
-        match IpcClient::get_endpoint_links().await {
-            Ok(links) => return Ok(links),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to get endpoint links via service, falling back to process mode: {}",
-                    e
-                );
-            }
-        }
+    if let Some(links) = ask_service(
+        use_service,
+        "get endpoint links",
+        IpcClient::get_endpoint_links(),
+    )
+    .await
+    {
+        return Ok(links);
     }
 
     let proxy_manager = PROXY_MANAGER.read().await;
@@ -576,16 +583,10 @@ async fn get_endpoint_links(use_service: Option<bool>) -> Result<Vec<EndpointLin
 async fn get_node_health(use_service: Option<bool>) -> Result<Vec<NodeHealthStatus>, AppError> {
     let use_service = use_service.unwrap_or(false);
 
-    if use_service {
-        match IpcClient::get_node_health().await {
-            Ok(health) => return Ok(health),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to get node health via service, falling back to process mode: {}",
-                    e
-                );
-            }
-        }
+    if let Some(health) =
+        ask_service(use_service, "get node health", IpcClient::get_node_health()).await
+    {
+        return Ok(health);
     }
 
     let proxy_manager = PROXY_MANAGER.read().await;
@@ -605,16 +606,14 @@ async fn get_node_health(use_service: Option<bool>) -> Result<Vec<NodeHealthStat
 async fn get_node_traffic(use_service: Option<bool>) -> Result<Vec<NodeTrafficStatus>, AppError> {
     let use_service = use_service.unwrap_or(false);
 
-    if use_service {
-        match IpcClient::get_node_traffic().await {
-            Ok(traffic) => return Ok(traffic),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to get node traffic via service, falling back to process mode: {}",
-                    e
-                );
-            }
-        }
+    if let Some(traffic) = ask_service(
+        use_service,
+        "get node traffic",
+        IpcClient::get_node_traffic(),
+    )
+    .await
+    {
+        return Ok(traffic);
     }
 
     let proxy_manager = PROXY_MANAGER.read().await;
@@ -636,16 +635,14 @@ async fn get_node_traffic(use_service: Option<bool>) -> Result<Vec<NodeTrafficSt
 async fn get_active_flows(use_service: Option<bool>) -> Result<ActiveFlowPage, AppError> {
     let use_service = use_service.unwrap_or(false);
 
-    if use_service {
-        match IpcClient::get_active_flows().await {
-            Ok(page) => return Ok(page),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to list active flows via service, falling back to process mode: {}",
-                    e
-                );
-            }
-        }
+    if let Some(page) = ask_service(
+        use_service,
+        "list active flows",
+        IpcClient::get_active_flows(),
+    )
+    .await
+    {
+        return Ok(page);
     }
 
     let proxy_manager = PROXY_MANAGER.read().await;
@@ -667,16 +664,9 @@ async fn get_active_flows(use_service: Option<bool>) -> Result<ActiveFlowPage, A
 async fn close_flow(id: u64, use_service: Option<bool>) -> Result<bool, AppError> {
     let use_service = use_service.unwrap_or(false);
 
-    if use_service {
-        match IpcClient::close_flow(id).await {
-            Ok(closed) => return Ok(closed),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to close a flow via service, falling back to process mode: {}",
-                    e
-                );
-            }
-        }
+    if let Some(closed) = ask_service(use_service, "close a flow", IpcClient::close_flow(id)).await
+    {
+        return Ok(closed);
     }
 
     let proxy_manager = PROXY_MANAGER.read().await;
@@ -700,16 +690,14 @@ async fn close_node_flows(
 ) -> Result<Option<usize>, AppError> {
     let use_service = use_service.unwrap_or(false);
 
-    if use_service {
-        match IpcClient::close_node_flows(&connection).await {
-            Ok(closed) => return Ok(closed),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to close a node's flows via service, falling back to process mode: {}",
-                    e
-                );
-            }
-        }
+    if let Some(closed) = ask_service(
+        use_service,
+        "close a node's flows",
+        IpcClient::close_node_flows(&connection),
+    )
+    .await
+    {
+        return Ok(closed);
     }
 
     let proxy_manager = PROXY_MANAGER.read().await;
@@ -1021,16 +1009,14 @@ async fn take_issued_credential(
 ) -> Result<Option<IssuedCredentialPayload>, AppError> {
     let use_service = use_service.unwrap_or(false);
 
-    if use_service {
-        match IpcClient::take_issued_credential().await {
-            Ok(credential) => return Ok(credential),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to read the enrolled credential via service, falling back to process mode: {}",
-                    e
-                );
-            }
-        }
+    if let Some(credential) = ask_service(
+        use_service,
+        "read the enrolled credential",
+        IpcClient::take_issued_credential(),
+    )
+    .await
+    {
+        return Ok(credential);
     }
 
     // Cloned out of the lock first: the guard must not be held across the await below.

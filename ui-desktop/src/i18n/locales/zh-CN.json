@@ -366,6 +366,7 @@
     "proxy": {
       "no_nodes": "请先添加至少一个节点再启动代理。",
       "invalid_load_balancing": "无法识别该负载均衡策略。",
+      "invalid_dns_strategy": "无法识别该 DNS 策略。",
       "start_failed": "代理启动失败，详情请查看日志。",
       "no_reachable_backend": "无法连接到任何已配置的节点。请检查节点 ID（或票据）与网络后重试。",
       "two_factor_required": "服务端要求两步验证，但此处未配置 2FA 凭据。请填写服务端 [auth.clients] 中对应的客户端 ID 与密钥。",

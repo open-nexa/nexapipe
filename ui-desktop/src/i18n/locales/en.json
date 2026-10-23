@@ -366,6 +366,7 @@
     "proxy": {
       "no_nodes": "Add at least one node before starting the proxy.",
       "invalid_load_balancing": "The load-balancing strategy is not recognised.",
+      "invalid_dns_strategy": "The DNS strategy is not recognised.",
       "start_failed": "The proxy failed to start. See the logs for details.",
       "no_reachable_backend": "No configured node could be reached. Check the node ID (or ticket) and your network, then try again.",
       "two_factor_required": "The server requires two-factor authentication, but no 2FA credentials are configured here. Add the client ID and secret the server lists under [auth.clients].",
