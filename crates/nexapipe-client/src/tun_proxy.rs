@@ -52,13 +52,11 @@
 
 use crate::ClientError;
 use crate::EndpointGroup;
+use crate::dns::UpstreamResolvers;
 use crate::dns::server::handle_dns_query;
-use crate::dns::{DNS_CLASS_IN, DNS_TYPE_A, DNS_TYPE_AAAA, UpstreamResolvers};
 use crate::flow::{FlowKind, FlowMeta};
 use crate::l4;
-use crate::local_proxy::{
-    handle_local_connection, report_domain_patterns, should_proxy_domain, warn,
-};
+use crate::local_proxy::{handle_local_connection, report_domain_patterns, warn};
 use crate::virtual_ip::IpMapping;
 
 #[cfg(feature = "jni")]

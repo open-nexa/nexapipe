@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::domains::should_proxy_domain;
