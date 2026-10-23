@@ -149,10 +149,36 @@ export function clearNodeTwoFactor(nodeId: string): void {
  * A credential is a secret or a key: a key node stores no seed at all, so an
  * empty secret there is not a missing credential. A node that is still
  * waiting to enroll has neither yet — it has a token, not a credential.
+ *
+ * The rule is the one the handshake itself uses (`manager.rs`), so the page
+ * and the handshake cannot disagree about whether this node has a credential:
+ * a key counts only once it names the device it was issued to, because until
+ * the enrollment has been answered the key is an offer rather than something
+ * to answer with.
  */
 export function hasTwoFactor(node: NodeConfig): boolean {
-  if (!node.twoFactor) return false;
-  return node.twoFactor.secret.trim() !== '' || !!node.deviceKey?.trim();
+  const secret = node.twoFactor?.secret.trim() ?? '';
+  if (secret !== '') return true;
+  const device = node.twoFactor?.device?.trim() ?? '';
+  return device !== '' && !!node.deviceKey?.trim();
+}
+
+/**
+ * What a node's 2FA reads as.
+ *
+ * Three states, not two: a node that is waiting to enroll has no credential
+ * yet, but it is not 2FA-off either — the token is armed, and the next
+ * connect trades it for a credential. Reading that as "disabled" is what made
+ * a scanned invite look like it had not been applied at all.
+ *
+ * The pending one is an enrollment that has not been answered yet: the server
+ * issues the credential on the next connect, and until then there is nothing
+ * to show but the wait. An answered enrollment leaves a credential behind and
+ * clears the token, so it is "on" by then.
+ */
+export function twoFactorState(node: NodeConfig): 'off' | 'pending' | 'on' {
+  if (node.enrollment) return 'pending';
+  return hasTwoFactor(node) ? 'on' : 'off';
 }
 
 export function removeNode(nodeId: string): void {

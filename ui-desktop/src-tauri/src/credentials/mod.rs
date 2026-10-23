@@ -38,6 +38,7 @@
 // encrypted file, the master key that file is sealed with, the files they
 // live in, and the bytes they are made of.
 mod bytes;
+mod device_key;
 mod files;
 mod master_key;
 mod store;
@@ -48,6 +49,52 @@ mod tests;
 
 pub use store::{get, keys, put, remove, status};
 pub use types::{mask, secret_key, CredentialKind, KeySource};
+
+use crate::error::AppError;
+
+/// The key a node has of its own: the one it enrolled with.
+///
+/// `None` when it has none — a node that was added without a registration
+/// invite, or one whose key was dropped with its credential.
+///
+/// Under the store's lock, like every other read of it: the key is read from
+/// a file that another write may be in the middle of replacing.
+pub fn node_device_key(node_id: &str) -> Result<Option<String>, AppError> {
+    let _guard = store::lock_store();
+    device_key::node_device_key(&store::Store::open()?, node_id)
+}
+
+/// The key this machine proves itself with.
+///
+/// The machine's own key, and — for a machine that has none yet — the key of a
+/// node that has one, adopted into the machine's own slot so that every node
+/// after it answers with the same key.
+///
+/// Under the store's lock: the adoption is a read followed by a write, and
+/// two callers doing it at once would each read the same snapshot and write
+/// two different keys over one another.
+pub fn machine_device_key() -> Result<Option<String>, AppError> {
+    let _guard = store::lock_store();
+    device_key::machine_device_key(&store::Store::open()?)
+}
+
+/// The key a node proves itself with: its own when it has one, and the
+/// machine's when it does not.
+pub fn effective_device_key(node_id: &str) -> Result<Option<String>, AppError> {
+    let _guard = store::lock_store();
+    device_key::effective_device_key(&store::Store::open()?, node_id)
+}
+
+/// Keeps a key as the node's own, and as the machine's when the machine has
+/// none.
+///
+/// Under the store's lock: the two writes are one decision, and a write that
+/// landed between them would file the node's own key without adopting it — or
+/// adopt it as the machine's when the machine had one of its own.
+pub fn file_device_key(node_id: &str, private_key_hex: &str) -> Result<(), AppError> {
+    let _guard = store::lock_store();
+    device_key::file_device_key(&store::Store::open()?, node_id, private_key_hex)
+}
 
 // The private halves of the pieces, named here so that the test module can
 // reach them under the names it has always used.

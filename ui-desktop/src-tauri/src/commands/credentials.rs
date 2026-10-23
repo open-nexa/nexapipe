@@ -60,18 +60,25 @@ pub(crate) fn credential_kind(kind: &str, node_id: Option<String>) -> Result<Str
 pub(crate) struct NodeCredentials {
     totp: Option<String>,
     enrollment: Option<String>,
-    /// The private half of this node's device key, when it has one.
+    /// The private half of the key this node answers with, when it has one.
     ///
-    /// A credential like the secret beside it, and it crosses this boundary for
+    /// Its own when it enrolled with one, and the machine's otherwise — a key
+    /// belongs to the machine, as the name the server files it under does. A
+    /// credential like the secret beside it, and it crosses this boundary for
     /// the same reason: the proxy needs it to sign, and in the service mode the
     /// service is a separate process with no store of its own.
     device_key: Option<String>,
-    /// The public half of that key, as 64 hex characters.
+    /// The public half of the key *this node* enrolled with, as 64 hex
+    /// characters.
     ///
-    /// Derived from the private half rather than stored beside it, so the two
-    /// can never disagree about which key this is. Not a secret — the server
-    /// holds the same one — and it is what the app shows to name the key an
-    /// operator has on file.
+    /// Derived from the node's own private half rather than stored beside it,
+    /// so the two can never disagree about which key this is. Not a secret —
+    /// the server holds the same one — and it is what the app shows to name
+    /// the key an operator has on file.
+    ///
+    /// Absent for a node that never enrolled with a key: the machine's key is
+    /// offered to a server, not issued to this node, and naming it here would
+    /// present a node as holding a credential it was never given.
     #[serde(default)]
     public_key: Option<String>,
     ticket: Option<String>,
@@ -88,13 +95,20 @@ pub(crate) struct RuntimeCredentials {
 
 /// Reads one node's credentials out of the store.
 pub(crate) fn node_credentials(node_id: &str) -> Result<NodeCredentials, AppError> {
-    let device_key = credentials::get(&credentials::secret_key(
-        credentials::CredentialKind::DeviceKey,
-        node_id,
-    ))?;
-    // Derived rather than stored: a value that could disagree with the private
-    // half beside it would name the wrong key to an operator.
-    let public_key = device_key
+    // The key the node answers with: its own when it enrolled with one, and
+    // the machine's when it did not. A key belongs to the machine rather than
+    // to the node — the server files a credential under the machine's name,
+    // and that name outlives every server the machine comes back to — so a
+    // node without a key of its own offers the machine's rather than a new
+    // one, which the server would refuse as a takeover.
+    let device_key = credentials::effective_device_key(node_id)?;
+    // The public half of the key *this node* enrolled with, derived rather
+    // than stored: a value that could disagree with the private half beside
+    // it would name the wrong key to an operator. The node's own key and not
+    // the effective one, because a node that never enrolled with a key has
+    // none to name — the machine's key is offered to a server, not issued to
+    // this node.
+    let public_key = credentials::node_device_key(node_id)?
         .as_deref()
         .and_then(|spelled| DeviceKey::from_hex(spelled).ok())
         .map(|key| key.public_hex());

@@ -34,7 +34,17 @@ pub(super) const ENTRY_PREFIX: &str = "v1:";
 static STORE_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
-fn lock_store() -> std::sync::MutexGuard<'static, ()> {
+/// Takes the store's lock, for a sequence that does not go through the
+/// wrappers below.
+///
+/// The device key has its own read-then-write — a node's key is adopted as
+/// the machine's — and it reads and writes the store directly, so it has to
+/// take the lock itself: two sequences that do not are two sequences that can
+/// interleave, and the store's file is written from a snapshot of it.
+///
+/// The lock is not reentrant, so a holder must not call the wrappers below:
+/// they take it too.
+pub(super) fn lock_store() -> std::sync::MutexGuard<'static, ()> {
     STORE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -57,7 +67,7 @@ pub(super) struct Entries {
 
 impl Store {
     /// The store for this installation.
-    fn open() -> Result<Self, AppError> {
+    pub(super) fn open() -> Result<Self, AppError> {
         let dir = store_dir();
         std::fs::create_dir_all(&dir)
             .map_err(|e| AppError::cause(codes::CREDENTIALS_STORE_FAILED, e))?;

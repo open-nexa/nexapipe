@@ -40,6 +40,11 @@ pub enum CredentialKind {
     /// desktop keeps here is the only copy there is. It never leaves the
     /// machine, and the app has no way to show it: there is nothing to read
     /// off a screen, which is the whole point of a key.
+    ///
+    /// Filed under the node it was enrolled with, and — because a key belongs
+    /// to the machine rather than to the node — under the machine's own scope
+    /// as well: the two are the same key in the ordinary case, and the
+    /// machine's is never replaced once it exists.
     DeviceKey,
     /// The bearer token a custom relay asks for. Not per-node: it is a global setting.
     RelayToken,
@@ -116,6 +121,13 @@ pub fn mask(value: &str) -> String {
     format!("{head}{MASK_MIDDLE}{tail}")
 }
 
+/// The scope a credential that belongs to the machine rather than to a node is
+/// filed under.
+///
+/// Not a node id: the ids are `node-<hex>` or a 64-character Node ID, so an
+/// entry filed under this scope cannot be mistaken for one of a node's own.
+pub const MACHINE_SCOPE: &str = "global";
+
 /// The key a credential is filed under.
 ///
 /// Built here and not by the caller so the two sides cannot disagree about the
@@ -123,7 +135,7 @@ pub fn mask(value: &str) -> String {
 /// secret that is simply gone.
 pub fn secret_key(kind: CredentialKind, node_id: &str) -> String {
     match kind {
-        CredentialKind::RelayToken => format!("{}:global", kind.as_str()),
+        CredentialKind::RelayToken => format!("{}:{}", kind.as_str(), MACHINE_SCOPE),
         _ => format!("{}:{}", kind.as_str(), node_id),
     }
 }

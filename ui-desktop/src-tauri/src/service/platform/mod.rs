@@ -142,6 +142,10 @@ pub fn is_service_running() -> bool {
 /// that window, and starting the new build behind a teardown that has not finished is what the
 /// wait exists to prevent.
 ///
+/// A service that is marked for deletion is the third thing that is neither: it is on its way
+/// out, and it is kept apart for the same reason — it cannot be started, and it is not there
+/// to be uninstalled again.
+///
 /// Kept outside the Windows-only module, and compiled under `test` too, so the reading of an
 /// `sc.exe` answer is testable on a machine that has no `sc.exe`.
 #[cfg(any(windows, test))]
@@ -155,22 +159,45 @@ enum ScState {
     Pending,
     /// Not registered, so there is no state to be in.
     Absent,
+    /// Marked for deletion: registered, but on its way out of the control manager's database.
+    ///
+    /// Its own state, because it is neither registered-and-stopped nor gone: the record is
+    /// still there, but the control manager has already been told to remove it and refuses
+    /// every operation on it. A panel that reads it as "stopped" offers to start a service
+    /// that cannot be started and to uninstall one that is already leaving.
+    Deleting,
     /// `sc.exe` could not be asked, or answered without a state line.
     Unknown,
 }
 
+/// The Win32 error `sc.exe query` answers with when the service is not installed.
+#[cfg(any(windows, test))]
+const NOT_INSTALLED: &str = "1060";
+
+/// The Win32 error `sc.exe query` answers with when the service is marked for deletion.
+///
+/// `DeleteService` only *marks* a service for deletion: the record stays in the control
+/// manager's database until every handle to it is closed and the service is no longer
+/// running. Until then a query fails with this instead of answering a state, and a service
+/// that is leaving has to read as leaving — not as one that is registered and stopped.
+#[cfg(any(windows, test))]
+const MARKED_FOR_DELETE: &str = "1072";
+
 /// Reads that answer out of what `sc.exe query` prints.
 ///
-/// `1060` only counts when `sc.exe` reported it as a failure: the same four digits appear in the
+/// A failure only counts when `sc.exe` reported it as one: the same four digits appear in the
 /// `PID` line of a perfectly healthy service, and reading that as "absent" would let an install
 /// replace a service that is still up.
 #[cfg(any(windows, test))]
 fn sc_state(query_output: &str) -> ScState {
-    if query_output
-        .lines()
-        .any(|line| line.contains("FAILED") && line.contains("1060"))
-    {
+    if failure_with(query_output, NOT_INSTALLED) {
         return ScState::Absent;
+    }
+
+    // Checked before the state line, because a query that failed this way has no state line
+    // at all: it is the answer of a record that is on its way out, not a state.
+    if failure_with(query_output, MARKED_FOR_DELETE) {
+        return ScState::Deleting;
     }
 
     match query_output
@@ -183,6 +210,17 @@ fn sc_state(query_output: &str) -> ScState {
         Some(line) if line.contains("STOPPED") => ScState::Stopped,
         _ => ScState::Unknown,
     }
+}
+
+/// Whether `sc.exe` answered with `code` as the failure it reported.
+///
+/// The code has to be on the line that carries `FAILED`: `sc.exe` puts the error there, and
+/// the same digits turn up elsewhere in an answer that is not a failure at all.
+#[cfg(any(windows, test))]
+fn failure_with(query_output: &str, code: &str) -> bool {
+    query_output
+        .lines()
+        .any(|line| line.contains("FAILED") && line.contains(code))
 }
 
 // ==========================================================================
@@ -687,6 +725,64 @@ SERVICE_NAME: nexa-service
             ),
             ScState::Absent
         );
+    }
+
+    /// A service that is on its way out is not a service that is registered and stopped.
+    ///
+    /// `DeleteService` only *marks* a service for deletion: the record stays in the control
+    /// manager's database until every handle to it is closed and the service is no longer
+    /// running, and a query in that window fails instead of answering a state. Reading that as
+    /// "stopped" is what left the panel offering to start a service that cannot be started, and
+    /// to uninstall one that was already leaving.
+    #[test]
+    fn a_service_marked_for_deletion_is_not_a_stopped_one() {
+        assert_eq!(sc_state(query_marked_for_delete()), ScState::Deleting);
+
+        assert_ne!(
+            sc_state(query_marked_for_delete()),
+            ScState::Stopped,
+            "a service that is leaving must not read as one that is registered and stopped"
+        );
+    }
+
+    /// The answer, spelled the way `sc.exe` spells it.
+    ///
+    /// The failure carries the code on the line that says `FAILED`, and the state line the
+    /// other answers have is not there at all — which is why reading it as anything but a
+    /// failure needed the code to be looked for in the first place.
+    #[test]
+    fn the_marked_for_deletion_failure_is_read_as_one() {
+        assert_eq!(
+            sc_state(
+                "[SC] EnumQueryServicesStatus:OpenService FAILED 1072:\n\nThe specified service has been marked for deletion.\n"
+            ),
+            ScState::Deleting
+        );
+    }
+
+    /// A code that is not a failure is not a failure.
+    ///
+    /// The same four digits turn up in the exit-code line of a service that stopped badly, and
+    /// reading that as "marked for deletion" would take a registered service out of the
+    /// picture.
+    #[test]
+    fn an_exit_code_is_not_a_deletion() {
+        assert_eq!(
+            sc_state(
+                "SERVICE_NAME: nexa-service\n        STATE              : 1  STOPPED\n        WIN32_EXIT_CODE    : 1072  (0x430)\n"
+            ),
+            ScState::Stopped
+        );
+    }
+
+    /// `sc query` for a service that has been marked for deletion and has not left the control
+    /// manager's database yet.
+    fn query_marked_for_delete() -> &'static str {
+        "\
+[SC] EnumQueryServicesStatus:OpenService FAILED 1072:
+
+The specified service has been marked for deletion.
+"
     }
 
     /// The four answers a wait keys off: coming down, up, gone, and "no answer".

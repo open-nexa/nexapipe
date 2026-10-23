@@ -140,8 +140,10 @@ impl IrohConnectionPool {
             );
         }
 
-        // Enrollment first: a token is spent once and buys the credentials the
-        // block below then uses, so it only runs while there are none.
+        // Enrollment first: a token is spent once, and it buys the credential
+        // the connection is authenticated with — on the stream the enrollment
+        // was made on, so the handshake that follows needs no stream of its
+        // own. It only runs while there are no credentials.
         let enrollment = self.inner.enrollment.lock().await.clone();
         if let Some(enrollment) = enrollment {
             #[cfg(feature = "tracing")]
@@ -160,9 +162,39 @@ impl IrohConnectionPool {
                     // place that writes it: the identity comparison and the
                     // drop of the connections of the identity that is gone
                     // have to happen with it.
-                    self.set_credential(Some(issued.clone())).await;
+                    //
+                    // The generation comes back with the write. It is the one
+                    // the issued credential is filed under, read under the lock
+                    // the credential is written under, so the two cannot come
+                    // from different moments. Reading it here instead — after
+                    // the lock is released — would read it a moment later, and
+                    // a write that landed in between would have moved it: the
+                    // connection would carry the generation of a credential it
+                    // never authenticated with, and the pool would take it for
+                    // the identity that replaced this one.
+                    let generation = self.set_credential(Some(issued.clone())).await;
                     *self.inner.enrollment.lock().await = None;
                     *self.inner.issued.lock().await = Some(issued);
+                    // **The enrollment authenticated this connection already.**
+                    //
+                    // `exchange` ends with the ordinary handshake, on the very
+                    // stream the enrollment was made on: the server reads
+                    // ENROLL_START and AUTH_START in order off one bi-stream,
+                    // and the second message is what authenticates the client.
+                    //
+                    // So there is nothing left to authenticate, and the block
+                    // below must not run. It would open a *second* stream for
+                    // the handshake, and a second stream arrives at the server
+                    // looking like data sent before any credential: the server
+                    // serves it as data, the AUTH_START bytes are parsed as an
+                    // HTTP request, and the connection is closed with "invalid
+                    // HTTP method parsed". The enrollment succeeds and the
+                    // connection dies with it — which is what left a device
+                    // that had just enrolled without a working connection.
+                    //
+                    // The generation is the one the issued credential is filed
+                    // under, so the two cannot come from different moments.
+                    return Ok(Authenticated { conn, generation });
                 }
                 Err(e) => {
                     conn.close(0u32.into(), b"2FA enrollment failed");

@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 
 use super::{
     per_user_service_candidates, pick_service_binary, sc_state, scm_service_binary,
-    system_service_binary, system_service_dir, ScState, ServiceState, SERVICE_DISPLAY_NAME,
-    SERVICE_NAME,
+    system_service_binary, system_service_dir, ScState, ServiceState, MARKED_FOR_DELETE,
+    NOT_INSTALLED, SERVICE_DISPLAY_NAME, SERVICE_NAME,
 };
 use crate::error::{codes, AppError};
 use crate::service::platform::account::AccountId;
@@ -62,7 +62,22 @@ const ELEVATION_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long a start or stop may take to actually show up in `sc query`. The SCM accepts the
 /// command immediately, so this is the wait for the process to reach the requested state.
-const SETTLE_TIMEOUT: Duration = Duration::from_secs(20);
+///
+/// Not shorter than the stop wait hint the service itself asks the control manager for
+/// (`STOP_WAIT_HINT` in `nexa-service.rs`): the teardown ends with restoring the system DNS,
+/// and giving up before the service's own budget is up reports a stop that is still running
+/// as one that failed — which leaves the service registered, and the panel offering to start a
+/// service that is on its way down.
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a record that is marked for deletion is waited for.
+///
+/// The record normally leaves the control manager's database as soon as the last handle to it
+/// is closed, which is quick. The wait is for the case where something is still holding it —
+/// the service's own process on its way out, or a console that opened the service's properties
+/// and stayed open — and it is bounded, so a handle that never comes back does not turn into a
+/// hang.
+const DELETE_RECORD_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// `sc.exe` reports a refused operation as exit code 5 carrying this text.
 const ACCESS_DENIED: &str = "Access is denied";
@@ -82,7 +97,6 @@ const ALREADY_RUNNING: &str = "1056";
 /// Same shape: the state asked for is already the state, so refusing to call it a success
 /// only stops a perfectly good stop from ever being reported as done.
 const NOT_STARTED: &str = "1062";
-const NOT_INSTALLED: &str = "1060";
 
 /// Accepts a nonzero exit code from the previous command as success.
 ///
@@ -107,6 +121,10 @@ enum Escalation {
 /// The registration itself is the same either way — the entry, the binary under Program
 /// Files, the account it serves — only the service is left down.
 pub fn install(installing_by: Option<AccountId>, leave_stopped: bool) -> Result<(), AppError> {
+    // A record that is still marked for deletion has to be gone before a new service can take
+    // the name, so this waits for it rather than letting `sc create` refuse.
+    wait_for_deletable_record()?;
+
     let exe = std::env::current_exe().map_err(|e| AppError::cause(codes::SERVICE_EXE_PATH, e))?;
     let app_dir = exe
         .parent()
@@ -368,6 +386,10 @@ pub fn uninstall() -> Result<(), AppError> {
             |_| {
                 vec![
                     format!("sc.exe delete {SERVICE_NAME}"),
+                    // A service that is already marked for deletion is on its way out, and the
+                    // control manager answers the second delete with 1072. That is the state
+                    // an uninstall is heading towards, so it counts as done.
+                    tolerate(MARKED_FOR_DELETE),
                     "exit /b %errorlevel%".to_string(),
                 ]
             },
@@ -457,11 +479,28 @@ pub fn stop() -> Result<(), AppError> {
 pub fn state() -> ServiceState {
     match sc_query().map(|text| sc_state(&text)) {
         Some(ScState::Running) => ServiceState::Running,
-        // `sc.exe` itself could not be run, so there is nothing to report as installed.
-        Some(ScState::Absent) | None => ServiceState::NotInstalled,
+        // `sc.exe` itself could not be run, so there is nothing to report as installed. A
+        // service that is marked for deletion counts as gone: the control manager refuses
+        // every operation on it, so there is nothing left to start, stop or uninstall.
+        Some(ScState::Absent) | Some(ScState::Deleting) | None => ServiceState::NotInstalled,
         // Pending included: a service coming up is not answering yet, and one going down has
         // already stopped answering — both are "not running" to every control keyed off this.
         _ => ServiceState::Stopped,
+    }
+}
+
+/// Whether the control manager still holds a service under this name.
+///
+/// A record that is marked for deletion does not count: the control manager has already been
+/// told to remove it and refuses every operation on it, so an uninstall that found it would try
+/// to stop and delete a service that is already leaving.
+///
+/// A query that could not be run at all is not evidence of absence — the service may well be
+/// there, and an install that believes the service is gone replaces one that is still up.
+fn service_exists() -> bool {
+    match sc_query().map(|text| sc_state(&text)) {
+        Some(ScState::Absent) | Some(ScState::Deleting) => false,
+        Some(_) | None => true,
     }
 }
 
@@ -478,10 +517,12 @@ fn settle_down(failure: &str) -> Result<(), AppError> {
     let deadline = Instant::now() + SETTLE_TIMEOUT;
     loop {
         match sc_query().map(|text| sc_state(&text)) {
-            Some(ScState::Stopped | ScState::Absent) => return Ok(()),
+            // A record that is marked for deletion is down as well: nothing is running, and
+            // the control manager has already been told to remove it.
+            Some(ScState::Stopped | ScState::Absent | ScState::Deleting) => return Ok(()),
             // `sc.exe` could not be run at all, so there is nothing to wait out.
             Some(ScState::Unknown) | None => {
-                return Err(AppError::with_detail(failure, "sc.exe reported no state"))
+                return Err(AppError::with_detail(failure, "sc.exe reported no state"));
             }
             Some(ScState::Running | ScState::Pending) => {}
         }
@@ -492,6 +533,50 @@ fn settle_down(failure: &str) -> Result<(), AppError> {
                 format!(
                     "the service was still up after {}s\n{}",
                     SETTLE_TIMEOUT.as_secs(),
+                    sc_query().unwrap_or_default()
+                ),
+            ));
+        }
+
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Waits for a record that is marked for deletion to leave the control manager's database.
+///
+/// `DeleteService` only *marks* a service for deletion: the record stays until every handle to
+/// it is closed and the service is no longer running, and `sc create` refuses to put a new
+/// service in its place while it is there. A user who uninstalls and installs again therefore
+/// meets a record that is still on its way out, and the wait is what turns that into an install
+/// that works.
+///
+/// Bounded, and the answer is the control manager's own words: a record that does not go away
+/// is an install that says so rather than one that hangs.
+fn wait_for_deletable_record() -> Result<(), AppError> {
+    let deadline = Instant::now() + DELETE_RECORD_TIMEOUT;
+
+    loop {
+        match sc_query().map(|text| sc_state(&text)) {
+            // Not there at all, or there and usable: there is nothing to wait for.
+            Some(ScState::Absent)
+            | Some(ScState::Running | ScState::Stopped | ScState::Pending) => return Ok(()),
+            // The record is on its way out; the wait is for it to actually go.
+            Some(ScState::Deleting) => {}
+            // `sc.exe` could not be run at all, so there is nothing to wait out.
+            Some(ScState::Unknown) | None => {
+                return Err(AppError::with_detail(
+                    codes::SERVICE_INSTALL_FAILED,
+                    "sc.exe reported no state",
+                ));
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Err(AppError::with_detail(
+                codes::SERVICE_INSTALL_FAILED,
+                format!(
+                    "the previous service was still marked for deletion after {}s\n{}",
+                    DELETE_RECORD_TIMEOUT.as_secs(),
                     sc_query().unwrap_or_default()
                 ),
             ));
@@ -756,7 +841,7 @@ fn run_with_timeout(
             Ok(Some(_)) => {
                 return child
                     .wait_with_output()
-                    .map_err(|e| AppError::cause(codes::SERVICE_COMMAND_FAILED, e))
+                    .map_err(|e| AppError::cause(codes::SERVICE_COMMAND_FAILED, e));
             }
             Ok(None) => {}
             Err(e) => return Err(AppError::cause(codes::SERVICE_COMMAND_FAILED, e)),
@@ -840,33 +925,57 @@ fn program_files() -> Result<PathBuf, AppError> {
     ))
 }
 
-fn service_exists() -> bool {
-    sc_query()
-        .map(|output| !output.contains("1060"))
-        .unwrap_or(true)
-}
-
 /// An install that reported success still has to leave a service behind.
 fn verify_present() -> Result<(), AppError> {
     std::thread::sleep(Duration::from_millis(500));
 
     match sc_query() {
-        Some(output) if !output.contains("1060") => Ok(()),
-        Some(output) => Err(AppError::with_detail(codes::SERVICE_INSTALL_FAILED, output)),
+        // Not there, or already on its way out: the install did not leave a service behind.
+        Some(text) if matches!(sc_state(&text), ScState::Absent | ScState::Deleting) => {
+            Err(AppError::with_detail(codes::SERVICE_INSTALL_FAILED, text))
+        }
+        Some(_) => Ok(()),
         None => Err(AppError::new(codes::SERVICE_INSTALL_FAILED)),
     }
 }
 
+/// Waits for the control manager to let go of the record.
+///
+/// The delete is answered as soon as the control manager has been told to remove the record,
+/// which is not the same as the record being gone: it stays until every handle to it is closed.
+/// A fixed sleep guessed at how long that takes and failed an uninstall that had in fact
+/// worked; polling asks instead.
+///
+/// A record that is marked for deletion counts as gone — the service cannot be started and the
+/// control manager refuses every operation on it, which is what an uninstall is for.
 fn verify_absent() -> Result<(), AppError> {
-    std::thread::sleep(Duration::from_millis(500));
+    let deadline = Instant::now() + DELETE_RECORD_TIMEOUT;
 
-    match sc_query() {
-        Some(output) if output.contains("1060") => Ok(()),
-        Some(output) => Err(AppError::with_detail(
-            codes::SERVICE_UNINSTALL_FAILED,
-            output,
-        )),
-        None => Ok(()),
+    loop {
+        match sc_query().map(|text| sc_state(&text)) {
+            Some(ScState::Absent) | Some(ScState::Deleting) => return Ok(()),
+            // `sc.exe` could not be run at all, so there is nothing to wait out.
+            Some(ScState::Unknown) | None => {
+                return Err(AppError::with_detail(
+                    codes::SERVICE_UNINSTALL_FAILED,
+                    "sc.exe reported no state",
+                ));
+            }
+            Some(ScState::Running | ScState::Stopped | ScState::Pending) => {}
+        }
+
+        if Instant::now() >= deadline {
+            return Err(AppError::with_detail(
+                codes::SERVICE_UNINSTALL_FAILED,
+                format!(
+                    "the service was still registered after {}s\n{}",
+                    DELETE_RECORD_TIMEOUT.as_secs(),
+                    sc_query().unwrap_or_default()
+                ),
+            ));
+        }
+
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
