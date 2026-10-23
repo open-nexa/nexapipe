@@ -43,6 +43,22 @@ fn loads_the_auth_section_of_the_example_config() {
     );
 }
 
+/// The general example ships with 2FA on, like the first-run template.
+///
+/// A fresh install that starts with nothing but the Node ID as its credential
+/// is a fresh install whose Node ID is a publicly resolvable credential for
+/// every route — and that Node ID is in every invite link, in the client's own
+/// configuration and in screenshots. The example is the first file an
+/// operator copies, so it is the one that has to start secure.
+#[test]
+fn the_general_example_ships_with_two_factor_on() {
+    let (_, auth) = ProxyConfig::load_with_auth("../../config.toml.example")
+        .expect("the general example parses");
+
+    let auth = auth.expect("the general example declares an [auth] section");
+    assert!(auth.enabled, "the general example starts with 2FA on");
+}
+
 /// A config without any `[auth]` table loads as "no 2FA", not as an error.
 #[test]
 fn accepts_a_config_without_auth() {

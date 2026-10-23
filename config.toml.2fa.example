@@ -139,7 +139,8 @@ issuer = "NexaPipe"
 # block, for people who already have their own credentials.
 #
 # That code carries the TOTP secret in the clear — it is a password that happens
-# to be shaped like an address. Prefer the enrollment form below, which is not:
+# to be shaped like an address, and it stays a password for as long as the
+# secret lives. The enrollment form below is the one that is not:
 #
 #   nexapipe --generate-invite client-001 --registration --config config.toml
 #
@@ -159,17 +160,29 @@ issuer = "NexaPipe"
 # outstanding token, which is how a link that never arrived gets revoked. Never
 # write the key by hand — let the command own it.
 #
+# The token is only worth anything while the server runs the 2FA handshake, so
+# the enrollment form needs `enabled = true` here — which is what this file
+# ships. With 2FA off the server never asks anybody for a credential, and the
+# invite falls back to carrying the secret, with a warning saying so.
+#
 # Warning: changing algorithm, time_step or digits here does NOT change what the
 # app does once it has scanned the code. Those values are only read when the
 # enrollment QR code is generated; keep them stable after clients are enrolled.
 #
 # Both invite forms above need the client to exist already, since they hand out
 # the secret this file holds. To create one and invite it in a single run, add
-# --create-client — it generates the secret, writes it here and puts it in the
-# invite, which is two commands folded into one:
+# --create-client — it generates the secret, writes it here and prints an
+# invite for it, which is two commands folded into one:
 #
 #   nexapipe --generate-invite client-003 --create-client --config config.toml
 #   nexapipe --generate-invite client-003 --create-client --registration
+#
+# A client that this run creates is the one case where the enrollment form is
+# the default: the secret it mints was in nobody's hands a moment earlier, so
+# nothing is lost by the first device trading the token for a fresh one — and
+# the link stops being a credential the moment it is scanned. A client that
+# exists already keeps the secret it has, and the link that carries it is a
+# password for as long as that secret lives.
 #
 # It only ever creates a client that is missing entirely: run against one that
 # already has a secret it reuses that secret rather than issuing a second, so an
@@ -215,6 +228,12 @@ created_at = "1723756800"
 # That is the correct answer, and it is not the answer a deployed
 # configuration was written against. Turn it on having looked at where your
 # backends actually listen.
+#
+# The flag does not say which of the two rules you have, so the server says it
+# for you: with a client that has a port list and this flag off, the startup
+# log names that client and says the list is held against the port the client
+# names - and that a request naming no port is not checked at all.
+# `nexapipe client list` shows the same thing per client.
 # allow_ports_strict = true
 # The server keeps `failed_attempts`, `locked_until` and `last_used` for a
 # client that has failed a handshake, so a lockout survives a restart. Those

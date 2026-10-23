@@ -7,6 +7,8 @@ use crate::auth::{
 use crate::conn::peers::PeerIdentity;
 
 use nexapipe_proto::auth::Format;
+use tokio::io::{AsyncRead, AsyncReadExt};
+use zeroize::Zeroizing;
 
 use iroh::endpoint::Connection;
 
@@ -123,7 +125,7 @@ pub(in crate::conn) async fn perform_authentication(
 
     // The payload's first byte says which form it is in, and the answers go
     // back in the form the client asked in.
-    let (start_msg, start_format) = AuthMessage::from_payload(&start_bytes).map_err(|_| {
+    let (start_msg, start_format) = AuthMessage::from_payload(&start_bytes[..]).map_err(|_| {
         AuthFailure::NotStarted("the first stream is not an AUTH_START".to_string())
     })?;
     let mut format = reply_format(&start_msg, start_format);
@@ -184,8 +186,8 @@ pub(in crate::conn) async fn perform_authentication(
             let start_after_enroll = read_auth_message(&mut recv)
                 .await
                 .map_err(AuthFailure::NotStarted)?;
-            let (start_after_enroll_msg, asked_in) = AuthMessage::from_payload(&start_after_enroll)
-                .map_err(|_| {
+            let (start_after_enroll_msg, asked_in) =
+                AuthMessage::from_payload(&start_after_enroll[..]).map_err(|_| {
                     AuthFailure::NotStarted("expected AUTH_START after ENROLL_START".to_string())
                 })?;
             // The client may announce its version here, so this message is
@@ -230,7 +232,7 @@ pub(in crate::conn) async fn perform_authentication(
         .await
         .map_err(AuthFailure::NotStarted)?;
 
-    let (response_msg, response_format) = AuthMessage::from_payload(&response_bytes)
+    let (response_msg, response_format) = AuthMessage::from_payload(&response_bytes[..])
         .map_err(|_| AuthFailure::NotStarted("expected AUTH_RESPONSE message".to_string()))?;
 
     let (resp_client_id, resp_device_id, resp_timestamp, signature, totp_code) = match response_msg
@@ -562,7 +564,14 @@ pub(in crate::conn) async fn perform_authentication(
 /// The length prefix is whatever the peer sent first, so it is only trusted
 /// after the range check: a data stream offered to a 2FA server starts with
 /// bytes that would otherwise ask for a gigabyte-sized buffer.
-async fn read_auth_message(recv: &mut iroh::endpoint::RecvStream) -> Result<Vec<u8>, String> {
+///
+/// Generic on purpose: `tokio::io::duplex` gives a test both ends of the
+/// framing in one process, so what a peer sends can be read without an iroh
+/// endpoint behind it — the same reason the L4 tunnel is written this way.
+async fn read_auth_message<R>(recv: &mut R) -> Result<Zeroizing<Vec<u8>>, String>
+where
+    R: AsyncRead + Unpin,
+{
     let len_buf = read_bytes(recv, 4).await?;
     let msg_len = u32::from_le_bytes([len_buf[0], len_buf[1], len_buf[2], len_buf[3]]) as usize;
 
@@ -575,16 +584,30 @@ async fn read_auth_message(recv: &mut iroh::endpoint::RecvStream) -> Result<Vec<
 
 /// Reads exactly `len` bytes, one cancel-safe `read` at a time.
 ///
-/// `RecvStream::read` is cancel-safe and `read_exact` is not, and the handshake
-/// runs under a deadline that may drop this future mid-message.
-async fn read_bytes(recv: &mut iroh::endpoint::RecvStream, len: usize) -> Result<Vec<u8>, String> {
-    let mut buf = vec![0u8; len];
+/// `read` is cancel-safe and `read_exact` is not, and the handshake runs
+/// under a deadline that may drop this future mid-message.
+///
+/// **The buffer wipes itself when it goes out of scope.** Two of the messages
+/// this reads carry a credential — the enrollment token, and the signature
+/// that answers a challenge — and the bytes of them are in the buffer until
+/// it is dropped. A plain `Vec<u8>` would leave those bytes in the heap for
+/// the allocator to hand out again, which is where a core dump, a swap file
+/// or a read of `/proc/<pid>/mem` finds them: the credential outlives the
+/// handshake that needed it.
+///
+/// Every message read here is wiped, not only the ones that carry a
+/// credential: the buffer is the same buffer either way, and a rule that says
+/// "wipe this one, not that one" is a rule somebody has to remember.
+async fn read_bytes<R>(recv: &mut R, len: usize) -> Result<Zeroizing<Vec<u8>>, String>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buf = Zeroizing::new(vec![0u8; len]);
     let mut filled = 0usize;
     while filled < len {
         match recv.read(&mut buf[filled..]).await {
-            Ok(Some(0)) => break,
-            Ok(Some(n)) => filled += n,
-            Ok(None) => break,
+            Ok(0) => break,
+            Ok(n) => filled += n,
             Err(e) => return Err(format!("failed to read auth message: {}", e)),
         }
     }
@@ -595,4 +618,170 @@ async fn read_bytes(recv: &mut iroh::endpoint::RecvStream, len: usize) -> Result
         ));
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexapipe_proto::secret::SecretString;
+    use tokio::io::AsyncWriteExt;
+
+    /// The heap, watched.
+    ///
+    /// The defect this fixes is a credential that survives in the heap after
+    /// the message that carried it is gone, and the only way to *show* that it
+    /// does not survive is to look at the memory after it is freed. The
+    /// allocator is where that memory comes back from, so the allocator is
+    /// where the proof is: a block on its way out that still holds the
+    /// credential is a block the credential survived in.
+    mod heap {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// The bytes the probe is watching for.
+        ///
+        /// A string no other test uses, so a block that holds it is one this
+        /// test made.
+        pub const NEEDLE: &str = "nexapipe-heap-probe-4b8e2a";
+
+        /// Whether the probe is watching.
+        static WATCHING: AtomicBool = AtomicBool::new(false);
+
+        /// Whether the needle was seen in a block on its way out.
+        static FOUND: AtomicBool = AtomicBool::new(false);
+
+        /// The allocator that watches.
+        struct Probe;
+
+        unsafe impl GlobalAlloc for Probe {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                scan(ptr, layout.size());
+                unsafe { System.dealloc(ptr, layout) }
+            }
+
+            unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+                unsafe { System.alloc_zeroed(layout) }
+            }
+
+            unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+                scan(ptr, layout.size());
+                unsafe { System.realloc(ptr, layout, new_size) }
+            }
+        }
+
+        #[global_allocator]
+        static PROBE: Probe = Probe;
+
+        /// Looks for the needle in a block that is about to be freed.
+        fn scan(ptr: *mut u8, len: usize) {
+            if !WATCHING.load(Ordering::Relaxed) || len < NEEDLE.len() {
+                return;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+            if bytes
+                .windows(NEEDLE.len())
+                .any(|window| window == NEEDLE.as_bytes())
+            {
+                FOUND.store(true, Ordering::SeqCst);
+            }
+        }
+
+        /// Runs `body` with the heap watched, and says whether the needle was
+        /// left behind in it.
+        pub fn left_behind<R>(body: impl FnOnce() -> R) -> bool {
+            WATCHING.store(true, Ordering::SeqCst);
+            FOUND.store(false, Ordering::SeqCst);
+            body();
+            WATCHING.store(false, Ordering::SeqCst);
+            FOUND.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The enrollment token a client offers does not survive in the heap.
+    ///
+    /// The token is the credential an enrollment is made with: it stands for
+    /// the secret the client is about to be issued, and it is spent the
+    /// moment it is exchanged. It arrives in a buffer, and the buffer used to
+    /// be a plain `Vec<u8>`: the bytes of the token were in it until it was
+    /// dropped, and dropping it left them in the heap for the allocator to
+    /// hand out again. A core dump, a swap file or a read of
+    /// `/proc/<pid>/mem` finds them there long after the handshake that
+    /// needed them.
+    ///
+    /// This is the proof that they do not survive: the heap is watched while
+    /// the buffer the message was read into is dropped, and a block on its
+    /// way out that still holds the token fails the test.
+    ///
+    /// The token travels over a `tokio::io::duplex` pipe rather than a real
+    /// connection on purpose: a QUIC connection would carry the token through
+    /// the transport's own buffers, and those would be found by the probe for
+    /// reasons that have nothing to do with this code.
+    #[tokio::test]
+    async fn a_received_credential_does_not_survive_in_the_heap() {
+        let needle = heap::NEEDLE;
+        let start = AuthMessage::EnrollStart {
+            client_id: "client-001".to_string(),
+            token: SecretString::new(needle.to_string()),
+            device_id: None,
+            public_key: None,
+        };
+        let payload = start
+            .to_payload(Format::Binary)
+            .expect("the message serializes");
+
+        // The client writes the message, and the server reads it.
+        let (mut peer, mut reader) = tokio::io::duplex(4096);
+        peer.write_all(&(payload.len() as u32).to_le_bytes())
+            .await
+            .expect("the length is written");
+        peer.write_all(&payload)
+            .await
+            .expect("the message is written");
+
+        let bytes = read_auth_message(&mut reader)
+            .await
+            .expect("the message is read");
+
+        // The parsed message holds a copy of its own: the token is a
+        // `SecretString` built out of the bytes, so the copy in the buffer is
+        // the redundant one — which is the one that has to be wiped.
+        let (parsed, _) = AuthMessage::from_payload(&bytes[..]).expect("the message parses");
+        match &parsed {
+            AuthMessage::EnrollStart { token, .. } => assert_eq!(
+                token.expose_secret(),
+                needle,
+                "the parsed message holds the credential"
+            ),
+            other => panic!("expected ENROLL_START, got {other:?}"),
+        }
+
+        // The buffer the credential was read into goes out of scope with the
+        // heap watched.
+        assert!(
+            !heap::left_behind(|| drop(bytes)),
+            "the credential survived in the heap"
+        );
+
+        // And the probe is not vacuous: a buffer that is *not* wiped leaves the
+        // credential behind, and the probe sees it.
+        assert!(
+            heap::left_behind(|| {
+                let mut plain = vec![0u8; needle.len()];
+                plain.copy_from_slice(needle.as_bytes());
+                std::hint::black_box(&plain);
+                drop(plain);
+            }),
+            "the probe does not see a credential that was not wiped"
+        );
+
+        // The copies that are meant to outlive the watched window: the parsed
+        // message, and the pipe that carried the bytes.
+        drop(parsed);
+        drop(peer);
+        drop(reader);
+    }
 }

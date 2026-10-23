@@ -87,9 +87,10 @@ impl ProxyConfig {
 /// `auth` is the `[auth]` half of the same file, and it is `None` when the file
 /// has no such section — which is not the same as "no credential". A config
 /// that names an inline `[iroh]` key and no `[auth]` at all is a credential in
-/// the open, and it is the common case: the generated first-run template and
-/// `config.toml.example` both leave `[auth]` out. A warning that needed an
-/// `AuthConfig` to exist would be silent for exactly that file.
+/// the open. The files this server ships — the generated first-run template
+/// and `config.toml.example` — both carry `[auth] enabled = true` now, but a
+/// deployment whose file predates the section still has one, and a warning
+/// that needed an `AuthConfig` to exist would be silent for exactly that file.
 pub fn warn_about_readable_credentials(
     path: &std::path::Path,
     proxy: &ProxyConfig,

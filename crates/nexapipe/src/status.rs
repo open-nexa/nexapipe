@@ -310,6 +310,23 @@ fn print_clients(body: &Value) {
                 None => "every port".to_string(),
             },
         );
+        // Which of the two port rules the list above is held against. The
+        // flag is not in the name of the setting and the two rules refuse
+        // different requests, so the list on its own says nothing about how
+        // narrow it is. The same line `nexapipe client list` prints, and it
+        // is only printed for a client that has a list at all.
+        if client["allow_ports"].is_array() {
+            println!(
+                "      port rule   {}",
+                if client["allow_ports_strict"].as_bool().unwrap_or(false) {
+                    "allow_ports_strict = true, so the list is checked against the port the \
+                     request is served from"
+                } else {
+                    "allow_ports_strict = false, so the list is checked against the port the \
+                     client names, and a request that names no port is not checked at all"
+                }
+            );
+        }
         if client["locked_until"].is_number() {
             println!("      locked out");
         }
