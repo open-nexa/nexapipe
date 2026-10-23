@@ -1942,16 +1942,14 @@ the same tags as the server.
 
 ### First launch on macOS
 
-The desktop bundles in a GitHub release are code-signed and notarized **when the
-release pipeline has the credentials for it**, and the pipeline fails when it
-does not: a release with no signing material is not published, so a bundle that
-reaches a user carries a signature.
-
-(An operator who wants a test build without the credentials can say so
-explicitly — the release workflow's `allow_unsigned` input names the platforms
-to publish unsigned, logs it, and puts a warning at the top of the release
-notes. It is a decision somebody makes on purpose, not a fallback that
-happens.)
+The desktop bundles in a GitHub release are code-signed and notarized. A
+release whose repository holds no signing credentials is **not published at
+all**: the release job fails before anything is built, naming the values
+that are missing, so a bundle that reaches a user carries a signature.
+Publishing a bundle unsigned is a deliberate act — a manual run of the
+release workflow asks for it by name — and the release notes carry the
+warning at the top. It is a decision somebody makes on purpose, not a
+fallback that happens.
 
 The **application inside the disk image** is what is notarized: the bundler
 submits it to Apple, waits for the answer and staples the ticket to it, so a
@@ -1965,8 +1963,8 @@ Gatekeeper accepts the image it produced, so a gap here shows up in the job
 log rather than in a user's first launch.
 
 A bundle that is **not** signed — one published through the `allow_unsigned`
-opt-out, or one built locally — is quarantined by Safari, so the first
-launch is refused with:
+opt-out, or one built locally — is quarantined by Safari, and so is the app
+copied from it, so the first launch is refused with:
 
 > "nexa" is damaged and can't be opened. You should move it to the Trash.
 
@@ -2006,9 +2004,9 @@ openssl base64 -A -in /path/to/developer-id.p12 -out certificate-base64.txt
 Tauri imports the certificate and does the notarization itself; the workflow
 only hands it the variables and then says, out loud, whether the application
 and the disk image it produced carry a valid signature and whether Gatekeeper
-accepts each of them. A release built without the credentials is signed by
-nothing and says so in the job log rather than quietly shipping an unsigned
-app.
+accepts each of them. A release whose repository holds no credentials does not
+reach the build at all: the job fails, naming the values that are missing,
+rather than quietly shipping an unsigned app.
 
 To find out whether the repository holds the material a release needs, before
 starting one, dispatch the release workflow with **signing_only** ticked. That

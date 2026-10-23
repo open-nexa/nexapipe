@@ -29,6 +29,23 @@ name: Release
 # an arch-less nexa.app.tar.gz), so ui-desktop/.github/scripts/stage-artifact.mjs renames
 # them — and any .sig that was made for the old name is regenerated right after.
 #
+# Signing rule: a release publishes signed artifacts, or it does not publish.
+#
+# The desktop bundles are signed with the mechanism of their own platform — a
+# Developer ID certificate plus notarization on macOS, an Authenticode
+# certificate on Windows — and the Android APK with the release keystore. A
+# platform whose signing material is missing fails the job before anything is
+# built, so an unsigned artifact never reaches a Release: macOS Gatekeeper and
+# Windows SmartScreen refuse such an artifact, and the person who installs it
+# is told nothing about why.
+#
+# The one exception is deliberate and visible: a manual run with
+# "allow_unsigned" lists the platforms that are published unsigned on purpose.
+# Those platforms are published unsigned — the material is not handed to the
+# bundler at all — the job log says so, and the release notes carry a warning
+# at the top. A tag push has no such input, so a release made by tagging is
+# always signed.
+#
 # Can also be triggered manually (workflow_dispatch); an existing tag must be
 # provided.
 #
@@ -394,6 +411,166 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
+      # The signing gate. It runs before anything is built, so a repository
+      # without the signing material fails in seconds instead of after a full
+      # Rust and frontend build. The material it checks is what the platform
+      # needs for the artifact to be signed at all: a Developer ID certificate
+      # and the notarization credentials on macOS, an Authenticode certificate
+      # on Windows.
+      #
+      # A missing value is a failure and not a warning: the release would
+      # publish an artifact that Gatekeeper or SmartScreen refuses, and the
+      # person who installs it is told nothing about why. The failure names
+      # the exact values that are missing, the way the Android keystore step
+      # does.
+      #
+      # The one exception is the "allow_unsigned" dispatch input: a platform it
+      # lists is published unsigned on purpose. The script says so in the log,
+      # and the release notes carry a warning about it.
+      #
+      # Linux is not gated: a deb/rpm/AppImage carries no code signature in
+      # this repository, and Linux refuses nothing the way Gatekeeper and
+      # SmartScreen do.
+      - name: Check the signing material
+        id: gate
+        if: matrix.os != 'linux'
+        shell: bash
+        env:
+          ALLOW_UNSIGNED: ${{ inputs.allow_unsigned }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_ID: ${{ vars.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: .github/scripts/signing-gate.sh "$MATRIX_OS" "$ALLOW_UNSIGNED"
+
+      - name: Prepare the macOS signing credentials
+        # The Developer ID certificate and the notarization credentials.
+        #
+        # Tauri imports the certificate from `APPLE_CERTIFICATE` (a base64
+        # .p12) itself and notarizes when the three notarization variables are
+        # set, so nothing here touches the keychain.
+        #
+        # The variables are only handed on when they are all there: Tauri
+        # notarizes when it sees them, and half a set is worse than none. The
+        # gate above has already refused to start without the whole set, so
+        # what arrives here is complete — the check is not repeated.
+        #
+        # Required, in the repository's secret and variable stores:
+        #   secret  APPLE_CERTIFICATE              base64 of the Developer ID .p12
+        #   secret  APPLE_CERTIFICATE_PASSWORD     the password of that .p12
+        #   secret  APPLE_APP_SPECIFIC_PASSWORD    an app-specific password for notarization
+        #   var     APPLE_SIGNING_IDENTITY         "Developer ID Application: … (TEAMID)"
+        #   var     APPLE_ID                       the Apple ID email
+        #   var     APPLE_TEAM_ID                  the team id
+        if: matrix.os == 'macos'
+        shell: bash
+        env:
+          SIGNING_UNSIGNED: ${{ steps.gate.outputs.signing_unsigned }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ vars.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          # An opted-out platform is published unsigned: the certificate is
+          # not imported and nothing is notarized, so the bundle is exactly
+          # what the release notes say it is.
+          if [ "$SIGNING_UNSIGNED" = "true" ]; then
+            echo "the macOS bundle is published unsigned (allow_unsigned lists macos): no certificate is imported and nothing is notarized"
+            exit 0
+          fi
+          echo "Signing with: $APPLE_SIGNING_IDENTITY"
+          {
+            echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
+            # The certificate is base64, and base64 wraps at 76 columns, so it
+            # is a **multi-line** value. A plain `echo` would write the first
+            # line as one env entry and the rest as lines of their own, and
+            # the certificate would arrive truncated — which fails the import
+            # in a way that says nothing about the password. The heredoc form
+            # is the one that carries a multi-line value whole.
+            echo "APPLE_CERTIFICATE<<NEXAPIPE_APPLE_CERTIFICATE_EOF"
+            echo "$APPLE_CERTIFICATE"
+            echo "NEXAPIPE_APPLE_CERTIFICATE_EOF"
+            echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
+          } >> "$GITHUB_ENV"
+          # The Apple ID is a repository **variable**, so it is not a secret
+          # to be kept hidden — but it is an account, and a public job log
+          # is the wrong place for one. The log says that notarization is
+          # configured and leaves the address out of it.
+          echo "Notarizing with the configured Apple ID"
+          {
+            echo "APPLE_ID=$APPLE_ID"
+            echo "APPLE_PASSWORD=$APPLE_APP_SPECIFIC_PASSWORD"
+            echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
+          } >> "$GITHUB_ENV"
+
+      - name: Prepare the Windows signing certificate
+        # The Authenticode certificate, imported into the runner's own
+        # certificate store. Tauri signs the NSIS installer and the binaries
+        # in it with the certificate whose thumbprint the bundle
+        # configuration names, so the certificate has to be in
+        # Cert:\CurrentUser\My before the build starts.
+        #
+        # Required, in the repository's secret and variable stores:
+        #   secret  WINDOWS_CERTIFICATE            base64 of the Authenticode .pfx
+        #   secret  WINDOWS_CERTIFICATE_PASSWORD   the password of that .pfx
+        #
+        # The thumbprint is not configured: it is read back from the imported
+        # certificate, so it cannot drift away from the certificate that was
+        # actually uploaded.
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          SIGNING_UNSIGNED: ${{ steps.gate.outputs.signing_unsigned }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # An opted-out platform is published unsigned: no certificate is
+          # imported and nothing is signed, so the installer is exactly what
+          # the release notes say it is.
+          if ($env:SIGNING_UNSIGNED -eq 'true') {
+            Write-Output 'the Windows bundle is published unsigned (allow_unsigned lists windows): no certificate is imported and nothing is signed'
+            exit 0
+          }
+
+          # The secret is the base64 of the .pfx itself. Whitespace is stripped
+          # because base64 wraps at 76 columns, and the file is written to the
+          # runner's temp directory and deleted right after the import.
+          $base64 = ($env:WINDOWS_CERTIFICATE -replace '\s', '')
+          if ([string]::IsNullOrWhiteSpace($base64)) {
+            throw 'the secret WINDOWS_CERTIFICATE is empty'
+          }
+          $pfx = Join-Path $env:RUNNER_TEMP 'nexapipe-code-signing.pfx'
+          try {
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($base64))
+          } catch {
+            throw "the secret WINDOWS_CERTIFICATE is not valid base64 of a .pfx file: $($_.Exception.Message)"
+          }
+
+          $password = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          try {
+            $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          } catch {
+            throw "the .pfx could not be imported into Cert:\CurrentUser\My: $($_.Exception.Message). Check WINDOWS_CERTIFICATE and WINDOWS_CERTIFICATE_PASSWORD."
+          } finally {
+            # The private key must not stay on disk in a readable file.
+            Remove-Item -Force $pfx -ErrorAction SilentlyContinue
+          }
+          if (-not $cert.HasPrivateKey) {
+            throw 'the imported certificate carries no private key, so nothing can be signed with it'
+          }
+          Write-Output "imported: $($cert.Subject)"
+          Write-Output "thumbprint: $($cert.Thumbprint)"
+          Write-Output "expires: $($cert.NotAfter)"
+          "WINDOWS_CERTIFICATE_THUMBPRINT=$($cert.Thumbprint)" >> $env:GITHUB_ENV
+
       - name: Install Linux dependencies
         if: matrix.os == 'linux'
         shell: bash
@@ -516,6 +693,9 @@ jobs:
         #     not ship the amd64 DLL)
         #   - bundle.createUpdaterArtifacts: enabled only when a signing key exists,
         #     otherwise the build fails for lack of a signature
+        #   - bundle.windows.certificateThumbprint: the Authenticode certificate the
+        #     Windows bundle is signed with, read back from the certificate the
+        #     "Prepare the Windows signing certificate" step imported
         #   - build.beforeBuildCommand: always npm, so we do not depend on yarn being
         #     present on the runner
         shell: bash
@@ -523,73 +703,6 @@ jobs:
           SIGNING_ENABLED: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
           MATRIX_TARGET: ${{ matrix.target }}
         run: node .github/scripts/ci-config.mjs
-
-      - name: Prepare the macOS signing credentials
-        # The Developer ID certificate and the notarization credentials, when
-        # the deployment has them.
-        #
-        # Tauri imports the certificate from `APPLE_CERTIFICATE` (a base64
-        # .p12) itself and notarizes when the three notarization variables are
-        # set, so nothing here touches the keychain.
-        #
-        # The variables are only handed on when they are all there: Tauri
-        # notarizes when it sees them, and half a set is worse than none.
-        #
-        # Required, in the repository's secret and variable stores:
-        #   secret  APPLE_CERTIFICATE              base64 of the Developer ID .p12
-        #   secret  APPLE_CERTIFICATE_PASSWORD     the password of that .p12
-        #   secret  APPLE_APP_SPECIFIC_PASSWORD    an app-specific password for notarization
-        #   var     APPLE_SIGNING_IDENTITY         "Developer ID Application: … (TEAMID)"
-        #   var     APPLE_ID                       the Apple ID email
-        #   var     APPLE_TEAM_ID                  the team id
-        if: matrix.os == 'macos'
-        shell: bash
-        env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ vars.APPLE_ID }}
-          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-          APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
-        run: |
-          set -euo pipefail
-          # The certificate, **its password** and the identity are all needed:
-          # a certificate whose password is missing cannot be imported, and a
-          # failed import is a broken release rather than an unsigned one. So a
-          # half-configured set falls back to the unsigned path with a warning,
-          # exactly like no set at all.
-          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_CERTIFICATE_PASSWORD" ] || [ -z "$APPLE_SIGNING_IDENTITY" ]; then
-            echo "::warning::no Developer ID certificate is configured, so this macOS bundle is not signed and not notarized. macOS Gatekeeper refuses an unsigned app until the user allows it by hand — see the README for the secrets this needs."
-            exit 0
-          fi
-          echo "Signing with: $APPLE_SIGNING_IDENTITY"
-          {
-            echo "APPLE_SIGNING_IDENTITY=$APPLE_SIGNING_IDENTITY"
-            # The certificate is base64, and base64 wraps at 76 columns, so it
-            # is a **multi-line** value. A plain `echo` would write the first
-            # line as one env entry and the rest as lines of their own, and
-            # the certificate would arrive truncated — which fails the import
-            # in a way that says nothing about the password. The heredoc form
-            # is the one that carries a multi-line value whole.
-            echo "APPLE_CERTIFICATE<<NEXAPIPE_APPLE_CERTIFICATE_EOF"
-            echo "$APPLE_CERTIFICATE"
-            echo "NEXAPIPE_APPLE_CERTIFICATE_EOF"
-            echo "APPLE_CERTIFICATE_PASSWORD=$APPLE_CERTIFICATE_PASSWORD"
-          } >> "$GITHUB_ENV"
-          if [ -n "$APPLE_ID" ] && [ -n "$APPLE_APP_SPECIFIC_PASSWORD" ] && [ -n "$APPLE_TEAM_ID" ]; then
-            # The Apple ID is a repository **variable**, so it is not a secret
-            # to be kept hidden — but it is an account, and a public job log
-            # is the wrong place for one. The log says that notarization is
-            # configured and leaves the address out of it.
-            echo "Notarizing with the configured Apple ID"
-            {
-              echo "APPLE_ID=$APPLE_ID"
-              echo "APPLE_PASSWORD=$APPLE_APP_SPECIFIC_PASSWORD"
-              echo "APPLE_TEAM_ID=$APPLE_TEAM_ID"
-            } >> "$GITHUB_ENV"
-          else
-            echo "::warning::the Developer ID certificate is there but the notarization credentials are not, so the bundle is signed but not notarized. Apple requires notarization for a Developer ID Application, and Gatekeeper refuses an un-notarized one."
-          fi
 
       - name: Build bundle
         shell: bash
@@ -604,39 +717,61 @@ jobs:
         # signature and the notarization are the two things a user's Gatekeeper
         # asks about, and a bundle that is signed but not notarized is refused
         # just as firmly as one that is neither.
+        #
+        # So this step does not only report: when the release is supposed to
+        # be signed, a bundle that is not signed with a Developer ID
+        # certificate fails the job, because that is the artifact the Release
+        # would publish. A run that opted out of signing reports the same
+        # findings without enforcing them.
         if: matrix.os == 'macos'
         shell: bash
+        env:
+          SIGNING_UNSIGNED: ${{ steps.gate.outputs.signing_unsigned }}
         run: |
           set -uo pipefail
+          enforce=true
+          if [ "$SIGNING_UNSIGNED" = "true" ]; then
+            enforce=false
+            echo "::warning::this bundle is published unsigned (allow_unsigned lists macos): the findings below are reported, not enforced"
+          fi
+          failed=0
           # src-tauri/target/<triple>/release/bundle/macos/<name>.app
           APP=$(find src-tauri/target -maxdepth 6 -name '*.app' -type d 2>/dev/null | head -n 1)
           if [ -z "$APP" ]; then
-            echo "::warning::no .app was found to report the signature of"
-            exit 0
-          fi
-          if codesign --verify --deep --strict --verbose=2 "$APP" 2>&1; then
-            echo "the signature verifies"
+            echo "::error::no .app was found to report the signature of"
+            failed=1
           else
-            echo "::warning::$APP does not carry a valid signature"
-          fi
-          # `codesign --verify` passes for an **ad-hoc** signature as well, so
-          # it says nothing about whose signature it is. The authority is what
-          # tells a Developer ID signature from an ad-hoc one, and only the
-          # first is the one a user's Gatekeeper accepts.
-          if codesign -dv --verbose=4 "$APP" 2>&1 | grep -q "Authority=Developer ID"; then
-            echo "the signature is a Developer ID one"
-          else
-            echo "::warning::$APP is not signed with a Developer ID certificate, so Gatekeeper will refuse it"
-          fi
-          if spctl --assess --type execute --verbose=2 "$APP" 2>&1; then
-            echo "Gatekeeper accepts the bundle"
-          else
-            echo "::warning::Gatekeeper does not accept $APP. It is either unsigned or not notarized, and macOS will refuse to open it until the user allows it by hand."
+            if codesign --verify --deep --strict --verbose=2 "$APP" 2>&1; then
+              echo "the signature verifies"
+            else
+              echo "::error::$APP does not carry a valid signature"
+              failed=1
+            fi
+            # `codesign --verify` passes for an **ad-hoc** signature as well, so
+            # it says nothing about whose signature it is. The authority is what
+            # tells a Developer ID signature from an ad-hoc one, and only the
+            # first is the one a user's Gatekeeper accepts.
+            if codesign -dv --verbose=4 "$APP" 2>&1 | grep -q "Authority=Developer ID"; then
+              echo "the signature is a Developer ID one"
+            else
+              echo "::error::$APP is not signed with a Developer ID certificate, so Gatekeeper will refuse it"
+              failed=1
+            fi
+            if spctl --assess --type execute --verbose=2 "$APP" 2>&1; then
+              echo "Gatekeeper accepts the bundle"
+            else
+              echo "::error::Gatekeeper does not accept $APP. It is either unsigned or not notarized, and macOS will refuse to open it until the user allows it by hand."
+              failed=1
+            fi
           fi
           # The published artifact is the **disk image**, not the application
           # inside it: the image is what a user downloads, and the quarantine
           # attribute lands on the image. The application is assessed above
           # because that is what carries the signature.
+          #
+          # The image itself carries no stapled ticket — the bundler notarizes
+          # the application and signs the image — so this one is reported and
+          # not enforced.
           DMG=$(find src-tauri/target -maxdepth 6 -name '*.dmg' -type f 2>/dev/null | head -n 1)
           if [ -n "$DMG" ]; then
             if spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG" 2>&1; then
@@ -647,6 +782,60 @@ jobs:
           else
             echo "::warning::no .dmg was found to assess, and the .dmg is the artifact the release publishes"
           fi
+          if [ "$failed" -ne 0 ] && [ "$enforce" = true ]; then
+            echo "::error::the macOS bundle is not signed with a Developer ID certificate, so this release would publish an artifact Gatekeeper refuses"
+            exit 1
+          fi
+          exit 0
+
+      - name: Verify the Windows installer signature
+        # The counterpart of the macOS check above, for the artifact the user
+        # downloads on Windows: the NSIS installer. A bundle that carries no
+        # Authenticode signature fails the job, because SmartScreen refuses
+        # it and says nothing about why.
+        #
+        # The signature has to be the one that was imported above; a bundle
+        # signed with some other certificate is not the release either.
+        if: matrix.os == 'windows'
+        shell: pwsh
+        env:
+          SIGNING_UNSIGNED: ${{ steps.gate.outputs.signing_unsigned }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:SIGNING_UNSIGNED -eq 'true') {
+            Write-Output 'the Windows installer is published unsigned (allow_unsigned lists windows): the signature is reported, not enforced'
+            exit 0
+          }
+
+          $installers = @(Get-ChildItem -Path 'src-tauri/target' -Recurse -Filter '*-setup.exe' -File -ErrorAction SilentlyContinue)
+          if ($installers.Count -eq 0) {
+            throw 'no NSIS installer was produced, so there is nothing to verify'
+          }
+
+          $failed = $false
+          foreach ($installer in $installers) {
+            $signature = Get-AuthenticodeSignature -FilePath $installer.FullName
+            if (-not $signature.SignerCertificate) {
+              Write-Output "::error::$($installer.Name) carries no Authenticode signature, so SmartScreen will refuse it"
+              $failed = $true
+              continue
+            }
+            Write-Output "$($installer.Name): signed by $($signature.SignerCertificate.Subject) (status $($signature.Status))"
+            if ($env:WINDOWS_CERTIFICATE_THUMBPRINT -and $signature.SignerCertificate.Thumbprint -ne $env:WINDOWS_CERTIFICATE_THUMBPRINT) {
+              Write-Output "::error::$($installer.Name) is signed with $($signature.SignerCertificate.Thumbprint), which is not the certificate that was imported ($($env:WINDOWS_CERTIFICATE_THUMBPRINT))"
+              $failed = $true
+            }
+            if ($signature.Status -ne 'Valid') {
+              # The file is signed, but the certificate does not chain to a
+              # trusted root — a self-signed test certificate, say. SmartScreen
+              # warns about that too, but the artifact is signed, so this is
+              # reported rather than enforced.
+              Write-Output "::warning::the signature of $($installer.Name) does not validate against a trusted root (status $($signature.Status)); SmartScreen will warn the user about it"
+            }
+          }
+          if ($failed) {
+            throw 'the Windows installer is not signed with the configured certificate'
+          }
 
       - name: Verify Debian service upgrade packaging
         if: matrix.os == 'linux'
@@ -1592,6 +1781,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALLOW_UNSIGNED: ${{ inputs.allow_unsigned }}
         run: |
           set -euo pipefail
 
@@ -1604,12 +1794,59 @@ jobs:
           esac
           echo "TAG_NAME=$TAG_NAME VERSION=$VERSION PRERELEASE_FLAG=$PRERELEASE_FLAG"
 
+          # The note that says, in the release notes, that some of the artifacts
+          # are unsigned. The opt-out is deliberate and has to be visible to
+          # the person who installs the app, not only to the person who ran
+          # the workflow — so the warning goes at the top of the notes.
+          UNSIGNED_NOTE=""
+          if [ -n "$ALLOW_UNSIGNED" ]; then
+            echo "::warning::this release publishes unsigned artifacts: $ALLOW_UNSIGNED"
+            items=""
+            for platform in ${ALLOW_UNSIGNED//,/ }; do
+              case "$platform" in
+                macos)
+                  items+=$'> - `macos` — the `.dmg` and the `.app` inside it carry no Developer ID signature and are not notarized. macOS Gatekeeper refuses them until the user allows them by hand.\n'
+                  ;;
+                windows)
+                  items+=$'> - `windows` — the NSIS installer (`-setup.exe`) carries no Authenticode signature. Windows SmartScreen refuses it until the user allows it by hand.\n'
+                  ;;
+                *)
+                  items+="> - $platform\n"
+                  ;;
+              esac
+            done
+            UNSIGNED_NOTE=$'> [!WARNING]\n> **This release contains unsigned artifacts.**\n>\n'
+            UNSIGNED_NOTE+="> The run was dispatched with \`allow_unsigned=$ALLOW_UNSIGNED\`, so the following platforms were published **without a code signature**:"$'\n'
+            UNSIGNED_NOTE+="$items"
+            UNSIGNED_NOTE+=$'>\n> macOS Gatekeeper and Windows SmartScreen refuse such an artifact until the user allows it by hand.\n'
+          fi
+
           if gh release view "$TAG_NAME" >/dev/null 2>&1; then
             echo "Release $TAG_NAME already exists, overwriting the uploaded artifacts"
             gh release upload "$TAG_NAME" dist/* --clobber
             # `gh release upload` cannot flip the flag, so keep an already
             # published release (e.g. a re-run) in sync with the rule as well.
             gh release edit "$TAG_NAME" "$PRERELEASE_FLAG"
+            if [ -n "$UNSIGNED_NOTE" ]; then
+              # An existing release keeps the notes it has, so the warning is
+              # prepended to them here.
+              BODY="$(gh release view "$TAG_NAME" --json body --jq .body)"
+              if printf '%s' "$BODY" | grep -qF "This release contains unsigned artifacts"; then
+                echo "the unsigned-artifact warning is already in the release notes"
+              else
+                { printf '%s\n\n' "$UNSIGNED_NOTE"; printf '%s' "$BODY"; } > "$RUNNER_TEMP/release-notes.md"
+                gh release edit "$TAG_NAME" --notes-file "$RUNNER_TEMP/release-notes.md"
+              fi
+            fi
+          elif [ -n "$UNSIGNED_NOTE" ]; then
+            # `--notes` is prepended to the generated notes, so the warning
+            # comes first.
+            gh release create "$TAG_NAME" dist/* \
+              --title "$TAG_NAME" \
+              --generate-notes \
+              --notes "$UNSIGNED_NOTE" \
+              --verify-tag \
+              "$PRERELEASE_FLAG"
           else
             gh release create "$TAG_NAME" dist/* \
               --title "$TAG_NAME" \
