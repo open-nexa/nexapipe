@@ -43,7 +43,7 @@ pub fn version_file_path(root: &Path) -> PathBuf {
 /// Unix only: the write happens in the privileged install itself, which is the only place a
 /// file in root's own directory can be created with root's ownership. On Windows the record
 /// is a value in the service's own registry key, written by the elevated batch instead —
-/// see [`record_command`].
+/// see `record_command`.
 #[cfg(unix)]
 pub fn record_installed_version(version: &str) -> Result<(), AppError> {
     use std::os::unix::fs::PermissionsExt;

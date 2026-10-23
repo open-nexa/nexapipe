@@ -32,7 +32,7 @@ pub fn service_binary_path() -> PathBuf {
 ///
 /// A development build has no bundle and no `nexa-service` beside it, and the desktop
 /// binary understands `--foreground` as well.
-#[cfg(any(target_os = "macos", test))]
+#[cfg(target_os = "macos")]
 pub fn service_source(exe: &Path) -> PathBuf {
     service_source_with(exe, |path| path.is_file())
 }
