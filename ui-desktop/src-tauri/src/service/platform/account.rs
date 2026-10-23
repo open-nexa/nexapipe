@@ -171,11 +171,10 @@ pub fn allows(installed_by: Option<&AccountId>, peer: &AccountId, token_owner: &
 ///   that was moved into place from elsewhere is read as if it had always
 ///   been there.
 ///
-/// On Unix there is a third rule, in [`directory_chain_is_trusted`]: no
-/// directory between the token and the filesystem root may be world-writable,
-/// because a world-writable directory lets another account replace the
-/// directories below it — which would make the first rule a statement about a
-/// directory the attacker owns.
+/// On Unix there is a third rule: no directory between the token and the
+/// filesystem root may be world-writable, because a world-writable directory
+/// lets another account replace the directories below it — which would make the
+/// first rule a statement about a directory the attacker owns.
 pub fn token_directory_is_trusted(path: &Path, owner: &AccountId) -> bool {
     let Some(directory) = path.parent() else {
         return false;

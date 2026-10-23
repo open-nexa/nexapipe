@@ -82,8 +82,9 @@ pub fn read_installed_by() -> Option<AccountId> {
 ///
 /// Unix only: the write happens in the privileged install itself, which is the
 /// only place the file can be created with root's ownership. On Windows the
-/// record is written by the elevated batch instead — see [`record_command`] —
-/// because the process that asks for the install is not the privileged one.
+/// record is written by the elevated batch instead — see the Windows-only
+/// `record_command` — because the process that asks for the install is not the
+/// privileged one.
 #[cfg(unix)]
 pub fn record_installed_by(account: &AccountId) -> Result<(), crate::error::AppError> {
     use crate::error::{codes, AppError};
