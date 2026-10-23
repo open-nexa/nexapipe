@@ -30,7 +30,10 @@ pub const SERVICE_COPY_PATH: &str = "/Library/Application Support/Nexa/nexa-serv
 pub const SERVICE_COPY_PATH: &str = "/usr/libexec/nexa-service";
 
 /// Where the daemon's program lives: the install's own copy of the service binary.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+///
+/// Not Windows: there the copy is made under Program Files and its path comes from the
+/// environment the installer runs in — see `platform::windows`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn service_binary_path() -> PathBuf {
     PathBuf::from(SERVICE_COPY_PATH)
 }
@@ -624,6 +627,7 @@ mod tests {
     /// replace it — so a unit that pointed at it would be running, as root, a program
     /// another account owns. The copy lives in a root-owned directory instead.
     #[test]
+    #[cfg(target_os = "linux")]
     fn the_unit_runs_the_copied_binary() {
         let program = service_binary_path();
         let unit = linux_unit_content(&program.to_string_lossy());
@@ -645,6 +649,7 @@ mod tests {
     /// replaced under the service manager must not take the program out from under the
     /// running service.
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn the_copy_lives_in_a_system_directory() {
         let program = service_binary_path();
 
@@ -704,6 +709,7 @@ mod tests {
     /// service must not run a program they can replace: launchd refuses to spawn one,
     /// and an install refused that way leaves the machine with no service at all.
     #[test]
+    #[cfg(target_os = "macos")]
     fn the_job_runs_the_copied_binary() {
         let program = service_binary_path();
         let plist = macos_plist_content(&program.to_string_lossy());
@@ -722,6 +728,7 @@ mod tests {
     /// replaced under the service manager must not take the program out from under the
     /// running service.
     #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn the_copy_lives_outside_the_app_bundle() {
         let program = service_binary_path();
 

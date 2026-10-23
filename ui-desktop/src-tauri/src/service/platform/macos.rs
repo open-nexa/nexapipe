@@ -6,6 +6,7 @@ use super::*;
 use crate::service::platform::account::AccountId;
 #[cfg(target_os = "macos")]
 use crate::service::platform::service_copy;
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
 
 /// Whether the job is still registered with launchd.
