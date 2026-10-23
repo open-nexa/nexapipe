@@ -58,7 +58,11 @@ class NexaVpnService : VpnService() {
     }
 
     private val TAG = "NexaVpnService"
-    private var vpnInterface: ParcelFileDescriptor? = null
+    // The TUN descriptor is not held in a field: it belongs to the establish
+    // that opened it, from establish() until the native side takes it, and
+    // that is also where it is closed when it never gets that far. See
+    // establishVpnInternal.
+
     // @Volatile: written from the main thread (onStartCommand/onRevoke) and
     // read from IO coroutines (reconnect logic).
     @Volatile private var isRunning = false
@@ -489,10 +493,11 @@ class NexaVpnService : VpnService() {
             Log.e(TAG, "nativeStopTunProxy failed: ${e.message}")
         }
 
-        // vpnInterface already went through detachFd, so the fd is owned by
-        // Rust and must not be closed here. Just drop the reference.
-        vpnInterface = null
-
+        // Nothing to close here: by the time the TUN proxy runs, the
+        // descriptor belongs to Rust — nativeStartTunProxy took it at the JNI
+        // boundary and nativeStopTunProxy above closed it. A descriptor that
+        // was never handed over was closed by the establish that still held
+        // it, which is the path this function used to leave open.
         stopForeground(STOP_FOREGROUND_REMOVE)
     }
 
@@ -538,6 +543,18 @@ class NexaVpnService : VpnService() {
             return false
         }
 
+        // The native library has to be there before a TUN is established.
+        // Without it the calls below raise an UnsatisfiedLinkError — an
+        // Error, not an Exception — which would escape the catch at the end
+        // of this function and take the process with it. Establishing the TUN
+        // first would be worse: the routes and the DNS server of the VPN
+        // point into a TUN that nothing ever reads, so the device would be
+        // left without DNS. Refuse before the TUN exists.
+        if (!IrohProxy.isNativeLoaded()) {
+            Log.e(TAG, "Establish failed: the native library is not loaded")
+            return false
+        }
+
         // Mutual-exclusion guard: Android allows only one active VpnService
         // TUN per user. If a foreign VPN app (e.g. Clash) currently owns the
         // slot, establish() would silently revoke it — refuse instead of
@@ -566,6 +583,26 @@ class NexaVpnService : VpnService() {
         // Snapshot before establish(): the VPN network that appears on top of
         // this is the one Android created for us.
         val vpnNetworksBefore = cm?.let { UnderlyingNetworkSelector.vpnNetworks(it) }.orEmpty()
+
+        // The TUN descriptor's owner, tracked explicitly because it changes
+        // hands three times below:
+        //
+        //   PFD   — Android opened it in establish(); the ParcelFileDescriptor
+        //           owns it until detachFd() is called.
+        //   LOCAL — after detachFd() this function owns the raw int.
+        //   RUST  — once nativeStartTunProxy() has been entered the native
+        //           side owns it and closes it on every path.
+        //
+        // Only one of the two variables below is ever set: the
+        // ParcelFileDescriptor while it still owns the descriptor, the
+        // detached int while this function owns it, and neither of them once
+        // the native side has taken it. The descriptor has to be closed
+        // exactly once — a second close of a number the process has already
+        // handed on closes whatever holds that number now, and the failure is
+        // silent — so the finally at the end of this function closes only
+        // what is still ours.
+        var tunPfd: ParcelFileDescriptor? = null
+        var tunFd: Int? = null
 
         return try {
             // The block the tunnel claims, and the addresses inside it. The
@@ -612,17 +649,32 @@ class NexaVpnService : VpnService() {
                 Log.d(TAG, "No underlying network from callback, skipping setUnderlyingNetworks")
             }
 
-            vpnInterface = builder.establish()
-            if (vpnInterface == null) {
+            val pfd = builder.establish()
+            if (pfd == null) {
                 Log.d(TAG, "Failed to establish VPN")
                 return false
             }
+            // The ParcelFileDescriptor owns the descriptor from here until
+            // detachFd() below.
+            tunPfd = pfd
+
+            // A suspension point, and the only one between the TUN coming up
+            // and the descriptor changing hands: the coroutine can be
+            // cancelled here — the user taps Disconnect while a network
+            // switch is rebuilding, or the service is destroyed — and the
+            // ParcelFileDescriptor is then the only thing holding the
+            // descriptor. The finally below closes it. Without that the TUN
+            // would stay established with nobody reading it while its routes
+            // and its DNS server still point the device's DNS into it: a
+            // device-wide DNS blackhole, with the foreground notification
+            // taken away at the same time.
             trackOwnVpnNetwork(vpnNetworksBefore)
 
             // Transfer TUN fd ownership to Rust (the PFD is no longer usable
             // after detachFd).
-            val fd = vpnInterface!!.detachFd()
-            vpnInterface = null  // the PFD is invalid now, drop the reference
+            val fd = pfd.detachFd()
+            tunPfd = null
+            tunFd = fd
 
             val proxyDomainsStr = allowedDomains.joinToString(",")
 
@@ -662,13 +714,21 @@ class NexaVpnService : VpnService() {
             } catch (e: Throwable) {
                 if (e is LinkageError) {
                     Log.e(TAG, "nativeStartTunProxy could not be called at all", e)
-                    try {
-                        ParcelFileDescriptor.adoptFd(fd).close()
-                    } catch (_: Exception) {}
+                    // The native method was never entered, so it took the
+                    // descriptor nowhere: it is still ours, and this is the
+                    // only place that may close it.
+                    closeTunFd(tunFd)
                 } else {
                     Log.e(TAG, "nativeStartTunProxy threw after taking the fd", e)
                 }
                 throw e
+            } finally {
+                // The native side owns the descriptor from here on: it took it
+                // at the JNI boundary and closes it on every path, including
+                // the ones that fail. The LinkageError above is the one case
+                // where it did not, and that branch closed it itself — so
+                // there is nothing left here for the finally below.
+                tunFd = null
             }
 
             if (result != 0) {
@@ -710,10 +770,55 @@ class NexaVpnService : VpnService() {
             // The tunnel is up, so the counters mean something: start showing them.
             startTrafficPolling()
             true
+        } catch (e: TimeoutCancellationException) {
+            // The budget of the reconnect that called this ran out. It has to
+            // leave the coroutine the way it found it: the caller decides what
+            // a timeout means (a retry), and turning it into a plain failure
+            // here would swallow it.
+            throw e
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // A deliberate cancellation — the user disconnected, or the
+            // service is being destroyed. It is not a failure of the
+            // establish and must not become one: the descriptor is cleaned up
+            // on the way out, and the caller has to see the cancellation
+            // rather than a `false` that leaves the session flags standing
+            // over a tunnel that is not there.
+            Log.d(TAG, "Establish cancelled")
+            throw e
         } catch (e: Exception) {
             Log.e(TAG, "VPN establishment failed: ${e.message}", e)
             tunProxyStarted = false
             false
+        } finally {
+            // Close the descriptor if it is still ours to close: the
+            // ParcelFileDescriptor while it still owns it, the detached int
+            // while this function owns it, and nothing at all once the native
+            // side has taken it. Only one of the two is ever set, so this
+            // closes the descriptor exactly once.
+            tunPfd?.let { owned ->
+                try {
+                    owned.close()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Could not close the TUN descriptor: ${e.message}")
+                }
+            }
+            closeTunFd(tunFd)
+        }
+    }
+
+    /**
+     * Closes a descriptor this side still owns.
+     *
+     * Only for a descriptor that was never handed to the native side: closing
+     * a number the process has already handed on closes whatever holds that
+     * number now, and the failure is silent.
+     */
+    private fun closeTunFd(fd: Int?) {
+        if (fd == null) return
+        try {
+            ParcelFileDescriptor.adoptFd(fd).close()
+        } catch (e: Exception) {
+            Log.e(TAG, "Could not close the TUN descriptor $fd: ${e.message}")
         }
     }
 

@@ -384,9 +384,52 @@ fn dispatch_stop() -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        linux_activation_args, macos_install_commands, macos_job_target, macos_plist_content,
-        sc_state, ScState, SERVICE_NAME,
+        SERVICE_NAME, ScState, linux_activation_args, linux_service_exec_with, linux_unit_content,
+        macos_install_commands, macos_job_target, macos_plist_content, sc_state,
     };
+
+    /// systemd splits the `ExecStart=` line on whitespace, so a path with a space in it
+    /// arrives as two arguments and the unit fails to start — with `status=203/EXEC`,
+    /// which names neither the path nor the space that caused it.
+    ///
+    /// The macOS plist and the Windows `binPath` both carry such a path correctly. This is
+    /// the third spelling of the same thing, and it was the one that did not.
+    #[test]
+    fn the_systemd_unit_quotes_a_path_with_a_space_in_it() {
+        let unit = linux_unit_content("/home/me/My Apps/nexa");
+
+        let exec_start = unit
+            .lines()
+            .find_map(|line| line.strip_prefix("ExecStart="))
+            .expect("the unit carries an ExecStart");
+
+        assert!(
+            exec_start.starts_with("\"/home/me/My Apps/nexa\""),
+            "the path is not quoted: {exec_start}"
+        );
+    }
+
+    /// The same, for the development build that hosts the service itself instead of a
+    /// dedicated binary beside it: the argument after the path has to survive the quoting
+    /// too, or it becomes part of the path.
+    #[test]
+    fn the_systemd_exec_keeps_its_argument_outside_the_quotes() {
+        let exec = linux_service_exec_with("/home/me/My Apps/nexa", false);
+
+        assert_eq!(exec, "\"/home/me/My Apps/nexa\" --foreground");
+    }
+
+    /// A path with a quote or a backslash in it has to come out of the quoting unchanged:
+    /// systemd reads the line with its own word splitter, and inside double quotes a
+    /// backslash escapes the character after it.
+    #[test]
+    fn the_quoting_escapes_what_systemd_would_otherwise_take() {
+        // The packaged install points at the service binary beside the desktop
+        // executable, so the file name is replaced before the quoting.
+        let exec = linux_service_exec_with("/home/me/My \"Apps\"/nexa", true);
+
+        assert_eq!(exec, "\"/home/me/My \\\"Apps\\\"/nexa-service\"");
+    }
 
     /// launchd's own default for `ExitTimeOut` is documented as no more than
     /// "system-defined" and is shorter than the teardown allows itself — 5s on this
@@ -535,7 +578,9 @@ SERVICE_NAME: nexa-service
         assert_eq!(sc_state(query_running()), ScState::Running);
 
         assert_eq!(
-            sc_state("[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\n\nThe specified service does not exist as an installed service.\n"),
+            sc_state(
+                "[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\n\nThe specified service does not exist as an installed service.\n"
+            ),
             ScState::Absent
         );
     }

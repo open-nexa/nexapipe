@@ -91,25 +91,49 @@ pub fn linux_activation_args() -> [&'static str; 2] {
 /// A packaged install has a dedicated nexa-service binary beside the desktop executable. A
 /// development build may not, in which case the desktop binary understands --foreground and
 /// can host the same service without daemonizing.
-#[cfg(target_os = "linux")]
+///
+/// The path is quoted, because systemd splits the line on whitespace and an install under a
+/// directory with a space in it — a development build, or a home directory that has one — would
+/// otherwise arrive as two arguments and leave the unit failing with `status=203/EXEC`. The
+/// macOS plist (an argv array) and the Windows `binPath` (escaped quotes) both carry such a
+/// path correctly; this is the third spelling of the same thing, and it was the one that did
+/// not.
+#[cfg(any(target_os = "linux", test))]
 pub fn linux_service_exec(exe_path: &str) -> String {
     let service = std::path::Path::new(exe_path).with_file_name("nexa-service");
     linux_service_exec_with(exe_path, service.is_file())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 pub fn linux_service_exec_with(exe_path: &str, has_service_binary: bool) -> String {
     if has_service_binary {
-        std::path::Path::new(exe_path)
-            .with_file_name("nexa-service")
-            .to_string_lossy()
-            .into_owned()
+        systemd_quote(
+            &std::path::Path::new(exe_path)
+                .with_file_name("nexa-service")
+                .to_string_lossy(),
+        )
     } else {
-        format!("{exe_path} --foreground")
+        format!("{} --foreground", systemd_quote(exe_path))
     }
 }
 
-#[cfg(target_os = "linux")]
+/// A path as systemd's `ExecStart=` line wants it.
+///
+/// systemd reads the line with its own word splitter: whitespace separates arguments, and a
+/// double-quoted run is one argument with the quotes taken off. Inside double quotes a
+/// backslash escapes the character after it, so a literal backslash is written twice and a
+/// literal quote is written once — which is what makes a path with either of them in it
+/// survive the round trip.
+///
+/// The alternative — a path with a space in it, unquoted — is a unit that systemd refuses to
+/// start, and the refusal names neither the path nor the space that caused it.
+#[cfg(any(target_os = "linux", test))]
+fn systemd_quote(path: &str) -> String {
+    let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+#[cfg(any(target_os = "linux", test))]
 pub fn linux_unit_content(exe_path: &str) -> String {
     format!(
         r#"[Unit]
