@@ -329,7 +329,10 @@ pub(super) fn clean_nrpt_rules(dns_ip: &str) -> Result<()> {
 }
 
 #[cfg(windows)]
-pub(super) fn set_system_dns_windows(interface: &str, dns_ip: &str) -> Result<()> {
+pub(super) fn set_system_dns_windows(
+    interface: &str,
+    dns_ip: &str,
+) -> Result<DnsHijack, DnsHijackFailure> {
     // On Windows all configured DNS servers race in parallel (smart multi-homed name
     // resolution): if the NIC keeps a public IPv6 DNS server — typically a router-learned
     // fe80::... link-local one that `-ResetServerAddresses` cannot remove because it is not
@@ -356,7 +359,7 @@ pub(super) fn set_system_dns_windows(interface: &str, dns_ip: &str) -> Result<()
                 dns_ip,
                 dump.trim().replace('\n', "; ")
             );
-            return Ok(());
+            return Ok(DnsHijack::Global);
         }
         Ok(dump) => {
             tracing::warn!(
@@ -389,12 +392,20 @@ pub(super) fn set_system_dns_windows(interface: &str, dns_ip: &str) -> Result<()
         .output();
     if windows_dns_points_at(dns_ip) {
         tracing::info!("System DNS set to {} via netsh fallback (verified)", dns_ip);
-        return Ok(());
+        return Ok(DnsHijack::Global);
     }
-    anyhow::bail!(
-        "Failed to point system DNS at the TUN resolver {} — DNS hijack is NOT in effect",
-        dns_ip
-    )
+    // The machine was changed before this point was reached: the adapters were
+    // reset and re-pointed, and only the read-back says the result is not what
+    // was asked for. The hijack is therefore reported as installed — the
+    // caller has to take it back, or the machine keeps a static DNS pointing
+    // at a TUN address that will never come up.
+    Err(DnsHijackFailure {
+        hijack: DnsHijack::Global,
+        error: anyhow::anyhow!(
+            "Failed to point system DNS at the TUN resolver {} — DNS hijack is NOT in effect",
+            dns_ip
+        ),
+    })
 }
 
 /// Runs the per-adapter DNS switch and returns a dump of the effective IPv4 DNS servers
@@ -534,57 +545,262 @@ pub(super) fn restore_system_dns_windows(interface: &str, _dns_ip: &str) -> Resu
 
 #[cfg(windows)]
 pub(super) fn cleanup_stale_hijack_windows() {
-    use crate::proxy::tun_proxy::TUN_BASE_CANDIDATES;
-    use std::net::Ipv4Addr;
+    // What the machine has: the adapters and their DNS servers, the NRPT rules,
+    // and the addresses a tunnel still holds. One PowerShell run says it; the
+    // decision is made here, in the shared code, and a second run carries it
+    // out.
+    let dump = match windows_ps(&cleanup_collect_script()) {
+        Ok(dump) => dump,
+        Err(e) => {
+            // Nothing is reset on a machine that could not be read: the whole
+            // point of the guard below is to leave a live tunnel alone, and a
+            // cleanup that cannot tell a live one from a stale one must not
+            // guess.
+            tracing::warn!(
+                "stale DNS hijack cleanup could not read the machine's DNS: {}",
+                e
+            );
+            return;
+        }
+    };
+    let state = parse_cleanup_state(&dump);
 
-    let stale: Vec<String> = TUN_BASE_CANDIDATES
-        .iter()
-        .map(|base| Ipv4Addr::from(u32::from(*base) | 0x0000_00FE).to_string())
-        .collect();
-    let list = stale.join("','");
-    let ps_cmd = format!(
-        "$stale = @('{0}');\
-         $v6Listener = @(Get-NetUDPEndpoint -LocalAddress ::1 -LocalPort 53 -ErrorAction SilentlyContinue).Count -gt 0;\
-         $reset = @();\
-         Get-DnsClientServerAddress | Where-Object {{ $_.ServerAddresses }} | ForEach-Object {{\
-           $hit = $false;\
-           if ($_.AddressFamily -eq 2) {{ foreach ($s in $_.ServerAddresses) {{ if ($stale -contains $s) {{ $hit = $true }} }} }};\
-           if ($_.AddressFamily -eq 23 -and -not $v6Listener -and ($_.ServerAddresses -contains '::1')) {{ $hit = $true }};\
-           if ($hit) {{ $reset += $_.InterfaceIndex }}\
-         }};\
-         $reset = @($reset | Select-Object -Unique);\
-         foreach ($i in $reset) {{\
-           try {{ Set-DnsClientServerAddress -InterfaceIndex $i -ResetServerAddresses -ErrorAction Stop; Write-Output ('reset ifindex ' + $i) }} catch {{ Write-Warning ('reset ifindex ' + $i + ': ' + $_.Exception.Message) }}\
-         }};\
-         $nrpt = @(Get-DnsClientNrptRule | Where-Object {{\
-           $hit = $false;\
-           foreach ($s in $_.NameServers) {{ if ($stale -contains $s) {{ $hit = $true }} }};\
-           $hit\
-         }});\
-         foreach ($r in $nrpt) {{\
-           try {{ Remove-DnsClientNrptRule -Name $r.Name -Force -ErrorAction Stop; Write-Output ('removed nrpt rule ' + ($r.Namespace -join ',')) }} catch {{ Write-Warning ('remove nrpt ' + $r.Name + ': ' + $_.Exception.Message) }}\
-         }};\
-         if (($reset.Count + $nrpt.Count) -gt 0) {{ Clear-DnsClientCache }};\
-         Write-Output ('stale adapters reset: ' + $reset.Count);\
-         Write-Output ('stale NRPT rules removed: ' + $nrpt.Count)",
-        list
-    );
-    match hidden("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
-        .output()
-    {
-        Ok(o) => {
-            let stderr = String::from_utf8_lossy(&o.stderr);
-            if !stderr.trim().is_empty() {
-                tracing::warn!("stale DNS hijack cleanup warnings: {}", stderr.trim());
-            }
+    // The one question that separates a stale hijack from a live one: is that
+    // address still in use?
+    //
+    // On Windows it is asked of the socket that holds it. An ordinary process
+    // cannot ask it the way macOS and Linux do — whether the address is still
+    // bindable — because Windows lets a second socket bind an address another
+    // one holds, as long as it uses a different port. So the question is
+    // asked of the listener instead: the tunnel's DNS server holds the TUN
+    // address at port 53 for as long as the tunnel is up, and it is what the
+    // hijack points the machine at.
+    let in_use = |address: &str| state.in_use.iter().any(|live| live.as_str() == address);
+
+    let indexes = stale_adapter_indexes(&state.adapters, &in_use);
+    let rules = stale_nrpt_rules(&state.rules, &in_use);
+    if indexes.is_empty() && rules.is_empty() {
+        tracing::info!("stale DNS hijack cleanup: nothing to reset");
+        return;
+    }
+
+    // What was left alone, and why: an adapter whose TUN address a tunnel
+    // still holds is not a leftover, and resetting it would leave the tunnel
+    // up and the machine's DNS somewhere else — the proxied domains would
+    // resolve at their real addresses and the traffic would leave in the clear.
+    for adapter in &state.adapters {
+        if indexes.contains(&adapter.index) {
+            continue;
+        }
+        let ours: Vec<&String> = adapter
+            .servers
+            .iter()
+            .filter(|server| is_tun_dns_address(server.as_str()) || server.as_str() == LOCALHOST_V6)
+            .collect();
+        if !ours.is_empty() {
+            tracing::info!(
+                "{} still points at {}, which a tunnel holds — not a stale hijack",
+                adapter.index,
+                ours.iter()
+                    .map(|server| server.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
+    let names: Vec<String> = rules.iter().map(|rule| rule.name.clone()).collect();
+    for rule in &rules {
+        tracing::warn!(
+            "stale NRPT rule for {}: removing — it routes to an address no tunnel holds",
+            rule.namespaces.join(", ")
+        );
+    }
+    match windows_ps(&cleanup_apply_script(&indexes, &names)) {
+        Ok(output) => {
             tracing::info!(
                 "stale DNS hijack cleanup: {}",
-                String::from_utf8_lossy(&o.stdout)
-                    .trim()
-                    .replace('\n', "; ")
+                output.trim().replace('\n', "; ")
             );
         }
         Err(e) => tracing::warn!("stale DNS hijack cleanup could not run: {}", e),
     }
+}
+
+/// The addresses the cleanup asks about: the TUN candidate addresses a hijack
+/// points system DNS at, and the IPv6 loopback the local DNS server also
+/// listens on.
+#[cfg(any(windows, test))]
+pub(super) fn cleanup_watched_addresses() -> Vec<String> {
+    use crate::proxy::tun_proxy::TUN_BASE_CANDIDATES;
+    use std::net::Ipv4Addr;
+
+    TUN_BASE_CANDIDATES
+        .iter()
+        .map(|base| Ipv4Addr::from(u32::from(*base) | 0x0000_00FE).to_string())
+        .chain(std::iter::once(LOCALHOST_V6.to_string()))
+        .collect()
+}
+
+/// The script that reports what the cleanup has to decide about.
+///
+/// The adapters and their DNS servers, the NRPT rules, and — the part that
+/// matters — the watched addresses a tunnel still holds. The last is asked of
+/// the socket that holds it: `Get-NetUDPEndpoint` finds the tunnel's DNS
+/// server, which listens on the TUN address at port 53 for as long as the
+/// tunnel is up, and on `[::1]:53` for the IPv6 half of the hijack.
+#[cfg(any(windows, test))]
+pub(super) fn cleanup_collect_script() -> String {
+    let watched = cleanup_watched_addresses()
+        .iter()
+        .map(|address| format!("'{address}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "$watched = @({watched});\
+         Get-DnsClientServerAddress -ErrorAction SilentlyContinue | Where-Object {{ $_.ServerAddresses }} | ForEach-Object {{ Write-Output ('adapter|' + $_.InterfaceIndex + '|' + ($_.ServerAddresses -join ',')) }};\
+         if (Get-Command Get-DnsClientNrptRule -ErrorAction SilentlyContinue) {{ Get-DnsClientNrptRule | ForEach-Object {{ Write-Output ('nrpt|' + $_.Name + '|' + ($_.Namespace -join ',') + '|' + ($_.NameServers -join ',')) }} }};\
+         foreach ($a in $watched) {{ if (@(Get-NetUDPEndpoint -LocalAddress $a -LocalPort 53 -ErrorAction SilentlyContinue).Count -gt 0) {{ Write-Output ('live|' + $a) }} }}",
+        watched = watched
+    )
+}
+
+/// The script that carries out what the cleanup decided.
+///
+/// The decision is made in the shared code — see [`stale_adapter_indexes`] and
+/// [`stale_nrpt_rules`] — and this only applies it: the adapters whose DNS is
+/// a stale hijack, and the rules that route to one.
+#[cfg(any(windows, test))]
+pub(super) fn cleanup_apply_script(indexes: &[u32], rules: &[String]) -> String {
+    let reset = indexes
+        .iter()
+        .map(|index| index.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let names = rules
+        .iter()
+        .map(|name| format!("'{}'", name.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "$reset = @({reset});\
+         foreach ($i in $reset) {{\
+           try {{ Set-DnsClientServerAddress -InterfaceIndex $i -ResetServerAddresses -ErrorAction Stop; Write-Output ('reset ifindex ' + $i) }} catch {{ Write-Warning ('reset ifindex ' + $i + ': ' + $_.Exception.Message) }}\
+         }};\
+         $rules = @({names});\
+         foreach ($r in $rules) {{\
+           try {{ Remove-DnsClientNrptRule -Name $r -Force -ErrorAction Stop; Write-Output ('removed nrpt rule ' + $r) }} catch {{ Write-Warning ('remove nrpt ' + $r + ': ' + $_.Exception.Message) }}\
+         }};\
+         if (($reset.Count + $rules.Count) -gt 0) {{ Clear-DnsClientCache }};\
+         Write-Output ('stale adapters reset: ' + $reset.Count);\
+         Write-Output ('stale NRPT rules removed: ' + $rules.Count)",
+        reset = reset,
+        names = names
+    )
+}
+
+/// What the cleanup found on the machine.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct CleanupState {
+    /// The adapters and the DNS servers configured on them.
+    pub(super) adapters: Vec<AdapterDns>,
+    /// The NRPT rules.
+    pub(super) rules: Vec<CleanupRule>,
+    /// The watched addresses a tunnel still holds.
+    pub(super) in_use: Vec<String>,
+}
+
+/// One NRPT rule, as the cleanup sees it.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CleanupRule {
+    /// The rule's name — how it is removed.
+    pub(super) name: String,
+    /// The namespaces it covers, for the log.
+    pub(super) namespaces: Vec<String>,
+    /// The servers it routes to.
+    pub(super) servers: Vec<String>,
+}
+
+/// Reads the dump the collection script prints.
+///
+/// Three kinds of line, one per thing the cleanup has to know: `adapter|<index>
+/// |<servers>`, `nrpt|<name>|<namespaces>|<servers>` and `live|<address>`. A
+/// line it does not understand is skipped rather than guessed at — this is a
+/// decision about the machine's DNS, and a wrong guess is a wrong reset.
+#[cfg(any(windows, test))]
+pub(super) fn parse_cleanup_state(output: &str) -> CleanupState {
+    let mut state = CleanupState::default();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split('|').collect();
+        match fields.as_slice() {
+            ["adapter", index, servers] => {
+                let Ok(index) = index.trim().parse::<u32>() else {
+                    continue;
+                };
+                let servers = split_servers(servers);
+                // The same adapter is reported once per address family, and the
+                // decision is about the adapter rather than the family.
+                match state
+                    .adapters
+                    .iter_mut()
+                    .find(|adapter| adapter.index == index)
+                {
+                    Some(adapter) => adapter.servers.extend(servers),
+                    None => state.adapters.push(AdapterDns { index, servers }),
+                }
+            }
+            ["nrpt", name, namespaces, servers] => {
+                state.rules.push(CleanupRule {
+                    name: name.to_string(),
+                    namespaces: split_servers(namespaces),
+                    servers: split_servers(servers),
+                });
+            }
+            ["live", address] => {
+                let address = address.trim();
+                if !address.is_empty() {
+                    state.in_use.push(address.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    state
+}
+
+/// A comma-separated list of names, without the empty ones.
+#[cfg(any(windows, test))]
+fn split_servers(list: &str) -> Vec<String> {
+    list.split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The NRPT rules that route to an address no tunnel holds any more.
+///
+/// A rule is a registry entry, so it outlives the process that wrote it — and a
+/// rule that routes to an address a live tunnel still holds is not stale,
+/// however old it is: removing it would take a live tunnel's names out of the
+/// proxy.
+#[cfg(any(windows, test))]
+pub(super) fn stale_nrpt_rules(
+    rules: &[CleanupRule],
+    in_use: impl Fn(&str) -> bool,
+) -> Vec<&CleanupRule> {
+    rules
+        .iter()
+        .filter(|rule| {
+            rule.servers
+                .iter()
+                .any(|server| is_tun_dns_address(server) && !in_use(server))
+        })
+        .collect()
 }

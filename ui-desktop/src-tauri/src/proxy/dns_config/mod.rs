@@ -29,6 +29,11 @@
 //! back to [`restore_system_dns`]: each is undone where it was done, and a scoped
 //! hijack leaves nothing in the places a global one writes.
 //!
+//! A hijack that *fails* carries what it had already installed with it — see
+//! [`DnsHijackFailure`] — because the global paths change the machine before they read
+//! it back, and a read-back that does not show the TUN address leaves the machine
+//! pointing at an address that will never come up.
+//!
 //! Note: the local DNS server (proxy/dns.rs) must be started before `set_system_dns`,
 //! otherwise the switched-over system DNS queries would have nobody to answer them.
 
@@ -149,6 +154,28 @@ pub enum DnsHijack {
     None,
 }
 
+/// A hijack that failed, and what it left behind.
+///
+/// "It failed" and "nothing happened" are two different things, and the
+/// difference is the whole point of this type: the global paths change the
+/// machine *first* and read it back afterwards — the Windows one resets and
+/// re-points every adapter and then asks whether the TUN address is among
+/// them, the macOS one writes every service and then asks whether any of them
+/// points at the TUN address. A read-back that does not show the address is a
+/// failure that leaves the machine pointing at a TUN address which will never
+/// come up: no name resolution on that adapter or service, until something
+/// else fixes it.
+///
+/// So the failure carries the hijack that was installed — at least in part —
+/// and the caller undoes it with that.
+#[derive(Debug)]
+pub struct DnsHijackFailure {
+    /// The kind of hijack that was installed, at least in part.
+    pub hijack: DnsHijack,
+    /// What went wrong.
+    pub error: anyhow::Error,
+}
+
 /// Points system DNS at the TUN virtual IP the way `strategy` says, and reports
 /// which kind of hijack ended up in place.
 ///
@@ -162,12 +189,16 @@ pub enum DnsHijack {
 /// An empty domain list is not a failure: there is nothing to scope, so
 /// nothing is installed and the machine's DNS stays where it was. A proxy that
 /// proxies no domain resolves nothing either way.
+///
+/// A failure carries the hijack that was installed — at least in part — so that
+/// the caller can take it back: see [`DnsHijackFailure`] and
+/// [`undo_failed_hijack`].
 pub fn set_system_dns(
     interface: &str,
     dns_ip: &str,
     proxy_domains: &[String],
     strategy: DnsStrategy,
-) -> Result<DnsHijack> {
+) -> Result<DnsHijack, DnsHijackFailure> {
     // Only the Linux (resolvectl) and Windows (adapter exclusion) branches need `interface`,
     // and only the three platform branches need `dns_ip`. The other platforms are a
     // compilation check, not a deployment target — but they have to compile.
@@ -185,18 +216,15 @@ pub fn set_system_dns(
         DnsStrategy::Global => {
             #[cfg(windows)]
             {
-                set_system_dns_windows(interface, dns_ip)?;
-                Ok(DnsHijack::Global)
+                set_system_dns_windows(interface, dns_ip)
             }
             #[cfg(target_os = "linux")]
             {
-                set_system_dns_linux(interface, dns_ip)?;
-                Ok(DnsHijack::Global)
+                set_system_dns_linux(interface, dns_ip)
             }
             #[cfg(target_os = "macos")]
             {
-                set_system_dns_macos(dns_ip)?;
-                Ok(DnsHijack::Global)
+                set_system_dns_macos(dns_ip)
             }
             #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
             {
@@ -218,13 +246,17 @@ pub fn set_system_dns(
             // configuration the operating system cannot be told about is not a
             // platform failure, and the two need different answers.
             if crate::proxy::dns::scoped_domains(proxy_domains).is_none() {
-                return Err(anyhow::anyhow!(
-                    "the scoped DNS strategy has nothing to install: {} cannot each be named \
-                     to the operating system. A bare \"*\" means every domain and is what the \
-                     global strategy is for, and a name without a dot is a host rather than a \
-                     domain. The machine's DNS was left alone.",
-                    describe_domains(proxy_domains)
-                ));
+                return Err(DnsHijackFailure {
+                    // Nothing was installed: the machine's DNS was left alone.
+                    hijack: DnsHijack::None,
+                    error: anyhow::anyhow!(
+                        "the scoped DNS strategy has nothing to install: {} cannot each be named \
+                         to the operating system. A bare \"*\" means every domain and is what the \
+                         global strategy is for, and a name without a dot is a host rather than a \
+                         domain. The machine's DNS was left alone.",
+                        describe_domains(proxy_domains)
+                    ),
+                });
             }
 
             #[cfg(windows)]
@@ -236,29 +268,79 @@ pub fn set_system_dns(
                 // verified by reading them back, because a machine that takes its NRPT
                 // from a domain policy ignores the local ones entirely, and that is not
                 // something to discover by having the proxy resolve nothing.
-                if set_scoped_dns_windows(dns_ip, proxy_domains)? {
-                    return Ok(DnsHijack::Scoped);
+                match set_scoped_dns_windows(dns_ip, proxy_domains) {
+                    Ok(true) => return Ok(DnsHijack::Scoped),
+                    // The platform took back what it had installed.
+                    Ok(false) => {}
+                    // The rules are still in the table — the cleanup could not
+                    // remove them — so there is something to take back, and the
+                    // restore is what takes it back.
+                    Err(e) => {
+                        return Err(DnsHijackFailure {
+                            hijack: DnsHijack::Scoped,
+                            error: e,
+                        })
+                    }
                 }
             }
             #[cfg(target_os = "linux")]
             {
-                if set_scoped_dns_linux(interface, dns_ip, proxy_domains)? {
-                    return Ok(DnsHijack::Scoped);
+                match set_scoped_dns_linux(interface, dns_ip, proxy_domains) {
+                    Ok(true) => return Ok(DnsHijack::Scoped),
+                    Ok(false) => {}
+                    Err(e) => {
+                        return Err(DnsHijackFailure {
+                            hijack: DnsHijack::Scoped,
+                            error: e,
+                        })
+                    }
                 }
             }
             #[cfg(target_os = "macos")]
             {
-                if set_scoped_dns_macos(dns_ip, proxy_domains)? {
-                    return Ok(DnsHijack::Scoped);
+                match set_scoped_dns_macos(dns_ip, proxy_domains) {
+                    Ok(true) => return Ok(DnsHijack::Scoped),
+                    Ok(false) => {}
+                    Err(e) => {
+                        return Err(DnsHijackFailure {
+                            hijack: DnsHijack::Scoped,
+                            error: e,
+                        })
+                    }
                 }
             }
-            Err(anyhow::anyhow!(
-                "the scoped DNS strategy could not be installed on this machine: {}. The \
-                 machine's DNS was left alone; the global strategy is what replaces it, and it \
-                 is a setting away.",
-                scoped_failure_reason()
-            ))
+            Err(DnsHijackFailure {
+                // The platform took back whatever it had installed, so the
+                // machine's DNS is where it was and there is nothing to undo.
+                hijack: DnsHijack::None,
+                error: anyhow::anyhow!(
+                    "the scoped DNS strategy could not be installed on this machine: {}. The \
+                     machine's DNS was left alone; the global strategy is what replaces it, and it \
+                     is a setting away.",
+                    scoped_failure_reason()
+                ),
+            })
         }
+    }
+}
+
+/// Undoes a hijack that failed after it had already changed the machine.
+///
+/// The failure carries the hijack that was installed — see [`DnsHijackFailure`] —
+/// and this is where that hijack is handed back to the restore.
+///
+/// Split out so that *which* hijack has to be undone is a decision of this
+/// module, and a test of it runs wherever the tests run; the undoing itself
+/// stays the platform's, which is what `restore` is.
+pub fn undo_failed_hijack(
+    failure: &DnsHijackFailure,
+    restore: impl FnOnce(DnsHijack) -> Result<()>,
+) -> Result<()> {
+    match failure.hijack {
+        // Nothing was installed, so there is nothing to undo — and undoing is
+        // not free: the restore rewrites the machine's DNS configuration.
+        DnsHijack::None => Ok(()),
+        hijack => restore(hijack),
     }
 }
 
@@ -323,9 +405,40 @@ fn hijack_is_in_effect(observed: &[Vec<String>], dns_ip: &str) -> bool {
         .any(|servers| servers.iter().any(|server| server == dns_ip))
 }
 
+/// How much of the machine a restore is allowed to touch.
+///
+/// The two differ in one question: does the read-back show the hijack?
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreScope {
+    /// Undo the hijack only if it is still in effect.
+    ///
+    /// The right question for a run that installed a hijack and took it back on
+    /// purpose: undoing is not free — the global restore writes every service
+    /// back from a backup — and a run that never got the machine to change has
+    /// nothing to undo.
+    IfInEffect,
+    /// Undo it whether or not the read-back shows it.
+    ///
+    /// For a hijack that failed *after* it had already changed the machine: the
+    /// read-back is exactly what failed, so asking it again answers the same
+    /// way — and the machine is left pointing at a TUN address that will never
+    /// come up.
+    Unconditional,
+}
+
 /// Restores the system DNS configuration (best effort), undoing the kind of
 /// hijack [`set_system_dns`] reported it had installed.
-pub fn restore_system_dns(interface: &str, dns_ip: &str, hijack: DnsHijack) -> Result<()> {
+///
+/// `scope` says how much the restore is allowed to touch: see
+/// [`RestoreScope`]. A hijack that failed halfway is undone unconditionally —
+/// the read-back that failed is the very thing that would say it is not in
+/// effect.
+pub fn restore_system_dns(
+    interface: &str,
+    dns_ip: &str,
+    hijack: DnsHijack,
+    scope: RestoreScope,
+) -> Result<()> {
     // Only the Linux (resolvectl) and Windows (adapter exclusion) branches need `interface`,
     // and only the three platform branches need `dns_ip`. The other platforms are a
     // compilation check, not a deployment target — but they have to compile.
@@ -333,6 +446,11 @@ pub fn restore_system_dns(interface: &str, dns_ip: &str, hijack: DnsHijack) -> R
     let _ = interface;
     #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
     let _ = dns_ip;
+    // The scope is a question only where the restore asks whether the hijack
+    // is still in effect; the Windows one hands the adapters back to DHCP
+    // either way.
+    #[cfg(windows)]
+    let _ = scope;
 
     #[cfg(windows)]
     {
@@ -370,7 +488,7 @@ pub fn restore_system_dns(interface: &str, dns_ip: &str, hijack: DnsHijack) -> R
                         &std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default(),
                     ),
                 ];
-                if hijack_is_in_effect(&observed, dns_ip) {
+                if scope == RestoreScope::Unconditional || hijack_is_in_effect(&observed, dns_ip) {
                     restore_system_dns_linux(interface, dns_ip)
                 } else {
                     tracing::info!(
@@ -395,7 +513,7 @@ pub fn restore_system_dns(interface: &str, dns_ip: &str, hijack: DnsHijack) -> R
                     .iter()
                     .filter_map(|service| dns_servers_for(service))
                     .collect();
-                if hijack_is_in_effect(&observed, dns_ip) {
+                if scope == RestoreScope::Unconditional || hijack_is_in_effect(&observed, dns_ip) {
                     restore_system_dns_macos(dns_ip)
                 } else {
                     tracing::info!(
@@ -510,9 +628,13 @@ pub fn recorded_dns_servers() -> Vec<String> {
 /// removed too — a rule is a registry entry, so it survives the reboot as well, and it
 /// keeps its domains resolving against a TUN address nothing answers from.
 ///
-/// On macOS and Linux the same question is asked of the system resolver, and an address
-/// that is still held by an interface is left alone — see [`cleanup_stale_hijack_macos`]
-/// and [`cleanup_stale_hijack_linux`].
+/// The same question is asked on every platform — is the address still in use? — and
+/// only the way it is answered differs: macOS and Linux ask the system resolver whether
+/// an interface still holds the address ([`cleanup_stale_hijack_macos`],
+/// [`cleanup_stale_hijack_linux`]), while Windows asks whether the tunnel's DNS server
+/// is still listening on it ([`cleanup_stale_hijack_windows`]). The decision itself is
+/// shared — see [`stale_adapter_indexes`] — so an adapter whose address a live tunnel
+/// still holds is left alone everywhere.
 pub fn cleanup_stale_hijack() {
     #[cfg(windows)]
     cleanup_stale_hijack_windows();
@@ -562,9 +684,82 @@ fn address_is_held(address: &str) -> bool {
     UdpSocket::bind((ip, 0)).is_ok()
 }
 
+/// The IPv6 loopback — the address the local DNS server also listens on, and
+/// the marker the IPv6 half of a hijack leaves behind.
+#[cfg(any(windows, test))]
+pub(crate) const LOCALHOST_V6: &str = "::1";
+
+/// One adapter's DNS configuration, as the stale-hijack cleanup sees it.
+///
+/// The shape is the Windows one — an adapter, addressed by its interface index
+/// — because that is the platform whose cleanup had no liveness guard. The
+/// decision built on it is shared, so it can be exercised on any host.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdapterDns {
+    /// The adapter's interface index — how a reset addresses it.
+    pub(crate) index: u32,
+    /// The DNS servers configured on it, over both address families.
+    pub(crate) servers: Vec<String>,
+}
+
+/// The adapters whose DNS still points at a hijack that is no longer running.
+///
+/// `in_use` answers the one question that separates a stale hijack from a live
+/// one: is that address still in use? It is asked per address, because the
+/// answer is per address — one tunnel holds one address.
+///
+/// Two things have to hold for an adapter to be reset:
+///
+/// - it names one of the TUN candidate addresses (`…254` of a candidate block),
+///   which is what a hijack leaves behind and nobody configures by hand; or
+///   it names `::1`, which is the IPv6 half of the hijack — the local DNS
+///   server listens on `[::1]:53` for as long as a tunnel is up;
+/// - and that address is not in use.
+///
+/// The second half is what keeps a live tunnel out of it. Resetting the
+/// adapters of a tunnel that is still up leaves the tunnel up and the machine's
+/// DNS somewhere else: the proxied domains resolve at their real addresses and
+/// the traffic leaves in the clear — the exact failure the DNS strategy was
+/// introduced to prevent.
+#[cfg(any(windows, test))]
+pub(crate) fn stale_adapter_indexes(
+    adapters: &[AdapterDns],
+    in_use: impl Fn(&str) -> bool,
+) -> Vec<u32> {
+    adapters
+        .iter()
+        .filter(|adapter| adapter_dns_is_stale(&adapter.servers, &in_use))
+        .map(|adapter| adapter.index)
+        .collect()
+}
+
+/// Whether one adapter's DNS is a stale hijack.
+///
+/// The IPv4 half and the IPv6 half are the same question asked of two
+/// addresses: does this adapter name an address a hijack uses, and is that
+/// address still in use?
+#[cfg(any(windows, test))]
+fn adapter_dns_is_stale(servers: &[String], in_use: impl Fn(&str) -> bool) -> bool {
+    let mut stale = false;
+    for server in servers {
+        let ours = server == LOCALHOST_V6 || is_tun_dns_address(server);
+        if ours && !in_use(server) {
+            stale = true;
+        }
+    }
+    stale
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DnsHijack, DnsStrategy};
+    use super::{undo_failed_hijack, DnsHijack, DnsHijackFailure, DnsStrategy};
+
+    // The cleanup's decision, and the pieces it is built from. Compiled under
+    // `test` on every platform: the machine that has to answer the liveness
+    // question is not the one the tests run on.
+    #[cfg(any(windows, test))]
+    use super::{stale_adapter_indexes, AdapterDns, LOCALHOST_V6};
 
     /// The three spellings there are, and nothing else.
     ///
@@ -668,6 +863,15 @@ mod tests {
     use super::{
         nrpt_add_script, nrpt_effective_script, nrpt_namespaces, nrpt_namespaces_for,
         nrpt_remove_script, parse_nrpt_rules,
+    };
+
+    // The Windows cleanup reads the machine in two steps — what is on it, and
+    // what is still in use — and decides in the shared code. Both halves are
+    // pure, so they are compiled under `test` on every platform.
+    #[cfg(any(windows, test))]
+    use super::{
+        cleanup_apply_script, cleanup_collect_script, parse_cleanup_state, stale_nrpt_rules,
+        CleanupRule,
     };
 
     #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -1433,5 +1637,247 @@ Link 7 (wg0): ~corp.example ~corp.internal
         assert!(remove_resolver_files(&dir, is_our_resolver_file).is_empty());
         assert!(!stale.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A hijack that failed after it had already changed the machine is taken
+    /// back — with the hijack that was installed, because that is the only
+    /// thing that knows where to take it back from.
+    ///
+    /// The failure is what carries it. The global paths change the machine
+    /// before they read it back, so "it failed" does not mean "nothing
+    /// happened", and a caller that had nothing but the error had nothing to
+    /// undo: the machine kept a static DNS pointing at a TUN address that
+    /// never comes up.
+    #[test]
+    fn a_hijack_that_failed_after_it_changed_the_machine_is_undone() {
+        let failure = DnsHijackFailure {
+            hijack: DnsHijack::Global,
+            error: anyhow::anyhow!("the read-back did not show the TUN address"),
+        };
+
+        let mut undone: Option<DnsHijack> = None;
+        undo_failed_hijack(&failure, |hijack| {
+            undone = Some(hijack);
+            Ok(())
+        })
+        .expect("undoing a hijack that was installed cannot fail here");
+
+        assert_eq!(
+            undone,
+            Some(DnsHijack::Global),
+            "the restore has to be called with the hijack that was installed"
+        );
+    }
+
+    /// A scoped hijack that failed is taken back the same way: the rules or
+    /// the resolver files it wrote are still there, and only the scoped
+    /// restore knows how to remove them.
+    #[test]
+    fn a_scoped_hijack_that_failed_is_undone_as_a_scoped_one() {
+        let failure = DnsHijackFailure {
+            hijack: DnsHijack::Scoped,
+            error: anyhow::anyhow!("the rules could not be removed"),
+        };
+
+        let mut undone: Option<DnsHijack> = None;
+        undo_failed_hijack(&failure, |hijack| {
+            undone = Some(hijack);
+            Ok(())
+        })
+        .expect("undoing a hijack that was installed cannot fail here");
+
+        assert_eq!(undone, Some(DnsHijack::Scoped));
+    }
+
+    /// A hijack that failed before it changed anything is not undone: there is
+    /// nothing to take back, and the restore is not free — it rewrites the
+    /// machine's DNS configuration.
+    #[test]
+    fn a_hijack_that_failed_before_it_changed_anything_is_not_undone() {
+        let failure = DnsHijackFailure {
+            hijack: DnsHijack::None,
+            error: anyhow::anyhow!("the configured domains cannot each be named"),
+        };
+
+        let mut called = false;
+        undo_failed_hijack(&failure, |_hijack| {
+            called = true;
+            Ok(())
+        })
+        .expect("there is nothing to undo, so nothing can fail");
+
+        assert!(
+            !called,
+            "nothing was installed, so there is nothing to take back"
+        );
+    }
+
+    /// The liveness guard the Windows cleanup was missing: an adapter whose
+    /// TUN address a tunnel still holds is not a leftover, and resetting it
+    /// would leave the tunnel up and the machine's DNS somewhere else — the
+    /// proxied domains would resolve at their real addresses and the traffic
+    /// would leave in the clear.
+    #[test]
+    fn an_adapter_whose_tun_address_is_still_in_use_is_not_reset() {
+        let adapters = vec![AdapterDns {
+            index: 7,
+            servers: vec!["198.18.0.254".to_string()],
+        }];
+        let in_use = |address: &str| address == "198.18.0.254";
+
+        assert!(
+            stale_adapter_indexes(&adapters, in_use).is_empty(),
+            "a live tunnel's DNS is not a stale hijack"
+        );
+    }
+
+    /// The other half: an address nothing holds is a leftover, and the
+    /// adapter carrying it is reset.
+    #[test]
+    fn an_adapter_whose_tun_address_is_not_in_use_is_reset() {
+        let adapters = vec![AdapterDns {
+            index: 7,
+            servers: vec!["198.18.0.254".to_string()],
+        }];
+        let in_use = |_: &str| false;
+
+        assert_eq!(stale_adapter_indexes(&adapters, in_use), vec![7]);
+    }
+
+    /// Only the addresses of a hijack are ever reset: an adapter carrying the
+    /// machine's own DNS is not ours to touch, and the IPv6 marker is a
+    /// leftover only while nothing holds `[::1]:53`.
+    #[test]
+    fn only_the_addresses_of_a_hijack_are_ever_reset() {
+        let adapters = vec![
+            AdapterDns {
+                index: 7,
+                servers: vec!["192.168.1.1".to_string(), "8.8.8.8".to_string()],
+            },
+            AdapterDns {
+                index: 8,
+                servers: vec![LOCALHOST_V6.to_string()],
+            },
+        ];
+
+        // Nothing is in use: the first adapter is not ours at all, the second
+        // one carries the IPv6 marker of a hijack that is gone.
+        let in_use = |_: &str| false;
+        assert_eq!(stale_adapter_indexes(&adapters, in_use), vec![8]);
+
+        // With the local resolver still listening on [::1]:53, the marker
+        // belongs to a live tunnel and the adapter is left alone.
+        let in_use = |address: &str| address == LOCALHOST_V6;
+        assert!(stale_adapter_indexes(&adapters, in_use).is_empty());
+    }
+
+    /// What the Windows cleanup reads off the machine: the adapters and their
+    /// DNS servers, the rules, and the addresses a tunnel still holds.
+    ///
+    /// The same adapter is reported once per address family, and the decision
+    /// is about the adapter rather than the family — so the two rows have to
+    /// end up as one.
+    #[cfg(any(windows, test))]
+    #[test]
+    fn the_cleanup_dump_reads_as_the_adapters_the_rules_and_what_is_still_in_use() {
+        let dump = "\
+adapter|12|198.18.0.254\n\
+adapter|12|::1\n\
+adapter|15|192.168.1.1\n\
+nrpt|{rule}|example.com,.example.com|198.18.0.254\n\
+live|198.18.0.254\n";
+        let state = parse_cleanup_state(dump);
+
+        assert_eq!(state.adapters.len(), 2);
+        assert_eq!(state.adapters[0].index, 12);
+        assert_eq!(
+            state.adapters[0].servers,
+            vec!["198.18.0.254".to_string(), "::1".to_string()]
+        );
+        assert_eq!(state.adapters[1].index, 15);
+        assert_eq!(state.rules.len(), 1);
+        assert_eq!(state.rules[0].name, "{rule}");
+        assert_eq!(
+            state.rules[0].namespaces,
+            vec!["example.com".to_string(), ".example.com".to_string()]
+        );
+        assert_eq!(state.rules[0].servers, vec!["198.18.0.254".to_string()]);
+        assert_eq!(state.in_use, vec!["198.18.0.254".to_string()]);
+    }
+
+    /// The guard, from what the machine says to what is done with it: an
+    /// adapter whose TUN address a tunnel still holds is left alone, and one
+    /// whose address nothing holds is reset.
+    #[cfg(any(windows, test))]
+    #[test]
+    fn the_cleanup_leaves_the_adapters_of_a_live_tunnel_alone() {
+        let live = parse_cleanup_state(
+            "adapter|12|198.18.0.254\nadapter|15|198.18.0.254\nlive|198.18.0.254\n",
+        );
+        let held = |address: &str| live.in_use.iter().any(|live| live == address);
+        assert!(
+            stale_adapter_indexes(&live.adapters, held).is_empty(),
+            "a tunnel that is up keeps its DNS"
+        );
+
+        // The same machine without the listener: both adapters are leftovers.
+        let stale = parse_cleanup_state("adapter|12|198.18.0.254\nadapter|15|198.18.0.254\n");
+        let nothing_held = |_: &str| false;
+        assert_eq!(
+            stale_adapter_indexes(&stale.adapters, nothing_held),
+            vec![12, 15]
+        );
+    }
+
+    /// A rule that routes to an address a live tunnel holds is not stale:
+    /// removing it would take a live tunnel's names out of the proxy.
+    #[cfg(any(windows, test))]
+    #[test]
+    fn an_nrpt_rule_of_a_live_tunnel_is_not_removed() {
+        let rules = vec![
+            CleanupRule {
+                name: "live".to_string(),
+                namespaces: vec!["example.com".to_string()],
+                servers: vec!["198.18.0.254".to_string()],
+            },
+            CleanupRule {
+                name: "stale".to_string(),
+                namespaces: vec!["foo.io".to_string()],
+                servers: vec!["198.19.0.254".to_string()],
+            },
+        ];
+
+        let in_use = |address: &str| address == "198.18.0.254";
+        let stale = stale_nrpt_rules(&rules, in_use);
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].name, "stale");
+    }
+
+    /// The two scripts the Windows cleanup runs: one that reports what is on
+    /// the machine, one that carries the decision out.
+    ///
+    /// Pinned, because a broken escape reaches that machine as a PowerShell
+    /// syntax error, and there is no other way to see it coming from here.
+    /// The liveness question is in the first one: the tunnel's DNS server, on
+    /// the TUN address and on the IPv6 loopback.
+    #[cfg(any(windows, test))]
+    #[test]
+    fn the_cleanup_scripts_are_pinned() {
+        let collect = cleanup_collect_script();
+        // The liveness question: the socket that holds the address — the
+        // tunnel's DNS server, on the TUN address and on the IPv6 loopback.
+        assert!(collect.contains("Get-NetUDPEndpoint -LocalAddress $a -LocalPort 53"));
+        assert!(collect.contains("$watched = @('198.18.0.254'"));
+        assert!(collect.contains(",'::1');"));
+        assert!(collect.contains("'adapter|' + $_.InterfaceIndex"));
+        assert!(collect.contains("'nrpt|' + $_.Name"));
+
+        let apply = cleanup_apply_script(&[12], &["{rule}".to_string()]);
+        assert!(apply.contains("$reset = @(12)"));
+        assert!(
+            apply.contains("Set-DnsClientServerAddress -InterfaceIndex $i -ResetServerAddresses")
+        );
+        assert!(apply.contains("$rules = @('{rule}')"));
+        assert!(apply.contains("Remove-DnsClientNrptRule -Name $r"));
     }
 }

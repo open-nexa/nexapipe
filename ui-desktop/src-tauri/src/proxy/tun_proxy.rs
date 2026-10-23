@@ -477,7 +477,32 @@ impl TunProxy {
             self.config.dns_strategy,
         ) {
             Ok(hijack) => hijack,
-            Err(e) => {
+            Err(failure) => {
+                // The failure carries what was installed: the global paths
+                // change the machine before they read it back, so a failure
+                // can leave the machine pointing at a TUN address that will
+                // never come up — no name resolution on that adapter or
+                // service, until something else fixes it. So the hijack is
+                // taken back here, before the routes go and while the
+                // interface is still the one the hijack named.
+                //
+                // Unconditionally: the read-back that failed is exactly what
+                // would say the hijack is not in effect.
+                if let Err(e) = dns_config::undo_failed_hijack(&failure, |installed| {
+                    dns_config::restore_system_dns(
+                        &interface,
+                        &dns_ip,
+                        installed,
+                        dns_config::RestoreScope::Unconditional,
+                    )
+                }) {
+                    tracing::warn!(
+                        "the DNS hijack that failed could not be taken back: {} — the machine may \
+                         be left pointing at {}",
+                        e,
+                        dns_ip
+                    );
+                }
                 // The same wind-down as the one below, minus the stack: it has
                 // not been started, so there is nothing to shut down. The
                 // global places are the ones a failed scoped attempt falls
@@ -490,7 +515,8 @@ impl TunProxy {
                 let _ = routing::remove_routes(&interface);
                 let _ = routing::remove_ipv6(&interface);
                 return Err(anyhow::anyhow!(
-                    "system DNS could not be pointed at {dns_ip} ({e:#}); the tunnel was not started"
+                    "system DNS could not be pointed at {dns_ip} ({:#}); the tunnel was not started",
+                    failure.error
                 ));
             }
         };
@@ -568,7 +594,12 @@ impl TunProxy {
         // system DNS, stop the local DNS server, remove the routes — all while the
         // device (still held by the stack's pumps) keeps the interface alive — and
         // only then stop the stack, which drops the device and the adapter.
-        if let Err(e) = dns_config::restore_system_dns(&interface, &dns_ip, hijack) {
+        if let Err(e) = dns_config::restore_system_dns(
+            &interface,
+            &dns_ip,
+            hijack,
+            dns_config::RestoreScope::IfInEffect,
+        ) {
             tracing::warn!("Failed to restore system DNS: {}", e);
         }
         dns_stopped.store(true, Ordering::Release);
