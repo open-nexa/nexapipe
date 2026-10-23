@@ -306,17 +306,24 @@ fn check_error_code_alignment() {
     let en = locale_codes(&locales_dir.join("en.json"));
     let zh = locale_codes(&locales_dir.join("zh-CN.json"));
 
-    // The frontend's fallback for a failure it cannot name has no code on the
-    // Rust side, so it is the one entry allowed to be there alone.
-    let mut en_expected = en.clone();
-    en_expected.remove("error.unknown");
-    let mut zh_expected = zh.clone();
-    zh_expected.remove("error.unknown");
-
     let rust_as_locale: BTreeSet<String> = rust_codes
         .iter()
         .map(|code| format!("error.{code}"))
         .collect();
+
+    // **A message does not always have a code behind it.**
+    //
+    // The frontend falls back to one when a failure carries no code of its
+    // own — `toast.error(error, 'error.proxy.close_failed')` — and shows one
+    // directly with `toast.fromKey('error.proxy.stop_failed')`. The proxy's
+    // stop command never fails with a code at all: it either stops or it does
+    // not, and the frontend is the one that says which.
+    //
+    // So a message with no code behind it is allowed. What is not allowed is
+    // for the two locales to disagree about them: the text a reader sees
+    // would then depend on the language they read the app in.
+    let en_extra: BTreeSet<String> = en.difference(&rust_as_locale).cloned().collect();
+    let zh_extra: BTreeSet<String> = zh.difference(&rust_as_locale).cloned().collect();
 
     // The frontend's files are outside this package, so cargo does not know
     // that a change to them has to run this script again. Without these lines
@@ -341,14 +348,26 @@ fn check_error_code_alignment() {
         ));
     }
 
-    for (name, locale) in [("en.json", &en_expected), ("zh-CN.json", &zh_expected)] {
+    // Every code has to have a message: a code the frontend cannot name is a
+    // failure the UI renders as "unknown".
+    for (name, locale) in [("en.json", &en), ("zh-CN.json", &zh)] {
         let missing: Vec<&String> = rust_as_locale.difference(locale).collect();
-        let extra: Vec<&String> = locale.difference(&rust_as_locale).collect();
-        if !missing.is_empty() || !extra.is_empty() {
+        if !missing.is_empty() {
             problems.push(format!(
-                "src/i18n/locales/{name} and src/error.rs disagree:\n  in error.rs but not in {name}: {missing:?}\n  in {name} but not in error.rs: {extra:?}"
+                "src/i18n/locales/{name} has no message for a code in src/error.rs: {missing:?}"
             ));
         }
+    }
+
+    // And the two locales have to agree about the messages that have no code
+    // behind them.
+    if en_extra != zh_extra {
+        problems.push(format!(
+            "src/i18n/locales/en.json and src/i18n/locales/zh-CN.json disagree about the \
+             messages that have no code behind them:\n  only in en.json: {:?}\n  only in zh-CN.json: {:?}",
+            en_extra.difference(&zh_extra).collect::<Vec<_>>(),
+            zh_extra.difference(&en_extra).collect::<Vec<_>>(),
+        ));
     }
 
     if problems.is_empty() {
@@ -362,9 +381,11 @@ fn check_error_code_alignment() {
     eprintln!(
         "\n[error-code-check] ui-desktop/src-tauri error code alignment failed.\n\
          \n\
-         The check enforces `src/error.rs == src/api/errors.ts` and `src/error.rs == locales - {{unknown}}`.\n\
-         A code the Rust side raises that the frontend does not know is a failure the UI renders as\n\
-         \"unknown\", and a locale key with no code behind it is a message no failure can show.\n"
+         The check enforces `src/error.rs == src/api/errors.ts`, that every code has a message in\n\
+         both locale files, and that the two locales agree about the messages that have no code\n\
+         behind them. A code the Rust side raises that the frontend does not know is a failure the\n\
+         UI renders as \"unknown\", and a message in one locale and not the other is a text a reader\n\
+         sees in one language and not in the other.\n"
     );
     for problem in &problems {
         eprintln!("  {problem}");

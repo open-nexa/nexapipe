@@ -370,9 +370,11 @@
       "start_failed": "代理启动失败，详情请查看日志。",
       "no_reachable_backend": "无法连接到任何已配置的节点。请检查节点 ID（或票据）与网络后重试。",
       "two_factor_required": "服务端要求两步验证，但此处未配置 2FA 凭据。请填写服务端 [auth.clients] 中对应的客户端 ID 与密钥。",
+      "stop_failed": "代理停止失败，详情请查看日志。",
       "not_running": "代理当前未运行。",
       "node_id_unavailable": "节点 ID 暂不可用。",
-      "tun_unavailable": "TUN 模式需要系统服务，请先安装服务再开启 TUN。"
+      "tun_unavailable": "TUN 模式需要系统服务，请先安装服务再开启 TUN。",
+      "close_failed": "无法关闭该连接，详情请查看日志。"
     },
     "service": {
       "unavailable": "系统服务无响应，可能尚未安装。",

@@ -370,9 +370,11 @@
       "start_failed": "The proxy failed to start. See the logs for details.",
       "no_reachable_backend": "No configured node could be reached. Check the node ID (or ticket) and your network, then try again.",
       "two_factor_required": "The server requires two-factor authentication, but no 2FA credentials are configured here. Add the client ID and secret the server lists under [auth.clients].",
+      "stop_failed": "The proxy failed to stop. See the logs for details.",
       "not_running": "The proxy is not running.",
       "node_id_unavailable": "The node ID is not available yet.",
-      "tun_unavailable": "TUN mode needs the system service. Install it first, then enable TUN."
+      "tun_unavailable": "TUN mode needs the system service. Install it first, then enable TUN.",
+      "close_failed": "The connection could not be closed. See the logs for details."
     },
     "service": {
       "unavailable": "The system service is not responding. It may not be installed.",
