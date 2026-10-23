@@ -20,13 +20,12 @@
 //! The framing is the WebSocket's own and is not touched here: the bytes are
 //! moved as they are, and the end of the session is the end of a stream.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use http::HeaderMap;
 use hyper::{Request, Response, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::conn::{find_headers_end, now_millis};
 use crate::http::body::{ProxyBody, ProxyFailure, Retryability};
@@ -219,13 +218,44 @@ pub async fn handshake(
     })
 }
 
+/// How long the session waits for the other direction after one of them ends.
+///
+/// A half-close is a request, not an ending: the peer that shut down its write
+/// side is done sending, and the reply that follows still has to arrive. So
+/// the session does not end when the first direction does — it ends when the
+/// second one does.
+///
+/// The bound is what keeps an abandoned session from holding its slot. A peer
+/// that vanished is indistinguishable from one that half-closed — both arrive
+/// as a clean end of stream — and without a bound the session would wait for
+/// a reply that is never coming, holding a stream slot and a backend
+/// connection for as long as the whole-flow deadline allows.
+///
+/// Thirty seconds is the same order nginx uses for the same problem
+/// (`lingering_time`), and long enough for a backend that is thinking about
+/// its answer.
+const LINGERING: Duration = Duration::from_secs(30);
+
+/// The moment no direction has ended yet.
+///
+/// `now_millis()` counts from the start of the process, so this cannot be a
+/// moment it returns.
+const NOT_ENDED: u64 = u64::MAX;
+
 /// The session: the client's bytes and the backend's bytes, moved either way.
 ///
-/// The session ends when one of the two ends stops, or when neither has moved
+/// The session ends when both directions have ended, or when neither has moved
 /// for a whole idle window. A direction that is quiet on its own does not end
 /// it: a client that only listens to a feed the backend keeps pushing has
 /// nothing to say, and a gap in one direction must not end a session the
 /// other direction is still using.
+///
+/// A half-close is not an ending either. A client that sends its Close frame
+/// and shuts its write side down is done sending, and the backend's answer —
+/// its own Close frame, echoed back — still has to arrive. So the two
+/// directions are joined rather than raced, and each one shuts the peer's
+/// write side down as it ends, so the peer sees a clean end of stream rather
+/// than a reset.
 pub async fn pump(
     client: hyper::upgrade::Upgraded,
     backend: BackendStream,
@@ -233,8 +263,22 @@ pub async fn pump(
     idle: Duration,
 ) {
     let client = crate::hyper_io::UpgradedIo::new(client);
-    let (backend_read, mut backend_write) = tokio::io::split(backend);
+    pump_session(client, backend, trailing, idle).await;
+}
+
+/// The session, over any pair of byte streams.
+///
+/// The tunnel's own pair is one of many, so the session is written over
+/// streams rather than over the tunnel's types: the shape below — two
+/// directions, joined and half-closed — is then the shape under test, and the
+/// test drives it over an in-memory pair.
+async fn pump_session<C, B>(client: C, backend: B, trailing: Vec<u8>, idle: Duration)
+where
+    C: AsyncRead + AsyncWrite,
+    B: AsyncRead + AsyncWrite,
+{
     let (mut client_read, mut client_write) = tokio::io::split(client);
+    let (mut backend_read, mut backend_write) = tokio::io::split(backend);
 
     // The bytes that came after the handshake belong to the session, not to
     // the handshake: they are the backend's first frames.
@@ -245,79 +289,224 @@ pub async fn pump(
         return;
     }
 
-    // When the last byte moved on this tunnel, in milliseconds since the
+    // When the last byte moved on this session, in milliseconds since the
     // epoch. Both directions write to it, and a direction that has been quiet
     // for a whole window reads it to find out whether the other one is still
     // talking.
-    let last_traffic = Arc::new(AtomicU64::new(now_millis()));
+    let last_traffic = AtomicU64::new(now_millis());
 
+    // When the first direction ended, in milliseconds since the epoch, and
+    // `NOT_ENDED` while both are still running. The second direction is given
+    // `LINGERING` from that moment on.
+    let first_end = AtomicU64::new(NOT_ENDED);
+
+    // The two directions, and the half-close that goes with each of them.
+    //
+    // A half-close is a **request**, not an ending: the peer that shut down
+    // its write side is done sending, and the other side has to hear that, or
+    // it waits for input that is never coming. So the FIN is sent as soon as
+    // the direction ends — not when the whole session does.
+    //
+    // The two directions are **joined**, not raced. Racing them meant that
+    // whichever ended first won and the other was dropped: a client that
+    // sent its Close frame and then shut its write side down never saw the
+    // backend's answer, because the direction carrying it was killed a
+    // microsecond after the half-close. Nothing shut a write half down
+    // either, so the backend saw the connection disappear rather than a
+    // clean end of stream.
     let client_to_backend = async {
-        let mut buf = vec![0u8; WS_COPY_BUFFER];
-        loop {
-            match tokio::time::timeout(idle, client_read.read(&mut buf)).await {
-                Ok(Ok(0)) => return "client_finished",
-                Ok(Ok(n)) => {
-                    last_traffic.store(now_millis(), Ordering::Relaxed);
-                    if let Err(e) = backend_write.write_all(&buf[..n]).await {
-                        tracing::debug!("WebSocket backend write failed: {e}");
-                        return "backend_write_error";
-                    }
-                    crate::metrics::METRICS.record_bytes_received(n as u64);
-                }
-                Ok(Err(_)) => return "client_read_error",
-                Err(_) => {
-                    // This direction has been quiet for a whole window. The
-                    // session ends when nothing has moved in either direction
-                    // for that long; until then the other side is still using
-                    // it.
-                    let quiet_for =
-                        now_millis().saturating_sub(last_traffic.load(Ordering::Relaxed));
-                    if quiet_for >= idle.as_millis() as u64 {
-                        return "idle";
-                    }
-                    // The other side is still talking: wait for more, with
-                    // the window measured from now.
-                    continue;
-                }
-            }
-        }
+        let end = copy_one_way(
+            &mut client_read,
+            &mut backend_write,
+            &last_traffic,
+            &first_end,
+            idle,
+            Leg::ClientToBackend,
+        )
+        .await;
+        // The client is done sending. The backend has to hear that.
+        let _ = backend_write.shutdown().await;
+        // The clock on the other direction starts now: this one is over.
+        mark_first_end(&first_end);
+        end
     };
-
     let backend_to_client = async {
-        let mut buf = vec![0u8; WS_COPY_BUFFER];
-        let mut backend_read = backend_read;
-        loop {
-            match tokio::time::timeout(idle, backend_read.read(&mut buf)).await {
-                Ok(Ok(0)) => return "backend_finished",
-                Ok(Ok(n)) => {
-                    last_traffic.store(now_millis(), Ordering::Relaxed);
-                    if let Err(e) = client_write.write_all(&buf[..n]).await {
-                        tracing::debug!("WebSocket client write failed: {e}");
-                        return "client_write_error";
-                    }
-                    crate::metrics::METRICS.record_bytes_sent(n as u64);
-                }
-                Ok(Err(_)) => return "backend_read_error",
-                Err(_) => {
-                    // The same bound as the other direction, and the same
-                    // reading of it: a quiet direction does not end a
-                    // session the other one is still using.
-                    let quiet_for =
-                        now_millis().saturating_sub(last_traffic.load(Ordering::Relaxed));
-                    if quiet_for >= idle.as_millis() as u64 {
-                        return "idle";
-                    }
-                    continue;
-                }
-            }
-        }
+        let end = copy_one_way(
+            &mut backend_read,
+            &mut client_write,
+            &last_traffic,
+            &first_end,
+            idle,
+            Leg::BackendToClient,
+        )
+        .await;
+        // The backend is done sending. The client has to hear that.
+        let _ = client_write.shutdown().await;
+        mark_first_end(&first_end);
+        end
     };
 
-    let (closed_direction, close_reason) = tokio::select! {
-        reason = client_to_backend => ("client_to_backend", reason),
-        reason = backend_to_client => ("backend_to_client", reason),
-    };
-    tracing::debug!("WebSocket tunnel closed first by {closed_direction}, reason: {close_reason}");
+    // Both directions have to be waited for. A `select!` here would drop the
+    // one that lost the race, and the bytes it was carrying would be lost
+    // with it.
+    let (client_end, backend_end) = tokio::join!(client_to_backend, backend_to_client);
+
+    // Both write halves, whatever happened: the session is over either way.
+    let _ = backend_write.shutdown().await;
+    let _ = client_write.shutdown().await;
+
+    tracing::debug!(
+        "WebSocket session ended: client to backend {}, backend to client {}",
+        client_end.reason(Leg::ClientToBackend),
+        backend_end.reason(Leg::BackendToClient),
+    );
+}
+
+/// Which way the bytes of one direction travel.
+#[derive(Clone, Copy)]
+enum Leg {
+    /// From the client to the backend.
+    ClientToBackend,
+    /// From the backend to the client.
+    BackendToClient,
+}
+
+impl Leg {
+    /// The name of the direction, for the log lines.
+    fn label(self) -> &'static str {
+        match self {
+            Leg::ClientToBackend => "client to backend",
+            Leg::BackendToClient => "backend to client",
+        }
+    }
+
+    /// Counts the bytes that crossed this direction.
+    fn record(self, bytes: u64) {
+        match self {
+            Leg::ClientToBackend => crate::metrics::METRICS.record_bytes_received(bytes),
+            Leg::BackendToClient => crate::metrics::METRICS.record_bytes_sent(bytes),
+        }
+    }
+}
+
+/// How one direction of the session ended.
+enum DirectionEnd {
+    /// The peer's write side closed: a half-close, or a peer that vanished —
+    /// the two arrive the same way, and the session cannot tell them apart.
+    Finished,
+    /// The transport failed on the way in.
+    ReadFailed,
+    /// The transport failed on the way out.
+    WriteFailed,
+    /// Nothing moved in either direction for a whole idle window.
+    Idle,
+    /// The other direction ended, and this one outlasted the bound.
+    Lingering,
+}
+
+impl DirectionEnd {
+    /// The reason, in the words the log uses.
+    ///
+    /// The two directions fail on different peers, so the reason names the
+    /// peer that failed rather than the direction.
+    fn reason(self, leg: Leg) -> &'static str {
+        match (self, leg) {
+            (DirectionEnd::Finished, Leg::ClientToBackend) => "client_finished",
+            (DirectionEnd::Finished, Leg::BackendToClient) => "backend_finished",
+            (DirectionEnd::ReadFailed, Leg::ClientToBackend) => "client_read_error",
+            (DirectionEnd::ReadFailed, Leg::BackendToClient) => "backend_read_error",
+            (DirectionEnd::WriteFailed, Leg::ClientToBackend) => "backend_write_error",
+            (DirectionEnd::WriteFailed, Leg::BackendToClient) => "client_write_error",
+            (DirectionEnd::Idle, _) => "idle",
+            (DirectionEnd::Lingering, _) => "lingering",
+        }
+    }
+}
+
+/// Notes that a direction ended, and says whether it was the first one to do so.
+fn mark_first_end(first_end: &AtomicU64) -> bool {
+    first_end
+        .compare_exchange(
+            NOT_ENDED,
+            now_millis(),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        )
+        .is_ok()
+}
+
+/// How long this direction may wait for the next chunk.
+///
+/// The shorter of the two bounds wins: the idle window says how long a
+/// direction may be quiet while the session is still alive, and the lingering
+/// bound says how long it may wait once the other direction ended. A direction
+/// that keeps moving bytes must not be able to hold the session open on its
+/// own, so the lingering bound is what the wait is measured against.
+fn wait_for(first_end: &AtomicU64, idle: Duration) -> Duration {
+    let at = first_end.load(Ordering::Relaxed);
+    if at == NOT_ENDED {
+        return idle;
+    }
+    let bound = LINGERING.as_millis() as u64;
+    let elapsed = now_millis().saturating_sub(at);
+    if elapsed >= bound {
+        return Duration::ZERO;
+    }
+    idle.min(Duration::from_millis(bound - elapsed))
+}
+
+/// Copies one direction of the session until it ends.
+///
+/// The direction ends when the peer stops sending, when the transport fails,
+/// when nothing has moved in either direction for a whole idle window, or
+/// when the other direction ended and this one outlasted the bound.
+async fn copy_one_way<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    last_traffic: &AtomicU64,
+    first_end: &AtomicU64,
+    idle: Duration,
+    leg: Leg,
+) -> DirectionEnd
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; WS_COPY_BUFFER];
+    loop {
+        // The bound is checked on every pass, not only when the read times
+        // out: a direction that keeps moving bytes would otherwise never
+        // notice that the other one ended.
+        let wait = wait_for(first_end, idle);
+        if wait.is_zero() {
+            return DirectionEnd::Lingering;
+        }
+        match tokio::time::timeout(wait, reader.read(&mut buf)).await {
+            Ok(Ok(0)) => return DirectionEnd::Finished,
+            Ok(Ok(n)) => {
+                last_traffic.store(now_millis(), Ordering::Relaxed);
+                if let Err(e) = writer.write_all(&buf[..n]).await {
+                    tracing::debug!("WebSocket {} write failed: {e}", leg.label());
+                    return DirectionEnd::WriteFailed;
+                }
+                leg.record(n as u64);
+            }
+            Ok(Err(_)) => return DirectionEnd::ReadFailed,
+            Err(_) => {
+                // This direction has been quiet for a whole window. The
+                // session ends when nothing has moved in either direction
+                // for that long; until then the other side is still using
+                // it.
+                let quiet_for = now_millis().saturating_sub(last_traffic.load(Ordering::Relaxed));
+                if quiet_for >= idle.as_millis() as u64 {
+                    return DirectionEnd::Idle;
+                }
+                // The other side is still talking: wait for more, with
+                // the window measured from now.
+                continue;
+            }
+        }
+    }
 }
 
 /// The upgrade request that goes to the backend.
@@ -390,6 +579,9 @@ fn forwards_upgrade_header(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::build_upgrade_request;
+    use super::pump_session;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     /// A route table whose route rewrites the paths under `pattern`.
     ///
@@ -506,5 +698,141 @@ mod tests {
                 "{leaked} reached the backend:\n{sent}"
             );
         }
+    }
+
+    /// A half-closed client still receives the backend's Close frame.
+    ///
+    /// A WebSocket close is a half-close: the client sends its Close frame
+    /// and shuts its write side down, and the backend's answer — its own
+    /// Close frame, echoed back — still has to arrive. The two directions
+    /// used to be raced, so the one carrying the answer was dropped the
+    /// moment the half-close was seen, and the client never got it. Nothing
+    /// shut a write half down either, so the backend saw the connection
+    /// disappear rather than a clean end of stream.
+    ///
+    /// The backend here reads until the client is done, and only then
+    /// answers — the shape of a protocol that is carried over a connection
+    /// the client may half-close.
+    #[tokio::test]
+    async fn a_half_closed_client_still_receives_the_close_frame() {
+        // Two in-memory pipes: the session gets one end of each, and the test
+        // plays the client and the backend from the other ends.
+        let (mut client_end, client_side) = tokio::io::duplex(1024);
+        let (mut backend_end, backend_side) = tokio::io::duplex(1024);
+
+        let session = tokio::spawn(pump_session(
+            client_side,
+            backend_side,
+            Vec::new(),
+            Duration::from_secs(5),
+        ));
+
+        // The client: sends its Close frame, then shuts its write side down.
+        // That is a half-close, not an ending — the peer may still have an
+        // answer on the way.
+        let application = async {
+            client_end
+                .write_all(b"\x88\x00")
+                .await
+                .expect("the close frame goes out");
+            client_end.shutdown().await.expect("the write side closes");
+            let mut buf = Vec::new();
+            client_end
+                .read_to_end(&mut buf)
+                .await
+                .expect("the echo arrives");
+            buf
+        };
+
+        // The backend: reads until the client is done, then answers. The end
+        // of the stream it sees has to be a clean one — a reset would mean
+        // the session tore the connection down instead of closing it.
+        let backend = async {
+            let mut buf = Vec::new();
+            backend_end
+                .read_to_end(&mut buf)
+                .await
+                .expect("the close frame arrives, and the end of the stream with it");
+            assert_eq!(buf, b"\x88\x00", "the backend did not see the close frame");
+            // The backend may still answer after the client's half-close —
+            // that is what a half-close is. A session that tore the
+            // connection down instead of closing it fails right here.
+            backend_end
+                .write_all(b"\x88\x00")
+                .await
+                .expect("the echo goes out after the client's half-close");
+            backend_end.shutdown().await.expect("the backend closes");
+        };
+
+        let (received, ()) = tokio::join!(application, backend);
+        assert_eq!(
+            received, b"\x88\x00",
+            "the close echo did not survive the half-close"
+        );
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), session).await;
+        assert!(ended.is_ok(), "the session never ended");
+    }
+
+    /// A session nobody is using ends on its own.
+    ///
+    /// The idle window is what ends it: nothing has moved in either direction
+    /// for a whole window, so there is nothing left to wait for.
+    #[tokio::test]
+    async fn a_session_nobody_uses_ends_on_its_own() {
+        let (_client_end, client_side) = tokio::io::duplex(1024);
+        let (_backend_end, backend_side) = tokio::io::duplex(1024);
+
+        let session = tokio::spawn(pump_session(
+            client_side,
+            backend_side,
+            Vec::new(),
+            Duration::from_millis(100),
+        ));
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), session).await;
+        assert!(ended.is_ok(), "the session never ended");
+    }
+
+    /// A quiet direction does not end a session the other one is using.
+    ///
+    /// A client that only listens to a feed the backend keeps pushing has
+    /// nothing to say, and the gap in its direction must not end the session:
+    /// the idle window is measured over both directions, so what counts is
+    /// whether anything moved at all.
+    #[tokio::test]
+    async fn a_quiet_direction_does_not_end_a_session_the_other_one_is_using() {
+        let (_client_end, client_side) = tokio::io::duplex(1024);
+        let (mut backend_end, backend_side) = tokio::io::duplex(1024);
+
+        let session = tokio::spawn(pump_session(
+            client_side,
+            backend_side,
+            Vec::new(),
+            Duration::from_millis(200),
+        ));
+
+        // The backend keeps pushing; the client says nothing at all.
+        let push = tokio::spawn(async move {
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                backend_end
+                    .write_all(b"ping")
+                    .await
+                    .expect("the backend pushes");
+            }
+            // And then it stops, so the session can end on its idle window.
+            backend_end.shutdown().await.expect("the backend closes");
+        });
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(
+            !session.is_finished(),
+            "a quiet client ended a session the backend was still using"
+        );
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), session).await;
+        assert!(ended.is_ok(), "the session never ended");
+        push.await.expect("the backend finished");
     }
 }

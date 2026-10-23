@@ -14,11 +14,26 @@
 //! configuration reload — the routes rebuilt and the health checks restarted,
 //! because a stranger typed a code wrong.
 //!
-//! So the counters live in their own file, `state.toml`, beside the
-//! configuration. The shape is the same on purpose: an operator who opens
-//! `state.toml` next to `config.toml` sees the same client and device names
-//! in both, and a mistake in one is a mistake in the other. The contents are
-//! not the same: only the counters, and nothing an operator wrote.
+//! So the counters live in their own file, beside the configuration, and named
+//! after it: `config.state.toml` next to `config.toml`. The shape is the same
+//! on purpose: an operator who opens `config.state.toml` next to
+//! `config.toml` sees the same client and device names in both, and a mistake
+//! in one is a mistake in the other. The contents are not the same: only the
+//! counters, and nothing an operator wrote.
+//!
+//! The name comes from the configuration's own name and not from the
+//! directory it happens to sit in, so two configurations in one directory
+//! have two state files. `config.toml` and `config.prod.toml` keep their
+//! counters apart, instead of sharing one set of lockouts and one set of TOTP
+//! step memories — a client that mistyped a code against the production
+//! server walked the staging server's lockout too, and a code used against
+//! one was refused against the other.
+//!
+//! A deployment that predates that rule keeps its state in `state.toml`, in
+//! the configuration's own directory. That file is read when the state's own
+//! file is not there yet, so an upgrade does not start the server with an
+//! empty memory: no lockouts, and no memory of the TOTP steps that were
+//! already used.
 //!
 //! What is in the configuration file stays there. The three keys
 //! (`failed_attempts`, `locked_until`, `last_used`) are still read from it, so
@@ -33,14 +48,46 @@ use std::path::{Path, PathBuf};
 
 /// The file the runtime state lives in, beside the configuration file.
 ///
-/// Derived from the configuration's own path rather than from a directory of
-/// its own, so the two travel together: a configuration in
-/// `/etc/nexapipe/config.toml` puts its state in `/etc/nexapipe/state.toml`,
-/// and the two cannot end up in different places by accident. A configuration
-/// with no directory of its own — `config.toml` in the working directory —
-/// gets `state.toml` beside it.
+/// The name comes from the configuration's own name, so two configurations in
+/// one directory have two state files: a configuration in
+/// `/etc/nexapipe/config.toml` puts its state in
+/// `/etc/nexapipe/config.state.toml`, and `/etc/nexapipe/config.prod.toml`
+/// puts its state in `/etc/nexapipe/config.prod.state.toml`. One name for
+/// both of them meant one state file for both of them, and a state file
+/// holds the lockout counters and the TOTP step memories — so a client that
+/// mistyped a code against the production server walked the staging server's
+/// lockout too, and a code used against one was refused against the other.
+///
+/// The rule is the configuration's name with `state` in it: the file name
+/// without its extension, then `.state.toml`. A configuration with no file
+/// name of its own — no path at all, or the current directory — keeps the
+/// old answer, `state.toml` beside it.
 pub fn path_for(config_path: &str) -> PathBuf {
     let path = Path::new(config_path);
+    match path.file_name() {
+        Some(name) => {
+            let stem = Path::new(name).file_stem().unwrap_or(name);
+            path.with_file_name(format!("{}.state.toml", stem.to_string_lossy()))
+        }
+        None => state_beside(path),
+    }
+}
+
+/// The legacy name: `state.toml` in the configuration's own directory.
+///
+/// This is where a deployment that predates the naming rule keeps its
+/// counters, and it is what [`load`] reads when the state's own file is not
+/// there yet.
+fn legacy_path(path: &Path) -> Option<PathBuf> {
+    let legacy = state_beside(path);
+    (legacy != path).then_some(legacy)
+}
+
+/// `state.toml` beside `path`.
+///
+/// The directory is the one the path is in, and the current directory when
+/// the path has none of its own.
+fn state_beside(path: &Path) -> PathBuf {
     match path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -150,12 +197,8 @@ struct StateSection {
 /// what to do about it, because an operator who cannot start their proxy
 /// needs a way forward rather than a refusal.
 pub fn load(path: &Path) -> anyhow::Result<RuntimeState> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(RuntimeState::default()),
-        Err(e) => {
-            anyhow::bail!("cannot read the 2FA state {}: {e}", path.display());
-        }
+    let Some((path, content)) = read_state_file(path)? else {
+        return Ok(RuntimeState::default());
     };
 
     let file: StateFile = toml::from_str(&content).map_err(|e| {
@@ -171,7 +214,44 @@ pub fn load(path: &Path) -> anyhow::Result<RuntimeState> {
     })
 }
 
+/// The file the state is read from, and its content.
+///
+/// The state's own file first, and the legacy `state.toml` beside it when
+/// that one is not there yet — the file a deployment that predates the naming
+/// rule has. The counters it holds are the counters the server had before
+/// the upgrade, so an upgrade does not hand every client a fresh start: the
+/// lockouts stay, and so does the memory of the TOTP steps that were already
+/// used.
+///
+/// The legacy file is read and not written. The state is written to the file
+/// named after the configuration from then on, and the legacy file is left
+/// where it is: another configuration in the same directory may still be
+/// counting on it, and taking it away could take a lockout away from a
+/// server that has not migrated yet.
+fn read_state_file(path: &Path) -> anyhow::Result<Option<(PathBuf, String)>> {
+    if let Some(content) = read_optional(path)? {
+        return Ok(Some((path.to_path_buf(), content)));
+    }
+
+    let Some(legacy) = legacy_path(path) else {
+        return Ok(None);
+    };
+    Ok(read_optional(&legacy)?.map(|content| (legacy, content)))
+}
+
+/// The file's content, or `None` when the file is not there.
+fn read_optional(path: &Path) -> anyhow::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => anyhow::bail!("cannot read the 2FA state {}: {e}", path.display()),
+    }
+}
+
 /// Writes the runtime state.
+///
+/// The file is the one named after the configuration, so two configurations
+/// in one directory do not write over each other's counters.
 ///
 /// The write is a temporary file and a rename, like the configuration's, so a
 /// process killed in the middle of it leaves the old state rather than a
@@ -453,13 +533,157 @@ mod tests {
         }
     }
 
+    /// The state file is named after the configuration file.
+    ///
+    /// The name is the configuration's own, so an operator who sees
+    /// `config.prod.state.toml` next to `config.prod.toml` knows what it
+    /// belongs to without reading the source.
     #[test]
-    fn the_state_file_sits_beside_the_configuration() {
+    fn the_state_file_is_named_after_the_configuration() {
         assert_eq!(
             path_for("/etc/nexapipe/config.toml"),
-            PathBuf::from("/etc/nexapipe/state.toml")
+            PathBuf::from("/etc/nexapipe/config.state.toml")
         );
-        assert_eq!(path_for("config.toml"), PathBuf::from("state.toml"));
+        assert_eq!(
+            path_for("/etc/nexapipe/config.prod.toml"),
+            PathBuf::from("/etc/nexapipe/config.prod.state.toml")
+        );
+        assert_eq!(path_for("config.toml"), PathBuf::from("config.state.toml"));
+    }
+
+    /// A configuration with no file name of its own keeps the old name.
+    #[test]
+    fn a_configuration_with_no_file_name_keeps_the_old_name() {
+        assert_eq!(path_for(""), PathBuf::from("state.toml"));
+        assert_eq!(path_for("."), PathBuf::from("state.toml"));
+        assert_eq!(path_for("/"), PathBuf::from("state.toml"));
+    }
+
+    /// Two configurations in one directory have two state files.
+    ///
+    /// One state file for both of them meant one set of lockout counters and
+    /// one set of TOTP step memories for two servers that were never meant to
+    /// know about each other: a client that mistyped a code against the
+    /// production server walked the staging server's lockout too.
+    #[test]
+    fn two_configurations_in_one_directory_have_two_state_files() {
+        assert_ne!(
+            path_for("/etc/nexapipe/config.toml"),
+            path_for("/etc/nexapipe/config.prod.toml")
+        );
+    }
+
+    /// The state path of a `config.toml` in `dir`.
+    fn state_path_in(dir: &Path) -> PathBuf {
+        let config = dir.join("config.toml").to_string_lossy().into_owned();
+        path_for(&config)
+    }
+
+    /// The legacy state file is read when the state's own file is not there
+    /// yet.
+    ///
+    /// This is the file a deployment that predates the naming rule has, and
+    /// an upgrade that ignored it would start the server with an empty
+    /// memory: every lockout reset, and a TOTP code that was already used
+    /// accepted again.
+    #[test]
+    fn the_legacy_state_file_is_read_when_the_new_one_is_not_there_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("state.toml"),
+            "[auth.clients.alice]\nfailed_attempts = 3\nlocked_until = 4102444800\n",
+        )
+        .unwrap();
+
+        let state_path = state_path_in(dir.path());
+        assert_eq!(state_path, dir.path().join("config.state.toml"));
+
+        let state = load(&state_path).expect("the legacy state file reads");
+        let alice = &state.clients["alice"];
+        assert_eq!(alice.failed_attempts, 3, "the lockout survived the upgrade");
+        assert_eq!(alice.locked_until, Some(4102444800));
+    }
+
+    /// The step memory survives the upgrade.
+    ///
+    /// The state file is what refuses the second use of a code, so an
+    /// upgrade that forgot it would accept a code that was already used.
+    #[test]
+    fn the_step_memory_survives_the_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("state.toml"),
+            "[auth.clients.alice]\nlast_used_step = 100\n",
+        )
+        .unwrap();
+
+        let state = load(&state_path_in(dir.path())).expect("the legacy state file reads");
+
+        let mut config = AuthConfig::default();
+        config
+            .clients
+            .insert("alice".to_string(), client(0, None, None));
+        apply(&state, &mut config);
+
+        assert_eq!(config.clients["alice"].last_used_step, Some(100));
+        assert_eq!(
+            config.accept_step("alice", None, 99),
+            crate::auth::config::StepVerdict::Refused,
+            "a code that was already used is still refused"
+        );
+    }
+
+    /// The state's own file wins over the legacy one.
+    ///
+    /// The legacy file is what the deployment had before the upgrade; once
+    /// the state has a file of its own, that is the answer.
+    #[test]
+    fn the_new_state_file_wins_over_the_legacy_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("state.toml"),
+            "[auth.clients.alice]\nfailed_attempts = 3\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config.state.toml"),
+            "[auth.clients.alice]\nfailed_attempts = 1\n",
+        )
+        .unwrap();
+
+        let state = load(&state_path_in(dir.path())).expect("the state file reads");
+
+        assert_eq!(state.clients["alice"].failed_attempts, 1);
+    }
+
+    /// The state is written to the file named after the configuration, and the
+    /// legacy file is left alone.
+    ///
+    /// Another configuration in the same directory may still be counting on
+    /// the legacy file, and taking it away could take a lockout away from a
+    /// server that has not migrated yet.
+    #[test]
+    fn the_state_is_written_to_the_file_named_after_the_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("state.toml");
+        std::fs::write(&legacy, "[auth.clients.alice]\nfailed_attempts = 3\n").unwrap();
+
+        let state_path = state_path_in(dir.path());
+
+        let mut config = AuthConfig::default();
+        config
+            .clients
+            .insert("alice".to_string(), client(1, None, None));
+
+        save(&state_path, &snapshot(&config)).expect("the write succeeds");
+
+        let on_disk = std::fs::read_to_string(&state_path).unwrap();
+        assert!(on_disk.contains("failed_attempts = 1"), "{on_disk}");
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            "[auth.clients.alice]\nfailed_attempts = 3\n",
+            "the legacy file is left as it was"
+        );
     }
 
     #[test]

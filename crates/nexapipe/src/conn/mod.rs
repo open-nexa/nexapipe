@@ -421,16 +421,23 @@ pub async fn handle_connection(
                 // Cloned per stream rather than shared, because the task owns
                 // everything it reads.
                 let who_clone = identity.clone();
-                // One id per request, and one span wrapping it. Both are made
-                // here rather than inside the handler: `method`, `uri` and
-                // `status` are not known until the head has been read, and a
-                // span opened after that would not cover the part where the
-                // request is routed and admitted. The handler fills them in on
-                // `Span::current()` as it learns them.
-                let request_id = crate::log::next_request_id();
+                // One id and one span per **stream**.
+                //
+                // A stream is not a request: the L4 tunnel and the TLS
+                // session carry a flow, and the flow is what this id and this
+                // span describe. The L4 path fills `method`, `uri` and
+                // `status` in on `Span::current()` as it learns them.
+                //
+                // **The request path does not use this id.** Hyper serves
+                // keep-alive requests on one stream, so one stream may carry
+                // several requests, and an id minted here would be the id of
+                // every one of them. The request path mints an id per request
+                // instead — see `http::server::serve`, which does it in the
+                // service closure hyper calls once per request.
+                let stream_id = crate::log::next_request_id();
                 let span = tracing::info_span!(
-                    "request",
-                    id = %request_id,
+                    "stream",
+                    id = %stream_id,
                     method = tracing::field::Empty,
                     uri = tracing::field::Empty,
                     status = tracing::field::Empty,
@@ -449,7 +456,7 @@ pub async fn handle_connection(
                         &limiter_clone,
                         &peer_clone,
                         acl_clone,
-                        &request_id,
+                        &stream_id,
                         who_clone,
                         protocol,
                     )
