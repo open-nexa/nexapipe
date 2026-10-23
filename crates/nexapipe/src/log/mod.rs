@@ -13,8 +13,8 @@
 //!
 //! It is three things, and they are three files:
 //!
-//! - [`sink`] — the file a line is written to, and how it rolls over.
-//! - [`access`] — the access line, what it says, and what is redacted from it.
+//! - `sink` — the file a line is written to, and how it rolls over.
+//! - `access` — the access line, what it says, and what is redacted from it.
 //! - this one — the layers the program installs, and the settings they read.
 
 mod access;
