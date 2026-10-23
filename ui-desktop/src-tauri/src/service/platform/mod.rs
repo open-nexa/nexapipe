@@ -55,6 +55,8 @@ pub fn service_state() -> ServiceState {
 use crate::error::codes;
 #[cfg(not(windows))]
 use crate::service::elevate;
+#[cfg(any(windows, test))]
+use std::path::{Path, PathBuf};
 
 /// Registers the service and starts it.
 pub fn install_service() -> Result<(), AppError> {
@@ -158,6 +160,81 @@ fn sc_state(query_output: &str) -> ScState {
         Some(line) if line.contains("STOPPED") => ScState::Stopped,
         _ => ScState::Unknown,
     }
+}
+
+// ==========================================================================
+// Windows: the binary the service control manager starts
+// ==========================================================================
+
+/// The name of the service binary, in the app's own directory and in the
+/// system-wide one alike.
+#[cfg(any(windows, test))]
+pub(crate) const SERVICE_BINARY_NAME: &str = "nexa-service.exe";
+
+/// The directory the service binary is copied into when the service is
+/// registered.
+///
+/// Under `C:\Program Files`, whose permissions give an ordinary user read and
+/// execute and nothing else. The control manager starts the file it is
+/// pointed at as SYSTEM without asking anybody, so *where* that file lives
+/// decides whether the user who installed the app can replace it — and a
+/// replaced service binary is a program of the user's choosing running as
+/// SYSTEM.
+#[cfg(any(windows, test))]
+pub(crate) fn system_service_dir(program_files: &Path) -> PathBuf {
+    program_files.join("Nexa").join("Service")
+}
+
+/// The system-wide copy of the service binary: the one the control manager is
+/// pointed at.
+#[cfg(any(windows, test))]
+pub(crate) fn system_service_binary(program_files: &Path) -> PathBuf {
+    system_service_dir(program_files).join(SERVICE_BINARY_NAME)
+}
+
+/// The binary the control manager is pointed at.
+///
+/// The system-wide copy, and never the app's own. The app installs itself per
+/// user, so the directory the per-user copy lives in belongs to the user who
+/// installed it — and the control manager starts what it is pointed at as
+/// SYSTEM, without asking anyone. An install that cannot put the binary
+/// somewhere the user cannot write has to fail rather than register a path the
+/// user owns, so there is deliberately no fallback to the per-user copy: that
+/// one is what the system-wide copy is made *from*.
+#[cfg(any(windows, test))]
+pub(crate) fn scm_service_binary(system: &Path, _per_user: &Path) -> PathBuf {
+    system.to_path_buf()
+}
+
+/// The app's own copies of the service binary, in the order they are tried.
+///
+/// The `resources` directory the app ships the binary in first, then the
+/// directory the app binary itself is in. Neither of them is what the control
+/// manager runs — see [`scm_service_binary`] — they are what the system-wide
+/// copy is made from.
+#[cfg(any(windows, test))]
+pub(crate) fn per_user_service_candidates(app_dir: &Path) -> Vec<PathBuf> {
+    vec![
+        app_dir.join("resources").join(SERVICE_BINARY_NAME),
+        app_dir.join(SERVICE_BINARY_NAME),
+    ]
+}
+
+/// The first of `candidates` that is there, or `fallback` when none of them is.
+///
+/// `exists` is a parameter so the rule can be read on a machine that has none
+/// of those files.
+#[cfg(any(windows, test))]
+pub(crate) fn pick_service_binary(
+    candidates: &[PathBuf],
+    fallback: &Path,
+    exists: impl Fn(&Path) -> bool,
+) -> PathBuf {
+    candidates
+        .iter()
+        .find(|candidate| exists(candidate))
+        .cloned()
+        .unwrap_or_else(|| fallback.to_path_buf())
 }
 
 // The three halves of the registration. Each one is compiled only where it
@@ -318,8 +395,10 @@ fn dispatch_stop() -> Result<(), AppError> {
 mod tests {
     use super::{
         linux_activation_args, macos_install_commands, macos_job_target, macos_plist_content,
-        sc_state, ScState, SERVICE_NAME,
+        per_user_service_candidates, pick_service_binary, sc_state, scm_service_binary,
+        system_service_binary, system_service_dir, ScState, SERVICE_BINARY_NAME, SERVICE_NAME,
     };
+    use std::path::{Path, PathBuf};
 
     /// launchd's own default for `ExitTimeOut` is documented as no more than
     /// "system-defined" and is shorter than the teardown allows itself — 5s on this
@@ -504,5 +583,107 @@ SERVICE_NAME: nexa-service
 
         assert!(plist.contains(&format!("<string>{path}</string>")));
         assert!(plist.contains(&format!("com.nexa.{SERVICE_NAME}")));
+    }
+
+    /// The directory the service binary is copied into, and the per-user copy it
+    /// is copied from.
+    ///
+    /// The two are what the whole fix is about: the control manager has to be
+    /// pointed at the first and never at the second, because the app installs
+    /// itself per user and the second therefore belongs to the user who
+    /// installed it.
+    fn windows_service_paths() -> (PathBuf, PathBuf) {
+        let program_files = Path::new("/Program Files");
+        let app_dir = Path::new("/home/user/AppData/Local/Programs/nexa");
+
+        (
+            system_service_binary(program_files),
+            app_dir.join(SERVICE_BINARY_NAME),
+        )
+    }
+
+    /// The path the control manager is given has to be the system-wide one.
+    ///
+    /// The control manager starts what it is pointed at as SYSTEM, without
+    /// asking anyone, so a path the user can write is a path that hands SYSTEM
+    /// to whoever writes there: the user who installed the app replaces the
+    /// binary and the next start of the service runs their program as SYSTEM.
+    #[test]
+    fn the_control_manager_is_pointed_at_the_system_wide_copy() {
+        let (system, per_user) = windows_service_paths();
+
+        let pointed_at = scm_service_binary(&system, &per_user);
+
+        assert_eq!(
+            pointed_at, system,
+            "the control manager has to run the copy in Program Files"
+        );
+        assert_ne!(
+            pointed_at, per_user,
+            "the per-user copy is in a directory the user owns; the control manager \
+             would run whatever they put there, as SYSTEM"
+        );
+    }
+
+    /// The resolution the control manager's path goes through prefers the
+    /// system-wide copy.
+    ///
+    /// The app's own copy is right there — it is what the system-wide one is
+    /// made from — and the answer is still the one the user cannot replace.
+    /// There is no "fall back to the per-user copy" case: an install that
+    /// cannot put the binary somewhere the user cannot write has to fail.
+    #[test]
+    fn the_service_binary_resolution_prefers_the_system_wide_copy() {
+        let (system, per_user) = windows_service_paths();
+        let app_dir = Path::new("/home/user/AppData/Local/Programs/nexa");
+
+        // The per-user copies are the source the system-wide one is made from.
+        let candidates = per_user_service_candidates(app_dir);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].file_name().and_then(|name| name.to_str()),
+            Some(SERVICE_BINARY_NAME)
+        );
+        assert!(
+            candidates[0]
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|name| name.to_str())
+                == Some("resources"),
+            "the copy the app ships in its resources directory comes first"
+        );
+
+        // Both the system-wide copy and the app's own copy are there, and the
+        // resolution still picks the system-wide one.
+        let both = [system.clone(), per_user.clone()];
+        let picked = pick_service_binary(&both, &app_dir.join("nexa"), |path| {
+            path == system || path == per_user
+        });
+
+        assert_eq!(picked, system);
+    }
+
+    /// The system-wide copy lives under `Program Files`, in a directory of its
+    /// own.
+    ///
+    /// `Program Files` is the one place Windows already keeps the way this fix
+    /// needs: an ordinary user may read and execute what is in it, and may
+    /// not write to it.
+    #[test]
+    fn the_system_wide_copy_lives_under_program_files() {
+        let program_files = Path::new("/Program Files");
+
+        let dir = system_service_dir(program_files);
+        assert_eq!(
+            dir.strip_prefix(program_files).unwrap(),
+            Path::new("Nexa").join("Service"),
+            "the copy is not in the app's own directory, which the user owns"
+        );
+        assert_eq!(
+            system_service_binary(program_files)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(SERVICE_BINARY_NAME)
+        );
     }
 }

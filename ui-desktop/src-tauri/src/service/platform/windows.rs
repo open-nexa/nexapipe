@@ -10,12 +10,42 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use super::{sc_state, ScState, ServiceState, SERVICE_DISPLAY_NAME, SERVICE_NAME};
+use super::{
+    per_user_service_candidates, pick_service_binary, sc_state, scm_service_binary,
+    system_service_binary, system_service_dir, ScState, ServiceState, SERVICE_DISPLAY_NAME,
+    SERVICE_NAME,
+};
 use crate::error::{codes, AppError};
 
 /// Text `services.msc` shows for the entry.
 const SERVICE_DESCRIPTION: &str =
     "Runs the nexa proxy (TUN mode) without a signed-in desktop session.";
+
+/// The permissions the system-wide directory is given.
+///
+/// SYSTEM and the administrators may write; an ordinary user may only read
+/// and execute. `Program Files` already says that much, but the directory is
+/// given it explicitly so that the answer does not depend on how the machine
+/// happens to be configured.
+///
+/// Spelled with SIDs rather than with account names, because those are
+/// localized: "Administrators" is "Administrateurs" on a French Windows, and
+/// a command naming an account that does not exist is a command that fails.
+/// `*S-1-5-18` is SYSTEM, `*S-1-5-32-544` the administrators and
+/// `*S-1-5-32-545` the ordinary users.
+///
+/// Each permission is quoted: the parentheses in it are part of the
+/// permission and not part of the command, and `cmd.exe` reads an unquoted
+/// one as the start of a command block.
+const DIRECTORY_ACL: &str = "/inheritance:r /grant:r \"*S-1-5-18:(OI)(CI)F\" \
+                            \"*S-1-5-32-544:(OI)(CI)F\" \"*S-1-5-32-545:(OI)(CI)RX\"";
+
+/// The permissions the system-wide copy of the service binary is given.
+///
+/// The same, without the inheritance flags: a file is a file, and it gets its
+/// own so that nothing about the copy it was made from travels with it.
+const FILE_ACL: &str =
+    "/inheritance:r /grant:r \"*S-1-5-18:F\" \"*S-1-5-32-544:F\" \"*S-1-5-32-545:RX\"";
 
 /// The helpers are console tools; the UAC consent dialog is drawn by Windows and shows
 /// regardless of this flag.
@@ -69,7 +99,24 @@ enum Escalation {
 }
 
 pub fn install() -> Result<(), AppError> {
-    let bin_path = bin_path_value(&service_binary()?);
+    let exe = std::env::current_exe().map_err(|e| AppError::cause(codes::SERVICE_EXE_PATH, e))?;
+    let app_dir = exe
+        .parent()
+        .ok_or_else(|| AppError::new(codes::SERVICE_EXE_PATH))?
+        .to_path_buf();
+
+    // The copy that is made is the app's own, and the control manager is
+    // pointed at the system-wide copy it becomes. The app's own directory is
+    // the user's to write — the app installs itself per user — and the
+    // control manager runs what it is pointed at as SYSTEM, without asking
+    // anyone, so that directory is the one place the service binary may not
+    // come from.
+    let source = service_binary(&app_dir, &exe);
+    let program_files = program_files()?;
+    let dir = system_service_dir(&program_files);
+    let system = system_service_binary(&program_files);
+    let bin_path =
+        bin_path_value(&scm_service_binary(&system, Path::new(&source)).to_string_lossy());
 
     // Whatever is already running has to go first — see [`stop_if_running`]. Done before
     // the binary is re-pointed, because the process is what keeps the old build alive.
@@ -84,6 +131,20 @@ pub fn install() -> Result<(), AppError> {
         |log| {
             let redirect = format!("> \"{}\" 2>&1", log.display());
             vec![
+                // The system-wide copy is made before the entry exists, and the
+                // entry is only pointed at it once it is there. A copy that
+                // cannot be made, or a directory whose permissions cannot be
+                // locked down, stops the install here — a service that cannot
+                // be installed safely is better than one that hands SYSTEM to
+                // whoever can write the directory.
+                format!("mkdir \"{}\"", dir.display()),
+                format!("if not exist \"{}\" exit /b 1", dir.display()),
+                format!("icacls \"{}\" {DIRECTORY_ACL}", dir.display()),
+                "if errorlevel 1 exit /b %errorlevel%".to_string(),
+                format!("copy /y \"{source}\" \"{}\"", system.display()),
+                "if errorlevel 1 exit /b %errorlevel%".to_string(),
+                format!("icacls \"{}\" {FILE_ACL}", system.display()),
+                "if errorlevel 1 exit /b %errorlevel%".to_string(),
                 format!("sc.exe query {SERVICE_NAME} >nul 2>&1"),
                 format!(
                     "if errorlevel 1 (sc.exe create {SERVICE_NAME} binPath= \"{bin_path}\" start= auto DisplayName= \"{SERVICE_DISPLAY_NAME}\" {redirect}) else (sc.exe config {SERVICE_NAME} binPath= \"{bin_path}\" start= auto {redirect})"
@@ -134,8 +195,14 @@ fn stop_if_running() -> Result<(), AppError> {
 }
 
 pub fn uninstall() -> Result<(), AppError> {
+    let program_files = program_files()?;
+    let dir = system_service_dir(&program_files);
+    let system = system_service_binary(&program_files);
+
     if !service_exists() {
-        return Ok(());
+        // Nothing is registered, but the system-wide copy may still be there:
+        // it is what the entry pointed at, and it is not the user's to keep.
+        return remove_system_copy(&dir, &system);
     }
 
     // Stopped, and confirmed stopped, before it is deleted. `sc delete` would stop
@@ -182,6 +249,38 @@ pub fn uninstall() -> Result<(), AppError> {
         )
     })
     .and_then(|()| verify_absent())
+    // The entry is gone, so nothing is running the file any more and it can
+    // be taken off the disk.
+    .and_then(|()| remove_system_copy(&dir, &system))
+}
+
+/// Removes the system-wide copy of the service binary, and the directory it
+/// is in.
+///
+/// The entry is gone by the time this runs, so nothing holds the file open.
+/// The directory is only removed when it is empty: anything else in it
+/// belongs to somebody else, and leaving it behind is harmless.
+fn remove_system_copy(dir: &Path, binary: &Path) -> Result<(), AppError> {
+    if !binary.exists() {
+        return Ok(());
+    }
+
+    run(
+        |_| {
+            vec![
+                format!("del /f /q \"{}\"", binary.display()),
+                // The file is still there when the delete did not work, and a
+                // file the control manager could be pointed at is worth
+                // reporting rather than leaving behind.
+                format!("if exist \"{}\" exit /b 1", binary.display()),
+                format!("if exist \"{}\" rmdir \"{}\"", dir.display(), dir.display()),
+                "exit /b 0".to_string(),
+            ]
+        },
+        "service uninstall (remove the system copy)",
+        Escalation::Always,
+        codes::SERVICE_UNINSTALL_FAILED,
+    )
 }
 
 pub fn start() -> Result<(), AppError> {
@@ -388,8 +487,7 @@ fn with_logging(lines: &[String], log: &Path) -> String {
     let mut script = String::from("@echo off\r\n");
 
     for line in lines {
-        let complete =
-            line.starts_with("if ") || line == "exit /b %errorlevel%" || line.contains('>');
+        let complete = line.starts_with("if ") || line.starts_with("exit ") || line.contains('>');
 
         if complete {
             script.push_str(line);
@@ -571,27 +669,40 @@ fn detail_of(output: &Output) -> String {
     }
 }
 
-/// The binary the service control manager should start: the `nexa-service` executable bundled
-/// with the app, falling back to this binary — a development build has no bundle, and the
-/// desktop binary understands `--service` too.
-fn service_binary() -> Result<String, AppError> {
-    let exe = std::env::current_exe().map_err(|e| AppError::cause(codes::SERVICE_EXE_PATH, e))?;
-    let dir = exe
-        .parent()
-        .ok_or_else(|| AppError::new(codes::SERVICE_EXE_PATH))?;
+/// The binary the system-wide copy is made from: the `nexa-service` executable bundled with the
+/// app, falling back to this binary — a development build has no bundle, and the desktop binary
+/// understands `--service` too.
+///
+/// This is the *source* of the copy, not what the control manager runs: the app's own directory
+/// is the user's to write, and the control manager starts what it is pointed at as SYSTEM. See
+/// [`scm_service_binary`].
+fn service_binary(app_dir: &Path, exe: &Path) -> String {
+    let candidates = per_user_service_candidates(app_dir);
 
-    let candidates = [
-        dir.join("resources").join("nexa-service.exe"),
-        dir.join("nexa-service.exe"),
-    ];
+    let found = pick_service_binary(&candidates, exe, |path| path.is_file());
 
-    let found = candidates
-        .iter()
-        .find(|path| path.is_file())
-        .cloned()
-        .unwrap_or_else(|| exe.clone());
+    found.to_string_lossy().to_string()
+}
 
-    Ok(found.to_string_lossy().to_string())
+/// The system-wide directory the service binary is copied into.
+///
+/// `ProgramW6432` first: it is the 64-bit `Program Files` even for a 32-bit
+/// process, whose own `ProgramFiles` is redirected to `Program Files (x86)`.
+/// A 64-bit process has no `ProgramW6432`, and its `ProgramFiles` is already
+/// the right one.
+fn program_files() -> Result<PathBuf, AppError> {
+    for name in ["ProgramW6432", "ProgramFiles"] {
+        if let Ok(dir) = std::env::var(name) {
+            if !dir.trim().is_empty() {
+                return Ok(PathBuf::from(dir));
+            }
+        }
+    }
+
+    Err(AppError::with_detail(
+        codes::SERVICE_EXE_PATH,
+        "ProgramFiles is not set",
+    ))
 }
 
 fn service_exists() -> bool {
