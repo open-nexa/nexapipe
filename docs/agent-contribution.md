@@ -130,8 +130,8 @@ the wire format only in `crates/nexapipe-proto/` — never by hand on one side.
 New behaviour arrives with a test. Comments, log lines, commit messages and PR
 descriptions are English, always.
 
-Scratch plans, patches and notes go to `.workbuddy/` (git-ignored), never into
-the repository tree.
+Scratch plans, patches and notes stay in the conversation, never in the
+repository tree.
 
 ### 5. Verify before claiming anything
 
@@ -191,7 +191,7 @@ git commit -m "fix(local-proxy): handle CONNECT tunnel close"
 
 The subject says what changed and in which component; the body says why, and
 what was verified. Two unrelated fixes are two commits — or two PRs. No secrets,
-no generated artifacts, no `.workbuddy/` scratch files.
+no generated artifacts, no scratch files.
 
 ### 7. Push, then describe and open
 

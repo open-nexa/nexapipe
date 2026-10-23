@@ -10,9 +10,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(r"C:\Users\eason\rust\nexapipe\ui-desktop")
-NODE = r"C:\Users\eason\.workbuddy\binaries\node\versions\22.22.2-3\node.exe"
-if not Path(NODE).exists():
-    NODE = r"C:\Program Files\nodejs\node.exe"
+NODE = shutil.which("node") or r"C:\Program Files\nodejs\node.exe"
 
 failures = []
 
