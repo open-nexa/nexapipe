@@ -46,7 +46,7 @@ use crate::http::client::BackendClients;
 use crate::http::client::BoxError;
 use crate::http::forward::Answer;
 use crate::http::response::BodyError;
-use crate::hyper_io::IrohIo;
+
 use crate::routes::{BackendInfo, BackendLookup, RoutingTable};
 
 /// The largest request head hyper will buffer.
@@ -81,12 +81,19 @@ pub struct Context {
 /// The stream is handed to hyper whole: hyper reads the head, hands the
 /// service a request, and writes the answer the service returns. Nothing is
 /// read out of the stream and put back.
+///
+/// `prefix` holds the bytes that were already read off the stream — the first
+/// byte of a connection that did not say what it carries. They are handed back
+/// before the rest, so hyper reads the head from the beginning.
 pub async fn serve(
     send: iroh::endpoint::SendStream,
     recv: iroh::endpoint::RecvStream,
+    prefix: Vec<u8>,
+    head_timeout: Duration,
     ctx: Arc<Context>,
 ) -> anyhow::Result<()> {
-    let io = IrohIo::new(send, recv);
+    let io =
+        crate::hyper_io::IrohIo::reading_through(send, crate::hyper_io::Replay::new(prefix, recv));
     let service_ctx = ctx.clone();
     let service = service_fn(move |req| handle(req, service_ctx.clone()));
 
@@ -97,7 +104,7 @@ pub async fn serve(
         // stream and sends nothing must not hold the slot forever. The same
         // bound the hand-written reader applied, and hyper applies it to the
         // head rather than to every read.
-        .header_read_timeout(ctx.config.timeouts().deadlines.header)
+        .header_read_timeout(head_timeout)
         // A head over this is not a request.
         .max_buf_size(MAX_HEAD)
         // The client finishes its half of the stream once the request is out
@@ -142,6 +149,36 @@ async fn handle(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or(request.uri().path());
+
+    // **A request that names more than one host is refused here.**
+    //
+    // The route and the access check read the **first** `Host` header, and
+    // the backend would be handed **all** of them, so the host that was
+    // authorised and the host that would be served would be two different
+    // hosts. Hyper accepts two `Host` headers and passes them both on, and
+    // the plaintext listener has always caught this itself — so this path has
+    // to catch it too, or the same request is refused on one listener and
+    // served on the other.
+    //
+    // RFC 9110 §7.2 asks for a 400, and that is what this is.
+    if crate::http::names_more_than_one_host(request.headers()) {
+        tracing::warn!(
+            "Refusing a request from {} that carries more than one Host header",
+            ctx.peer
+        );
+        crate::metrics::METRICS.record_request(StatusCode::BAD_REQUEST.as_u16(), 0);
+        crate::log::log_access(
+            &ctx.request_id,
+            &ctx.peer,
+            request.method().as_str(),
+            request.uri().path(),
+            StatusCode::BAD_REQUEST.as_u16(),
+            0,
+            0,
+            Some(&ctx.who),
+        );
+        return Ok(refusal(StatusCode::BAD_REQUEST));
+    }
 
     // **The verdict comes before the body is read.** A request for a host no
     // route serves has nothing to forward to, and reading its body first is
@@ -210,10 +247,30 @@ async fn handle(
     let span = tracing::Span::current();
     crate::log::record_request_on_span(&span, method.as_ref(), &request_target);
 
-    // The body is hyper's own stream, with the accounting the hand-written
-    // path had: the bytes are charged to the process-wide budget as they
-    // arrive, and counted for the access log.
-    let body = IncomingBody::new(body, ctx.config.timeouts().deadlines.body);
+    // The body, in the shape the backend is sent it in.
+    let body = match read_request_body(request.headers(), body, ctx.config.timeouts()).await {
+        Ok(body) => body,
+        Err(failure) => {
+            // The request never went anywhere: there is no backend to blame
+            // and no answer to give but the refusal.
+            tracing::warn!("Could not read the request body: {}", failure.message);
+            crate::metrics::METRICS.record_request(failure.status.as_u16(), 0);
+            crate::log::log_access(
+                &ctx.request_id,
+                &ctx.peer,
+                method.as_str(),
+                &request_target,
+                failure.status.as_u16(),
+                started.elapsed().as_millis() as u64,
+                0,
+                Some(&ctx.who),
+            );
+            return Ok(crate::http::response::create_error_response(
+                failure.status,
+                failure.message,
+            ));
+        }
+    };
 
     match forward(
         &ctx,
@@ -223,7 +280,7 @@ async fn handle(
         host,
         path,
         backend_info,
-        body,
+        &body,
         started,
     )
     .await
@@ -343,7 +400,7 @@ async fn forward(
     host: Option<(&str, Option<u16>)>,
     path: &str,
     backend_info: BackendInfo,
-    body: IncomingBody,
+    body: &RequestBody,
     started: std::time::Instant,
 ) -> Result<Answer, crate::http::body::ProxyFailure> {
     let attempts = ctx.config.retry().attempts;
@@ -361,7 +418,7 @@ async fn forward(
             ctx.config.timeouts(),
             request,
             &backend,
-            &body,
+            body,
             &ctx.request_id,
         )
         .await;
@@ -464,6 +521,151 @@ fn head_size(request: &Request<()>) -> usize {
         size += name.as_str().len() + value.as_bytes().len() + ": \r\n".len();
     }
     size + "\r\n".len()
+}
+
+/// The body of a request, in the shape the backend is sent it in.
+///
+/// Two shapes, and the difference is what the backend is told:
+///
+/// - **Whole**: the bytes are here, so the backend is sent them with a
+///   length of its own. A body that declared no length is this one: it
+///   arrives framed, and the framing was the client's — so the proxy
+///   re-frames it, because a backend that only knows `content-length`
+///   cannot read a chunked request. Reading it whole is also what bounds
+///   it.
+/// - **Streaming**: the bytes are still on the client's stream, and they are
+///   read as the backend asks for them. A body that declared a length is
+///   this one: the length is known, so the upload never has to be held, and
+///   the backend can start on the first byte.
+pub enum RequestBody {
+    /// The bytes are here, and they can be sent again.
+    Whole {
+        bytes: bytes::Bytes,
+        /// What the process budget holds for them.
+        reservation: crate::conn::limits::ByteReservation,
+    },
+    /// Still on the client's stream.
+    Streaming(IncomingBody),
+}
+
+impl RequestBody {
+    /// Whether the request may be tried again.
+    ///
+    /// A body that is here can be sent again; one that is still on the
+    /// client's stream can, as long as it has not been read — a body that
+    /// has been read is gone, and there is no second copy of it.
+    pub fn may_retry(&self) -> bool {
+        match self {
+            RequestBody::Whole { .. } => true,
+            RequestBody::Streaming(body) => body.may_retry(),
+        }
+    }
+
+    /// Whether the body's deadline expired while it was being read.
+    pub fn did_time_out(&self) -> bool {
+        match self {
+            RequestBody::Whole { .. } => false,
+            RequestBody::Streaming(body) => body.did_time_out(),
+        }
+    }
+
+    /// Whether the body is over: everything the client promised has been
+    /// read, or the client stopped sending.
+    pub fn has_been_sent(&self) -> bool {
+        match self {
+            RequestBody::Whole { .. } => true,
+            RequestBody::Streaming(body) => body.has_been_sent(),
+        }
+    }
+}
+
+/// A request body that could not be read.
+///
+/// The client is answered and the reason is logged. The body never reached a
+/// backend, so the answer is about the request — not about a backend that
+/// could not be blamed for it.
+pub struct BodyFailure {
+    /// The status the client is answered with.
+    pub status: StatusCode,
+    /// The body of the answer.
+    pub message: &'static str,
+    /// Why it failed, for the log.
+    pub reason: String,
+}
+
+/// Reads the body of a request, in the shape the backend is sent it in.
+///
+/// The client's own declaration decides the shape, and it is the same
+/// decision the hand-written path made:
+///
+/// - A body that **declares a length** is streamed. The bytes are still on
+///   the client's side, and the backend reads them as it asks for them, so an
+///   upload of any size costs a buffer rather than a copy of the upload. The
+///   length is checked against the limit **before** a byte of it is read: it
+///   is the size of the body this is about to carry.
+/// - A body that **declares no length** arrives framed, and the framing was
+///   the client's — so the proxy re-frames it. The bytes are read whole and
+///   the backend is sent them with a length of its own, because a backend
+///   that only knows `content-length` cannot read a chunked request. Reading
+///   it whole is also what bounds it.
+async fn read_request_body(
+    headers: &::http::HeaderMap,
+    body: Incoming,
+    timeouts: crate::config::Timeouts,
+) -> Result<RequestBody, BodyFailure> {
+    let declared = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok());
+
+    match declared {
+        Some(length) => {
+            if length > crate::http::body::MAX_REQUEST_BODY {
+                return Err(BodyFailure {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    message: "413 Payload Too Large",
+                    reason: format!(
+                        "a request body of {length} bytes is over the {} byte limit",
+                        crate::http::body::MAX_REQUEST_BODY
+                    ),
+                });
+            }
+            Ok(RequestBody::Streaming(IncomingBody::new(
+                body,
+                timeouts.deadlines.body,
+            )))
+        }
+
+        None => {
+            match crate::http::body::read_body_limited(
+                body,
+                crate::http::body::MAX_REQUEST_BODY,
+                timeouts.deadlines.body,
+            )
+            .await
+            {
+                Ok((bytes, reservation)) => Ok(RequestBody::Whole { bytes, reservation }),
+                Err(e) => {
+                    let (status, message) = match &e {
+                        crate::http::body::BodyReadError::TooLarge { .. } => {
+                            (StatusCode::PAYLOAD_TOO_LARGE, "413 Payload Too Large")
+                        }
+                        crate::http::body::BodyReadError::TimedOut { .. } => {
+                            (StatusCode::REQUEST_TIMEOUT, "408 Request Timeout")
+                        }
+                        crate::http::body::BodyReadError::Failed(_) => {
+                            (StatusCode::BAD_REQUEST, "400 Bad Request")
+                        }
+                    };
+                    Err(BodyFailure {
+                        status,
+                        message,
+                        reason: e.to_string(),
+                    })
+                }
+            }
+        }
+    }
 }
 
 /// The body of a request whose head hyper read.

@@ -171,6 +171,47 @@ impl hyper::body::Body for LeasedBody {
     }
 }
 
+/// Why a request body could not be read.
+///
+/// The three cases are three different answers: a body that is over the limit
+/// is too big, a body that ran out of time is late, and a body that could not
+/// be read at all is broken. A caller that answers the client says which.
+#[derive(Debug)]
+pub enum BodyReadError {
+    /// The body is over the limit.
+    TooLarge { limit: usize },
+    /// The body did not finish in time.
+    TimedOut { deadline: std::time::Duration },
+    /// The body could not be read.
+    Failed(anyhow::Error),
+}
+
+impl std::fmt::Display for BodyReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BodyReadError::TooLarge { limit } => {
+                write!(f, "request body is over the {limit} byte limit")
+            }
+            BodyReadError::TimedOut { deadline } => {
+                write!(
+                    f,
+                    "request body did not finish within {}s",
+                    deadline.as_secs()
+                )
+            }
+            BodyReadError::Failed(e) => write!(f, "failed to read the request body: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for BodyReadError {}
+
+impl From<anyhow::Error> for BodyReadError {
+    fn from(e: anyhow::Error) -> Self {
+        BodyReadError::Failed(e)
+    }
+}
+
 /// Reads a request body whole, refusing one past `limit` or past what the
 /// process can hold at once.
 ///
@@ -189,7 +230,7 @@ pub(super) async fn read_body_limited<B>(
     body: B,
     limit: usize,
     body_deadline: std::time::Duration,
-) -> anyhow::Result<(bytes::Bytes, crate::conn::limits::ByteReservation)>
+) -> Result<(bytes::Bytes, crate::conn::limits::ByteReservation), BodyReadError>
 where
     B: hyper::body::Body<Data = bytes::Bytes> + Unpin,
     B::Error: std::fmt::Display,
@@ -215,21 +256,20 @@ where
                 Ok(Some(frame)) => frame,
                 Ok(None) => break,
                 Err(_) => {
-                    return Err(anyhow::anyhow!(
-                        "request body did not finish within {}s",
-                        body_deadline.as_secs()
-                    ));
+                    return Err(BodyReadError::TimedOut {
+                        deadline: body_deadline,
+                    });
                 }
             };
-        let frame = frame.map_err(|e| anyhow::anyhow!("failed to read the request body: {}", e))?;
+        let frame = frame.map_err(|e| {
+            BodyReadError::Failed(anyhow::anyhow!("failed to read the request body: {}", e))
+        })?;
         // Anything that is not a data frame — trailers — carries no body bytes.
         let Ok(data) = frame.into_data() else {
             continue;
         };
         if bytes.len() + data.len() > limit {
-            return Err(anyhow::anyhow!(
-                "request body is over the {limit} byte limit"
-            ));
+            return Err(BodyReadError::TooLarge { limit });
         }
         reservation.grow(data.len())?;
         bytes.extend_from_slice(&data);

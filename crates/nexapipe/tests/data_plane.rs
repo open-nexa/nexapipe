@@ -1698,6 +1698,72 @@ async fn a_request_with_more_than_one_host_is_refused() {
     );
 }
 
+/// **The first byte of a request is part of the request.**
+///
+/// The old ALPN does not say what a stream carries, so the server reads the
+/// first byte to find out. When it turns out to be a request, that byte is
+/// part of the request — and the codec reads the head from the beginning, so
+/// a head that started one byte later would be a different request.
+///
+/// The byte is written on its own here, so the read that finds out what the
+/// stream carries is a read of one byte and nothing else, and the rest of
+/// the head arrives after it.
+#[tokio::test]
+async fn the_first_byte_of_a_request_is_part_of_the_request() {
+    let backend = spawn_backend("done").await;
+    let proxy = spawn_proxy(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial(proxy.addr).await;
+
+    let reply = tunnel
+        .exchange_split(&[b"G", b"ET / HTTP/1.1\r\nHost: app.test\r\n\r\n"])
+        .await;
+
+    assert!(
+        status_of(&reply).starts_with("HTTP/1.1 200"),
+        "expected a 200, got {:?}",
+        status_of(&reply)
+    );
+
+    let seen = backend.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].request_line, "GET / HTTP/1.1",
+        "the request the backend saw is not the one the client sent"
+    );
+}
+
+/// A request that names more than one host is refused on the named protocol
+/// too.
+///
+/// The two listeners used to differ here: the plaintext one caught it, and
+/// the tunnel one did not — because the tunnel path parsed the head by hand
+/// and the parser was the one refusing it. With hyper's codec on both, the
+/// check is the proxy's own, and it is made in one place.
+#[tokio::test]
+async fn a_request_with_more_than_one_host_is_refused_on_the_named_protocol() {
+    use nexapipe_proto::protocol::ALPN_HTTP;
+
+    let backend = spawn_backend("never").await;
+    let proxy =
+        spawn_proxy_that_reads_the_protocol(vec![http_route("app.test", &backend.url)]).await;
+    let tunnel = Tunnel::dial_with_alpn(proxy.addr, ALPN_HTTP).await;
+
+    let reply = tunnel
+        .exchange(b"GET / HTTP/1.1\r\nHost: app.test\r\nHost: internal.test\r\n\r\n")
+        .await;
+
+    assert!(
+        status_of(&reply).contains("400"),
+        "a request with two hosts should be answered with 400, got {:?}",
+        status_of(&reply)
+    );
+    assert!(
+        backend.seen().is_empty(),
+        "a request that names two hosts must not reach a backend: the host that was \
+         authorised and the host that would be served are two different hosts"
+    );
+}
+
 /// A head that never finishes is dropped when its deadline passes.
 ///
 /// The head deadline is 30 s by default, so the proxy is given a short one

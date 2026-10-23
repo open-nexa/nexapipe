@@ -18,21 +18,42 @@ use std::task::{Context, Poll};
 
 use hyper::rt::{Read, ReadBufCursor, Write};
 use pin_project_lite::pin_project;
+use tokio::io::AsyncRead;
 
 /// An iroh bi-stream seen as hyper's IO.
-pub struct IrohIo {
+///
+/// The read half is generic because it is not always the bare stream: a
+/// connection that did not say what it carries has its first byte read to find
+/// out, and that byte belongs to the request — so it is handed back with
+/// [`Replay`], and the codec reads the head from the beginning.
+pub struct IrohIo<R = iroh::endpoint::RecvStream> {
     send: iroh::endpoint::SendStream,
-    recv: iroh::endpoint::RecvStream,
+    recv: R,
 }
 
-impl IrohIo {
+impl IrohIo<iroh::endpoint::RecvStream> {
     /// The two halves of one bi-stream.
     pub fn new(send: iroh::endpoint::SendStream, recv: iroh::endpoint::RecvStream) -> Self {
         IrohIo { send, recv }
     }
 }
 
-impl hyper::rt::Read for IrohIo {
+impl<R> IrohIo<R> {
+    /// The two halves of one bi-stream, read through something else.
+    pub fn reading_through(send: iroh::endpoint::SendStream, recv: R) -> Self {
+        IrohIo { send, recv }
+    }
+}
+
+// The read half is never pinned into: it is read through `Pin::new`, which
+// needs it to be `Unpin` on its own. So the adapter is `Unpin` whatever it
+// carries.
+impl<R> Unpin for IrohIo<R> {}
+
+impl<R> hyper::rt::Read for IrohIo<R>
+where
+    R: AsyncRead + Unpin,
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -69,7 +90,7 @@ impl hyper::rt::Read for IrohIo {
     }
 }
 
-impl hyper::rt::Write for IrohIo {
+impl<R> hyper::rt::Write for IrohIo<R> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -88,6 +109,64 @@ impl hyper::rt::Write for IrohIo {
 
     fn is_write_vectored(&self) -> bool {
         false
+    }
+}
+
+/// A stream that hands back the bytes that were already read, and then the rest.
+///
+/// The first byte of a tunnel stream says what the stream carries, so it has
+/// to be read before anything else can be done with it. If it turns out to be
+/// a request, that byte is **part of the request**: the codec reads the head
+/// from the beginning, and a head that starts one byte later is a different
+/// request. So the bytes are given back first, unchanged, and the stream
+/// itself is read from where it was.
+pub struct Replay<R> {
+    /// The bytes that are given back first.
+    prefix: Vec<u8>,
+    /// How much of the prefix has been given back.
+    given: usize,
+    /// The stream itself.
+    inner: R,
+}
+
+impl<R> Replay<R> {
+    /// The bytes to hand back, and the stream they came from.
+    pub fn new(prefix: Vec<u8>, inner: R) -> Self {
+        Replay {
+            prefix,
+            given: 0,
+            inner,
+        }
+    }
+}
+
+impl<R> AsyncRead for Replay<R>
+where
+    R: AsyncRead + Unpin,
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+
+        if this.given < this.prefix.len() {
+            let room = buf.remaining();
+            if room == 0 {
+                // The reader asked for no bytes at all. The prefix is still
+                // there, so this is not an end of stream — but there is
+                // nowhere to put it either, and a reader that asks for nothing
+                // has to ask again.
+                return Poll::Pending;
+            }
+            let take = room.min(this.prefix.len() - this.given);
+            buf.put_slice(&this.prefix[this.given..this.given + take]);
+            this.given += take;
+            return Poll::Ready(Ok(()));
+        }
+
+        Pin::new(&mut this.inner).poll_read(cx, buf)
     }
 }
 

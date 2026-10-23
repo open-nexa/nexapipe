@@ -811,7 +811,7 @@ pub async fn proxy_to_backend(
     timeouts: crate::config::Timeouts,
     req: &Request<()>,
     backend_info: &BackendInfo,
-    body: &crate::http::server::IncomingBody,
+    body: &crate::http::server::RequestBody,
     request_id: &str,
 ) -> Result<Answer, ProxyFailure> {
     let client = clients.for_protocol(backend_info.protocol);
@@ -949,21 +949,33 @@ pub async fn proxy_to_backend(
 ///
 /// The head is built the way the hand-written path built it — the backend's
 /// own origin, the rewritten path, the client's headers that may be forwarded
-/// — and the body is the one hyper read.
+/// — and the body is the one the client sent.
+///
+/// The length the proxy declares is the length of the body it carries, and
+/// that is the one the client's own header is replaced with:
+///
+/// - a body that is **here** is sent with a length of its own, because the
+///   bytes are the whole of it;
+/// - a body that is **still arriving** is sent with the length the client
+///   declared, because that length is the truth.
 fn build_backend_request_from(
     req: &Request<()>,
     backend_info: &BackendInfo,
-    body: &crate::http::server::IncomingBody,
+    body: &crate::http::server::RequestBody,
 ) -> Result<Request<HttpBody>, anyhow::Error> {
-    // The length the proxy declares: the client's own `content-length`, which
-    // hyper read the head for. It is the truth, and it is the one the client's
-    // header is replaced with.
-    let content_length = req
-        .headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<usize>().ok());
+    let (content_length, http_body) = match body {
+        crate::http::server::RequestBody::Whole { bytes, .. } => {
+            (Some(bytes.len()), full_body(bytes.clone()))
+        }
+        crate::http::server::RequestBody::Streaming(inner) => {
+            let length = req
+                .headers()
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<usize>().ok());
+            (length, UnsyncBoxBody::new(inner.lend()))
+        }
+    };
     let builder = backend_request_builder(req, backend_info, content_length)?;
-    let http_body = UnsyncBoxBody::new(body.lend());
     Ok(builder.body(http_body)?)
 }
