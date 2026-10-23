@@ -282,8 +282,8 @@ async fn resolve_backend(
 /// A backend that does not name a port gets the scheme's own, and a bare host
 /// gets the TLS port: the bytes are forwarded to a listener that terminates
 /// TLS, and `https://host` is the HTTPS port. The L4 path reads the same
-/// address and refuses that reading — see [`crate::backend_conn::PortDefault`]
-/// — but it reads it from the same parser.
+/// address from the same parser, but refuses the bare-host reading: a raw
+/// tunnel has no scheme to take a port from.
 ///
 /// Public because the config check uses it too: the route is dialled with this
 /// function, so validating with anything else is how a backend passes at
