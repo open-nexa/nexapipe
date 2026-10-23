@@ -480,8 +480,26 @@ impl WipingBuffer {
     }
 
     /// The bytes written, in a buffer that wipes itself.
-    fn into_wiped(self) -> Zeroizing<Vec<u8>> {
-        Zeroizing::new(self.bytes)
+    fn into_wiped(mut self) -> Zeroizing<Vec<u8>> {
+        // The buffer is taken rather than moved out of: a type with a `Drop`
+        // cannot have its fields moved out of it. The empty vector that takes
+        // its place is wiped by the `Drop` below, which is a no-op on an empty
+        // one.
+        Zeroizing::new(std::mem::take(&mut self.bytes))
+    }
+}
+
+/// The buffer wipes itself when it goes out of scope.
+///
+/// The writer is dropped when a serialization fails — the `?` in
+/// [`AuthMessage::to_bytes`] and [`AuthMessage::to_payload`] drops the buffer
+/// on the way out — and by then it may already hold the credential: a message
+/// that fails halfway through has written the token before it fails on the
+/// field behind it. Without this, the bytes of that credential go back to the
+/// allocator unwiped, which is the very thing the buffer exists to prevent.
+impl Drop for WipingBuffer {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
     }
 }
 
@@ -1422,6 +1440,38 @@ mod tests {
         assert!(
             clean,
             "the credential was still in a freed block of the heap"
+        );
+    }
+
+    /// The credential does not survive when the serialization fails either.
+    ///
+    /// A message can fail halfway through being written: the credential is
+    /// written first, and the field behind it can be one the wire format
+    /// cannot hold. The buffer is dropped on the way out of that failure, and
+    /// a buffer that is only wiped on the success path leaves the credential
+    /// in the heap — which is the one thing the buffer is here to prevent.
+    ///
+    /// The failure is forced with a device id too long for the wire format:
+    /// it is written after the token, and the length check fails on it.
+    #[test]
+    fn the_serialized_credential_does_not_survive_when_the_serialization_fails() {
+        let start = AuthMessage::EnrollStart {
+            client_id: "client-001".to_string(),
+            token: SecretString::new(heap::NEEDLE.to_string()),
+            device_id: Some("x".repeat(70_000)),
+            public_key: None,
+        };
+
+        let clean = heap::watched(|| {
+            let result = start.to_payload(Format::Binary);
+            assert!(result.is_err(), "the message is too long to be written");
+            drop(result);
+            drop(start);
+        });
+
+        assert!(
+            clean,
+            "the credential was still in a freed block of the heap after the serialization failed"
         );
     }
 
