@@ -448,6 +448,90 @@ async fn a_half_closed_client_still_receives_the_reply() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), runner).await;
 }
 
+/// A `ClientHello` that arrives in pieces is still a hello.
+///
+/// The record's length is in its first five bytes, so a hello whose first
+/// read carried fewer than five had nothing to measure — and the reading
+/// stopped there, because the loop that reads the rest was inside the
+/// check. The truncated hello was then parsed as if it were the whole one,
+/// which is a hello with no name in it, and the session was closed with no
+/// retry and no tunnel.
+///
+/// The stream here hands over three bytes and the rest a moment later, which
+/// is what a path that segments the first record does.
+#[tokio::test]
+async fn a_hello_that_arrives_in_pieces_is_still_proxied() {
+    use tokio::io::AsyncWriteExt;
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // The far side.
+    let server = Endpoint::builder(presets::N0)
+        .alpns(vec![TLS_ALPN.to_vec()])
+        .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap()
+        .bind()
+        .await
+        .expect("the far side binds");
+    let server_addr = server.addr();
+    tokio::spawn(serve_a_tunnel_that_reads_the_hello(server, seen.clone()));
+
+    // This side: an endpoint, a pool over it, and the group over that.
+    let client = Endpoint::builder(presets::N0)
+        .alpns(vec![TLS_ALPN.to_vec()])
+        .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .unwrap()
+        .bind()
+        .await
+        .expect("this side binds");
+    let pool = crate::IrohConnectionPool::new_with_endpoint(client, server_addr);
+    let endpoint_group = crate::endpoint_group::EndpointGroup::new_with_single_pool(pool).await;
+
+    // The hello, in two pieces: three bytes, and the rest a moment later.
+    let hello = hello_with_server_names(&[(0x00, HOST)]);
+    let (mut far, near) = tokio::io::duplex(4096);
+    let rest = hello[3..].to_vec();
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        far.write_all(&rest)
+            .await
+            .expect("the rest of the hello goes out");
+        // Held open: the tunnel's copy loop reads from this end.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    });
+
+    super::tls::handle_tls_tunnel(
+        near,
+        hello[..3].to_vec(),
+        vec![0u8; super::STREAM_BUF_SIZE],
+        Arc::new(endpoint_group),
+        Arc::new(vec![HOST.to_string()]),
+        None,
+    )
+    .await
+    .expect("the hello is proxied");
+
+    // The far side must see the whole hello: the client read the name out of
+    // it and forwarded all of it.
+    let forwarded = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let bytes = seen.lock().expect("the lock is not held").clone();
+            if bytes.len() >= hello.len() {
+                break bytes;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the hello never reached the far side");
+    assert_eq!(
+        forwarded, hello,
+        "the far side did not get the hello the client was given"
+    );
+
+    writer.abort();
+}
+
 /// The far side of a tunnel that records what the client forwards.
 ///
 /// The tunnel carries a preface and then the bytes, so the preface is read
