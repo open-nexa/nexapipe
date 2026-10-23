@@ -6,6 +6,11 @@ fn main() {
     // elevation prompt (UAC / polkit / sudo), so the service-management verbs have to be consumed
     // before Tauri would open a window — otherwise the elevated copy just shows the UI and the
     // operation never runs. See `service::cli`.
+    //
+    // The same is true of the single-instance guard, which belongs to the desktop UI and not to
+    // the service: the elevated copy leaves here, so a second launch of the service is never
+    // stopped by the desktop's guard. The service itself is a separate binary (`nexa-service`)
+    // that never builds an app at all.
     // `args_os` rather than `args`: the latter panics on a non-UTF-8 argument, and a launcher we
     // do not control decides what lands here.
     let mut args: Vec<String> = std::env::args_os()
