@@ -5,8 +5,8 @@ use crate::proxy::{
     ProxyNodeConfig, StartError,
 };
 use crate::service::ipc::{
-    IpcMessage, IpcResponse, IssuedCredentialPayload, NodeInput, BUILD_VERSION, IPC_SOCKET_PATH,
-    MAX_IPC_LINE,
+    IpcListener, IpcMessage, IpcResponse, IpcStream, IssuedCredentialPayload, NodeInput,
+    BUILD_VERSION, IPC_SOCKET_PATH, MAX_IPC_LINE,
 };
 use crate::service::platform::account::AccountId;
 use crate::status::{ActiveFlowPage, ProxyStatus, FLOW_PAGE_LIMIT};
@@ -16,7 +16,6 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::TcpListener;
 
 /// The failure the last start recorded after it had already answered `Ok`.
 ///
@@ -110,7 +109,7 @@ impl ServiceRunner {
         // Clean that up before anything here needs DNS.
         crate::proxy::dns_config::cleanup_stale_hijack();
 
-        let listener = TcpListener::bind(IPC_SOCKET_PATH)
+        let listener = IpcListener::bind()
             .await
             .context("Failed to bind IPC socket")?;
 
@@ -130,7 +129,7 @@ impl ServiceRunner {
         let installed_by = self.installed_by.clone();
 
         loop {
-            let (mut stream, _) = listener
+            let mut stream = listener
                 .accept()
                 .await
                 .context("Failed to accept connection")?;
@@ -220,6 +219,11 @@ impl ServiceRunner {
     /// *taken* out — the tunnel has to be torn down (the TUN adapter outlives this process) and no
     /// late status request may be answered with "running".
     pub async fn shutdown(&self) {
+        // The socket the desktop looks for goes with the service: a socket file
+        // nobody listens on is one the desktop spends a connection failing to
+        // reach.
+        crate::service::ipc::remove_socket();
+
         let manager = self.proxy_manager.write().await.take();
         if let Some(manager) = manager {
             tracing::info!("Stopping the proxy before exiting");
@@ -228,7 +232,7 @@ impl ServiceRunner {
     }
 
     async fn handle_client(
-        stream: &mut tokio::net::TcpStream,
+        stream: &mut IpcStream,
         proxy_manager: Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
         installed_by: Option<&AccountId>,
     ) -> Result<()> {
@@ -522,10 +526,7 @@ impl ServiceRunner {
         }
     }
 
-    async fn write_response(
-        stream: &mut tokio::net::TcpStream,
-        response: &IpcResponse,
-    ) -> Result<()> {
+    async fn write_response(stream: &mut IpcStream, response: &IpcResponse) -> Result<()> {
         // The channel is newline-delimited in both directions, so the terminator belongs to the
         // response as much as it does to a request. Without it `IpcClient::exchange` — which
         // reads a line — waits for a byte that never comes: the answer is already in its socket
@@ -1164,13 +1165,10 @@ mod tests {
         use std::sync::Arc;
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("an ephemeral loopback port");
-        let mut client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .expect("the client connects");
-        let (mut server, _) = listener.accept().await.expect("the service accepts");
+        // The transport the IPC really runs over, not a stand-in: the service
+        // and the desktop speak over a Unix-domain socket on Unix, and that is
+        // the socket whose peer the kernel can name.
+        let (mut client, mut server) = crate::service::ipc::connected_pair().await;
 
         let manager: Arc<tokio::sync::RwLock<Option<Arc<crate::proxy::ProxyManager>>>> =
             Arc::new(tokio::sync::RwLock::new(None));
@@ -1209,13 +1207,7 @@ mod tests {
     async fn a_response_ends_the_line_the_client_is_reading() {
         use crate::service::ipc::IpcResponse;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("an ephemeral loopback port");
-        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .expect("the client connects");
-        let (mut server, _) = listener.accept().await.expect("the service accepts");
+        let (client, mut server) = crate::service::ipc::connected_pair().await;
 
         ServiceRunner::write_response(&mut server, &IpcResponse::Ok)
             .await

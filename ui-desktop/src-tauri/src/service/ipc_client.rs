@@ -1,10 +1,9 @@
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::net::TcpStream;
 
 use crate::error::{codes, AppError};
 use crate::service::ipc::{
-    IpcMessage, IpcResponse, IssuedCredentialPayload, StartProxyRequest, IPC_SOCKET_PATH,
+    connect, IpcMessage, IpcResponse, IssuedCredentialPayload, StartProxyRequest, IPC_SOCKET_PATH,
 };
 use crate::status::{
     ActiveFlowPage, EndpointLink, NodeHealthStatus, NodeTrafficStatus, ProxyStatus,
@@ -39,7 +38,7 @@ impl IpcClient {
     pub async fn send_message(msg: IpcMessage) -> Result<IpcResponse, AppError> {
         tracing::debug!("Connecting to service on: {}", IPC_SOCKET_PATH);
 
-        let mut stream = TcpStream::connect(IPC_SOCKET_PATH)
+        let mut stream = connect()
             .await
             .map_err(|e| AppError::cause(codes::SERVICE_UNAVAILABLE, e))?;
 

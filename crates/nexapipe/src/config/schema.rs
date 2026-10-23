@@ -10,7 +10,7 @@ use nexapipe_proto::secret::SecretString;
 
 use serde::Deserialize;
 
-use serde::de::IgnoredAny;
+use std::collections::HashMap;
 
 #[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
@@ -758,21 +758,101 @@ pub struct ProxyConfig {
     /// is, with the defaults.
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
-    /// The `[auth]` section: a known key, and nothing else.
+    /// The `[auth]` section, as far as the port rule is concerned.
     ///
     /// The 2FA half of the file is parsed by [`Self::load_with_auth`], which
     /// owns the seeds and the rules around them — this section is where they
     /// are validated, where the enrollment tokens live and where the counters
-    /// are read. All this field does is say that the key is *known*: the top
-    /// level refuses the keys it does not know, and `[auth]` is not one of
-    /// them.
+    /// are read. The top level refuses the keys it does not know, and `[auth]`
+    /// is not one of them.
     ///
-    /// The value is skipped rather than copied. `IgnoredAny` walks the table
-    /// and keeps none of it, which is what a TOTP seed needs: a copy of the
-    /// section inside this struct would be a second copy of every seed in the
-    /// file, held for as long as the configuration lives.
+    /// Only the two keys that say which of the two port rules a client is held
+    /// against are read here, and no credential is among them: the seeds stay
+    /// with the loader that owns them, and a copy of them inside this struct
+    /// would be a second copy of every secret in the file, held for as long as
+    /// the configuration lives.
+    ///
+    /// Read at all so the operator can be told which rule is in force. A port
+    /// list held against the port a client names is a weaker restriction than
+    /// it looks — a request that names no port is not checked at all — and the
+    /// flag that says so is not in the name of the setting.
+    #[serde(default, deserialize_with = "deserialize_auth_port_rules")]
+    pub(crate) auth: Option<AuthPortRules>,
+}
+
+/// The `[auth]` section, as far as the port rule is concerned.
+///
+/// The credentials in that section belong to the auth loader, and this struct
+/// keeps none of them: it reads the two keys that say which of the two port
+/// rules a client is held against, and ignores everything else in the section.
+/// An ignored value is never copied, so the seeds in the file stay in the one
+/// place that owns them.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub(crate) struct AuthPortRules {
+    /// The clients, by id.
     #[serde(default)]
-    pub(crate) auth: Option<IgnoredAny>,
+    pub clients: HashMap<String, ClientPortRule>,
+}
+
+/// One client's port rule: the list of ports, and the port it is held against.
+///
+/// The two keys are the whole of it. `allow_ports` is the list, and
+/// `allow_ports_strict` says whether that list is checked against the port the
+/// request is *served from* (the stronger rule) or the one the client *names*
+/// (the historical one).
+#[derive(Debug, Deserialize, Clone, Default)]
+pub(crate) struct ClientPortRule {
+    /// The ports this client may reach.
+    #[serde(default)]
+    pub allow_ports: Option<Vec<u16>>,
+    /// Whether the list is checked against the port the request is served from.
+    #[serde(default)]
+    pub allow_ports_strict: Option<bool>,
+}
+
+impl AuthPortRules {
+    /// The clients whose port list is held against the port the client names.
+    ///
+    /// A client with no port list is not limited by ports at all, and a client
+    /// with `allow_ports_strict` on is held against the port the request is
+    /// served from — the stronger rule. What is left is the historical one,
+    /// and it is the one an operator has to be told about.
+    pub fn clients_with_the_named_port_rule(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = self
+            .clients
+            .iter()
+            .filter(|(_, client)| {
+                client.allow_ports.is_some() && !client.allow_ports_strict.unwrap_or(false)
+            })
+            .map(|(id, _)| id.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+}
+
+/// Reads the `[auth]` section far enough to know which port rule is in force,
+/// and says so when it is the weaker one.
+///
+/// Said here, at the parse, because this is the one point every reader of the
+/// file passes through — the startup path included — and a second read of the
+/// same section would be a second pass over the credentials in it.
+fn deserialize_auth_port_rules<'de, D>(deserializer: D) -> Result<Option<AuthPortRules>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rules = Option::<AuthPortRules>::deserialize(deserializer)?;
+    if let Some(rules) = &rules {
+        for client in rules.clients_with_the_named_port_rule() {
+            tracing::warn!(
+                "[auth.clients.{client}] has an allow_ports list but allow_ports_strict is off: \
+                 the list is checked against the port the client names, and a request that \
+                 names no port is not checked at all. Set allow_ports_strict = true to check \
+                 the port the request is served from"
+            );
+        }
+    }
+    Ok(rules)
 }
 
 /// The `[backends]` section: how the proxy reaches the backends themselves.

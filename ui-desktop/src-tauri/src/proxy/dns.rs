@@ -125,7 +125,7 @@ impl DnsServer {
                     let resolvers = resolvers.clone();
 
                     tokio::spawn(async move {
-                        if let Err(e) = handle_dns_query(
+                        if let Err(e) = answer_query(
                             &socket,
                             &data,
                             addr,
@@ -151,8 +151,19 @@ impl DnsServer {
     }
 }
 
-/// Handles a single DNS query
-async fn handle_dns_query(
+/// Answers one query, and writes the answer to the socket.
+///
+/// The **decision** is the client's: whether the name is one of ours, whether
+/// it is an iroh name that must not be answered with a virtual address,
+/// whether an answer for it is already cached. That is the same server the
+/// TUN asks, so the desktop and the device answer the same question the same
+/// way — one copy of the question, not two.
+///
+/// What is left here is the socket: the query arrives on it and the answer
+/// goes out of it. The client answers with the bytes to send, or with nothing
+/// — a question it cannot read, or one no resolver answered — and nothing is
+/// sent either way.
+async fn answer_query(
     socket: &Arc<UdpSocket>,
     data: &[u8],
     client_addr: std::net::SocketAddr,
@@ -160,67 +171,17 @@ async fn handle_dns_query(
     proxy_domains: &[String],
     ip_mapping: &IpMapping,
 ) -> Result<()> {
-    if data.len() < 12 {
-        return Ok(());
-    }
+    let answer =
+        nexapipe_client::dns::server::handle_dns_query(data, proxy_domains, resolvers, ip_mapping)
+            .await;
 
-    // Parse the DNS query. The codec is the client's, which runs a DNS server
-    // of its own for the TUN: one copy of what a question is and what an
-    // answer looks like, so the two cannot answer the same question
-    // differently.
-    let query = match nexapipe_client::dns::parse_query(data) {
-        Some(q) => q,
-        None => {
-            tracing::debug!("Failed to parse DNS query");
-            return Ok(());
+    match answer {
+        Some(answer) => {
+            socket.send_to(&answer, client_addr).await?;
         }
-    };
-
-    tracing::debug!("DNS query: {} (type {})", query.domain, query.qtype);
-
-    // Check whether the domain is in the proxy list (suffix match on subdomains)
-    if should_proxy_domain(&query.domain, proxy_domains) {
-        // A gets an address from the IPv4 pool, AAAA from the IPv6 one — and the
-        // IPv6 pool only exists when the TUN actually got an IPv6 address to
-        // route (see routing::configure_ipv6). Without it the honest answer is
-        // the empty NOERROR that sends the resolver back to A, not an address
-        // that leads nowhere.
-        //
-        // The **class** is part of the question too, and what goes back is an IN
-        // record: handing one out for a CH or ANY question answers something
-        // that was not asked. Only a question in the Internet class gets an
-        // address — and the client says the same thing, which is the point of
-        // the codec being the client's: one rule, or two answers to one
-        // question.
-        let in_class = query.qclass == nexapipe_client::dns::DNS_CLASS_IN;
-        let answer = match query.qtype {
-            1 if in_class => Some(std::net::IpAddr::V4(ip_mapping.allocate(&query.domain))),
-            28 if in_class => ip_mapping
-                .allocate_v6(&query.domain)
-                .map(std::net::IpAddr::V6),
-            _ => None,
-        };
-
-        let response = match answer {
-            Some(address) => {
-                tracing::info!("DNS hijack: {} -> {}", query.domain, address);
-                nexapipe_client::dns::build_response(&query, address)
-            }
-            None => {
-                // Every other type (AAAA with no IPv6 pool, MX, ...) gets an empty NOERROR
-                // reply so the query is not leaked upstream and browser resolution is not
-                // disturbed.
-                nexapipe_client::dns::build_empty_response(&query)
-            }
-        };
-        socket.send_to(&response, client_addr).await?;
-        return Ok(());
+        None => tracing::debug!("the DNS query has no answer"),
     }
-
-    // Non-proxied domains: forward upstream. The machine's own resolvers come
-    // first — see [`resolver_chain`] for why — and the public fallbacks close the
-    // chain for when none of them answers.
-    forward_to_upstream(socket, data, client_addr, resolvers).await
+    Ok(())
 }
 
 /// Of the resolvers a host reports, the ones worth forwarding a query to.
@@ -328,27 +289,6 @@ pub(crate) const FALLBACK_UPSTREAMS: &[&str] = &[
     "1.1.1.1:53",         // Cloudflare
 ];
 
-/// Forwards the query along the chain, returning the first successful reply.
-///
-/// The chain is tried in turn, and each upstream gets a window. Only a
-/// response coming from the upstream we queried is accepted (spoofing
-/// protection) — that is the shared resolver's own rule, and it is the one
-/// this path has always had.
-async fn forward_to_upstream(
-    socket: &Arc<UdpSocket>,
-    data: &[u8],
-    client_addr: std::net::SocketAddr,
-    resolvers: &UpstreamResolvers,
-) -> Result<()> {
-    match resolvers.forward(data).await {
-        Some(answer) => {
-            socket.send_to(&answer, client_addr).await?;
-        }
-        None => tracing::debug!("All upstream DNS servers failed for query"),
-    }
-    Ok(())
-}
-
 /// A configured proxy domain reduced to the bare suffix it covers: no leading
 /// `*`, no leading or trailing dot, lower case.
 ///
@@ -416,21 +356,6 @@ fn is_scoped_domain(domain: &str) -> bool {
         && domain
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-}
-
-/// Checks whether a domain should be proxied.
-///
-/// The one rule, and it is the server's: a name (`example.com`), a dotted
-/// wildcard (`*.example.com`, its subdomains and not the apex) or the
-/// catch-all (`*`). The same rule decides which routes the server serves and
-/// which names a client puts in the tunnel, so a name this answers with a
-/// virtual address is a name the server can have a route for.
-///
-/// It used to be DOMAIN-SUFFIX here — a bare `example.com` meant the name and
-/// every subdomain — which is why this file and the client's own copy of the
-/// question could answer differently for the same config.
-fn should_proxy_domain(host: &str, proxy_domains: &[String]) -> bool {
-    nexapipe_client::should_proxy_domain(host, proxy_domains)
 }
 
 #[cfg(test)]
@@ -501,8 +426,9 @@ mod tests {
     /// A resolver that answers what it is asked, and remembers where the
     /// queries came from.
     ///
-    /// The answer carries the question it was asked and no records at all: the
-    /// shared resolver only needs the question to check the answer against.
+    /// The answer carries the question it was asked and one A record: the
+    /// shared resolver only needs the question to check the answer against,
+    /// and a record is what makes an answer one that can be kept.
     struct FakeUpstream {
         address: std::net::SocketAddr,
         /// The source address of every query that arrived.
@@ -523,10 +449,7 @@ mod tests {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .push(from);
-                    let mut reply = buf[..n].to_vec();
-                    // QR: this is an answer, not another query.
-                    reply[2] |= 0x80;
-                    socket.send_to(&reply, from).await.ok();
+                    socket.send_to(&an_answer(&buf[..n]), from).await.ok();
                 }
             });
 
@@ -538,17 +461,50 @@ mod tests {
         }
     }
 
+    /// The answer to `query`: the question it was asked, and one A record
+    /// pointing at a documentation address — so the answer is one that can be
+    /// kept, and one that is told apart from a virtual address.
+    fn an_answer(query: &[u8]) -> Vec<u8> {
+        let mut answer = query.to_vec();
+        // QR: this is an answer, not another query.
+        answer[2] |= 0x80;
+        // ANCOUNT: the one record below.
+        answer[6] = 0;
+        answer[7] = 1;
+        // The record: a pointer to the name in the question, type A, class IN,
+        // a TTL of a minute, and the address itself.
+        answer.extend_from_slice(&[0xC0, 0x0C]);
+        answer.extend_from_slice(&1u16.to_be_bytes()); // TYPE = A
+        answer.extend_from_slice(&1u16.to_be_bytes()); // CLASS = IN
+        answer.extend_from_slice(&60u32.to_be_bytes()); // TTL
+        answer.extend_from_slice(&4u16.to_be_bytes()); // RDLENGTH
+        answer.extend_from_slice(&[203, 0, 113, 7]); // RDATA
+        answer
+    }
+
     /// A DNS query for `example.com` in the Internet class.
     fn a_query() -> Vec<u8> {
-        a_query_in_class(1)
+        a_query_for("example.com")
+    }
+
+    /// A DNS query for `name` in the Internet class.
+    fn a_query_for(name: &str) -> Vec<u8> {
+        a_query_in_class_for(name, 1)
     }
 
     /// A DNS query for `example.com` in a given class.
     fn a_query_in_class(class: u16) -> Vec<u8> {
+        a_query_in_class_for("example.com", class)
+    }
+
+    /// A DNS query for `name` in a given class.
+    fn a_query_in_class_for(name: &str, class: u16) -> Vec<u8> {
         let mut packet = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
-        packet.extend_from_slice(&[
-            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00,
-        ]);
+        for label in name.split('.') {
+            packet.push(label.len() as u8);
+            packet.extend_from_slice(label.as_bytes());
+        }
+        packet.push(0);
         packet.extend_from_slice(&1u16.to_be_bytes());
         packet.extend_from_slice(&class.to_be_bytes());
         packet
@@ -557,6 +513,15 @@ mod tests {
     /// The number of records in an answer.
     fn answer_count(answer: &[u8]) -> u16 {
         u16::from_be_bytes([answer[6], answer[7]])
+    }
+
+    /// The address an answer carries.
+    ///
+    /// The record is the last thing in the answer, so its address is the last
+    /// four bytes: the resolver's own address, or a virtual one.
+    fn the_address_in_the_answer(answer: &[u8]) -> Option<Ipv4Addr> {
+        let rdata = answer.get(answer.len().checked_sub(4)?..)?;
+        Some(Ipv4Addr::new(rdata[0], rdata[1], rdata[2], rdata[3]))
     }
 
     /// The class is part of the question, and what goes back is an IN record.
@@ -574,7 +539,7 @@ mod tests {
         let domains = vec!["example.com".to_string()];
 
         // The Internet class gets an address.
-        handle_dns_query(
+        answer_query(
             &socket,
             &a_query(),
             client_addr,
@@ -599,7 +564,7 @@ mod tests {
         );
 
         // Another class gets nothing.
-        handle_dns_query(
+        answer_query(
             &socket,
             &a_query_in_class(3),
             client_addr,
@@ -630,6 +595,9 @@ mod tests {
     /// every router between the machine and the resolver would have to build a
     /// NAT mapping for it — and tear it down again as soon as the answer was
     /// in. One socket for the lot is what keeps the mapping alive.
+    ///
+    /// The two questions are about different names on purpose: the same name
+    /// twice is answered from the cache, and never reaches the resolver.
     #[tokio::test]
     async fn every_query_leaves_from_the_same_socket() {
         let upstream = FakeUpstream::start().await;
@@ -639,11 +607,19 @@ mod tests {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("a free port"));
         let client = UdpSocket::bind("127.0.0.1:0").await.expect("a free port");
         let client_addr = client.local_addr().expect("the address it got");
+        let mapping = IpMapping::new();
 
-        for _ in 0..2 {
-            forward_to_upstream(&socket, &a_query(), client_addr, &resolvers)
-                .await
-                .expect("the query is forwarded");
+        for name in ["example.com", "example.org"] {
+            answer_query(
+                &socket,
+                &a_query_for(name),
+                client_addr,
+                &resolvers,
+                &[],
+                &mapping,
+            )
+            .await
+            .expect("the query is answered");
         }
 
         let seen = upstream.seen();
@@ -652,6 +628,145 @@ mod tests {
             seen[0].port(),
             seen[1].port(),
             "both queries left from the same socket"
+        );
+    }
+
+    /// An iroh name is not one of ours to answer with a virtual address.
+    ///
+    /// iroh's own traffic leaves the machine by a path that is not the tunnel,
+    /// so an address out of the virtual pool sends it nowhere. The client
+    /// refuses to hand one out and forwards the question instead; the desktop
+    /// used to answer with an address of its own, and the same question got
+    /// two answers on two platforms.
+    #[tokio::test]
+    async fn an_iroh_name_is_forwarded_and_not_answered_with_a_virtual_address() {
+        let upstream = FakeUpstream::start().await;
+        let resolvers =
+            UpstreamResolvers::new(&[upstream.address], Arc::new(AtomicBool::new(false)));
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("a free port"));
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("a free port");
+        let client_addr = client.local_addr().expect("the address it got");
+        let mapping = IpMapping::new();
+
+        // Every name is ours — but not the ones iroh owns.
+        let domains = vec!["*".to_string()];
+
+        // An ordinary name is ours, and is answered with an address of its
+        // own: the question never reaches the resolver.
+        answer_query(
+            &socket,
+            &a_query_for("example.com"),
+            client_addr,
+            &resolvers,
+            &domains,
+            &mapping,
+        )
+        .await
+        .expect("the query is answered");
+        let mut buf = [0u8; 512];
+        let (read, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("an answer arrives")
+        .expect("the answer is received");
+        assert_ne!(
+            the_address_in_the_answer(&buf[..read]),
+            Some(Ipv4Addr::new(203, 0, 113, 7)),
+            "an ordinary name is answered with a virtual address"
+        );
+        assert_eq!(
+            upstream.seen().len(),
+            0,
+            "an ordinary name is not forwarded"
+        );
+
+        // The iroh name is not ours: it goes to the resolver, and the answer
+        // is the resolver's.
+        answer_query(
+            &socket,
+            &a_query_for("eu1abcdef.n0.iroh.link"),
+            client_addr,
+            &resolvers,
+            &domains,
+            &mapping,
+        )
+        .await
+        .expect("the query is answered");
+
+        let mut buf = [0u8; 512];
+        let (read, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("an answer arrives")
+        .expect("the answer is received");
+
+        assert_eq!(
+            upstream.seen().len(),
+            1,
+            "the question went to the resolver instead of being hijacked"
+        );
+        assert_eq!(
+            the_address_in_the_answer(&buf[..read]),
+            Some(Ipv4Addr::new(203, 0, 113, 7)),
+            "the answer is the resolver's, not a virtual address"
+        );
+    }
+
+    /// A name that was answered once is not looked up again.
+    ///
+    /// The client keeps the answers it has, for as long as their own records
+    /// say they are good, and the desktop used to ask the resolver every time:
+    /// every lookup was a round trip to a resolver, for a name the machine had
+    /// been told the answer to a moment earlier.
+    #[tokio::test]
+    async fn a_name_that_was_answered_once_is_not_asked_again() {
+        let upstream = FakeUpstream::start().await;
+        let resolvers =
+            UpstreamResolvers::new(&[upstream.address], Arc::new(AtomicBool::new(false)));
+
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("a free port"));
+        let client = UdpSocket::bind("127.0.0.1:0").await.expect("a free port");
+        let client_addr = client.local_addr().expect("the address it got");
+        let mapping = IpMapping::new();
+
+        for _ in 0..2 {
+            answer_query(
+                &socket,
+                &a_query_for("cached.example.com"),
+                client_addr,
+                &resolvers,
+                &[],
+                &mapping,
+            )
+            .await
+            .expect("the query is answered");
+
+            // The answer is read before the next question is asked, so the
+            // second one is asked after the first has been answered.
+            let mut buf = [0u8; 512];
+            let (read, _) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.recv_from(&mut buf),
+            )
+            .await
+            .expect("an answer arrives")
+            .expect("the answer is received");
+            assert_eq!(
+                the_address_in_the_answer(&buf[..read]),
+                Some(Ipv4Addr::new(203, 0, 113, 7)),
+                "the answer is the resolver's"
+            );
+        }
+
+        assert_eq!(
+            upstream.seen().len(),
+            1,
+            "the second question was answered from the cache"
         );
     }
 
@@ -745,24 +860,6 @@ mod tests {
         ] {
             assert_eq!(normalize_domain(spelling), "example.com");
         }
-    }
-
-    /// The per-query decision follows the server's rule, so a name this
-    /// answers with a virtual address is a name the server can route.
-    #[test]
-    fn a_name_is_proxied_by_the_rule_the_server_routes_by() {
-        // A name is that name.
-        let name = vec!["example.com".to_string()];
-        assert!(should_proxy_domain("example.com", &name));
-        assert!(!should_proxy_domain("www.example.com", &name));
-
-        // A dotted wildcard is the subdomains, and not the apex.
-        let wildcard = vec!["*.example.com".to_string()];
-        assert!(should_proxy_domain("a.b.example.com", &wildcard));
-        assert!(!should_proxy_domain("example.com", &wildcard));
-
-        // And a host that merely ends in the same letters is nobody's.
-        assert!(!should_proxy_domain("notexample.com", &wildcard));
     }
 
     /// The scope the operating system is told about is the suffix behind the

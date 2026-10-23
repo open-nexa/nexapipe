@@ -4,8 +4,9 @@
 #   cp config.toml.example config.toml     # config.toml is gitignored: it is the operator's live config
 #   nexapipe                                # picks up ./config.toml by default
 #
-# This is the general example, with 2FA off. See config.toml.2fa.example for the
-# same file with TOTP authentication enabled.
+# This is the general example: every section written out, with 2FA on - the
+# same setting the generated first-run template and config.toml.2fa.example
+# ship. See config.toml.2fa.example for the short file that is only about 2FA.
 #
 # No file at the path? On a first server start, the binary writes a minimal
 # `config.toml` for you (2FA on, no routes, no clients) instead of refusing to
@@ -624,13 +625,23 @@ domains = ["app.example.com"]
 # ]
 
 # ============================================================
-# [auth] - server-side 2FA (off by default)
+# [auth] - server-side 2FA (on in this file)
 # ============================================================
 # With this on, every client connection must complete a TOTP handshake before
 # proxying is allowed. The secrets below are the only credential gating the iroh
 # listener. Config file permissions are no longer enforced, so keep this file
 # private (chmod 600 is recommended) or move credentials into sidecar files /
 # the environment.
+#
+# What turning it on costs: a credential to hand out. Every client needs a
+# secret of its own, and that secret travels to the device in an invite link
+# or a QR code - so enrolling a client is a deliberate act, not a side effect
+# of starting the server.
+#
+# What leaving it off means: nothing is asked of a client but its Node ID. With
+# no [peers] list either, the Node ID alone reaches every route and every
+# backend - it is in every invite link, in the client's own configuration and
+# in screenshots - and the server says so, loudly, at startup.
 #
 # Generate a secret and its enrollment QR code (both write the result back into
 # config.toml, so do not point them at the example file itself):
@@ -644,8 +655,12 @@ domains = ["app.example.com"]
 # trades it for a fresh secret and the token is spent - see
 # config.toml.2fa.example for the full flow.
 #
-# [auth]
-# enabled = true
+# This file ships with 2FA on and no client enrolled, so nothing can connect
+# until you enroll the first one - which is the point: the first credential is
+# handed out on purpose.
+#   nexapipe --generate-invite client-001 --create-client --config config.toml
+[auth]
+enabled = true
 # issuer = "NexaPipe"
 # algorithm = "sha1"      # sha1 / sha256 / sha512
 # time_step = 30
@@ -659,3 +674,24 @@ domains = ["app.example.com"]
 # created_at = "1723756800"
 # allow_hosts = ["app.example.com", "*.db.example.com"]   # unset = every route
 # allow_ports = [443, 8443]                                # unset = every port
+#
+# The port list is the weaker half of this section by default, and the name of
+# the flag does not say which one you have. With allow_ports_strict off (the
+# default) the list is checked against the port the client NAMES - the one in
+# the tunnel preface, or the one in a request's Host header - and a request
+# that names no port is not checked at all. So a client limited to 443 that
+# asks for "app.example.com" with no port is not refused, and the request is
+# served from whatever port the backend happens to listen on.
+#
+# allow_ports_strict = true checks the list against the port the request is
+# SERVED FROM - the backend's own port - which is the stronger rule and the
+# one an allow-list of ports is written for. It is off by default, because
+# turning it on changes what an existing configuration allows: a client limited
+# to 443 whose route's backend listens on 18080 is refused. That is the
+# correct answer, and it is not the answer a deployed configuration was
+# written against - so turn it on having looked at where your backends
+# actually listen.
+#
+# The server says so at startup, and `nexapipe client list` says it too, when a
+# client has a port list and the strict flag is off.
+# allow_ports_strict = true

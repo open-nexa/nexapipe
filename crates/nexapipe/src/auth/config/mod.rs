@@ -189,7 +189,13 @@ impl AuthConfig {
                             allow_hosts: None,
                             allow_ports: None,
                             allow_ports_strict: false,
-                            pending_enrollment: None,
+                            // The pending token travels, and only the pending
+                            // token: the state file records which token the
+                            // enrollment counters were paid for, and it computes
+                            // that from the token itself. The secret above is
+                            // blanked, and neither of the two ever reaches the
+                            // file — the state file writes a digest.
+                            pending_enrollment: client.pending_enrollment.clone(),
                             // Names and stamps only. A snapshot exists so a
                             // wrong code does not copy a credential, and every
                             // device secret is one — so a device travels with
