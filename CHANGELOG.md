@@ -19,7 +19,7 @@ and its meaning.
 
 ## [Unreleased]
 
-Thirty-two things land in this cycle so far: the device credential can be a **key**
+Thirty-three things land in this cycle so far: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -51,7 +51,7 @@ connection rather than three, a 2FA code from a step that has gone by is
 refused, the price of a second connection is measured now — it comes to a
 handshake, the protocol is chosen at the handshake, the pool's ceiling
 is counted per protocol, and the tunnel path runs on hyper's own HTTP/1
-codec.
+codec, and a TLS hello that arrives in pieces is read until it is whole.
 No existing configuration key is removed or renamed, and the ones this cycle
 adds — `public_key` under a device entry, the six `[timeouts]` phase keys,
 `[limits]`, `[backends] ca_file`, `[retry]`, `[circuit_breaker]`,
@@ -1079,6 +1079,16 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **A TLS `ClientHello` that arrives in pieces is read until it is whole.** The
+  record's length is in its first five bytes, so a hello whose first read
+  carried fewer than five had nothing to measure — and the reading stopped
+  there, because the loop that reads the rest was inside the check. The
+  truncated hello was then parsed as if it were the whole one, which is a
+  hello with no name in it: the session was closed with no retry and no
+  tunnel, and the client saw a TLS handshake failure.
+
+  The head is read first now, and the hello is read until it is whole.
+
 - **The local proxy no longer drops the bytes that came with the request
   head.** The head reader keeps everything it read, so a client that wrote the
   request head and the first bytes of the tunnel in one go has both in the
@@ -1111,16 +1121,6 @@ lookup, which is what a config written before the key existed does.
 
   The file is watched now, the way the error-code check beside it already
   watches its own inputs.
-
-- **A TLS `ClientHello` that arrives in pieces is read until it is whole.** The
-  record's length is in its first five bytes, so a hello whose first read
-  carried fewer than five had nothing to measure — and the reading stopped
-  there, because the loop that reads the rest was inside the check. The
-  truncated hello was then parsed as if it were the whole one, which is a
-  hello with no name in it: the session was closed with no retry and no
-  tunnel, and the client saw a TLS handshake failure.
-
-  The head is read first now, and the hello is read until it is whole.
 
 - **The client and the server read the name inside a TLS `ClientHello` the
   same way now.** They each had a reader of their own, and the two did not
