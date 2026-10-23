@@ -89,11 +89,46 @@ use std::path::PathBuf;
 
 /// Registers the service and starts it.
 pub fn install_service() -> Result<(), AppError> {
-    #[cfg(windows)]
-    return install(account::AccountId::current());
+    install_service_with(false, false)
+}
 
+/// Registers the service and leaves it stopped.
+///
+/// For the installer: an upgrade has to leave the machine the way it found it, and a service
+/// the user had stopped is not theirs to start behind their back. The registration itself is
+/// the same — the entry, the binary under Program Files, the account it serves — only the
+/// service is left down.
+///
+/// Windows only in its effect. The Unix half starts the service through its own service
+/// manager, and the installer that asks for this is the Windows one.
+pub fn install_service_without_starting() -> Result<(), AppError> {
+    install_service_with(true, false)
+}
+
+/// Registers the service, with the two choices an install has to make about the machine it
+/// finds.
+///
+/// `leave_stopped` leaves the service down instead of starting it, and `keep_owner` leaves
+/// the account it serves alone instead of recording the one that happens to run the
+/// install. Both are what an upgrade asks for: an upgrade replaces the service binary and
+/// nothing else, so the start type the user gave the service and the account it serves are
+/// the user's own business. The UI's own install asks for neither.
+///
+/// Windows only in its effect: the Unix half registers the service through its own service
+/// manager and records the account in a root-owned file, so neither of the two is the
+/// installer's to decide there.
+pub fn install_service_with(leave_stopped: bool, keep_owner: bool) -> Result<(), AppError> {
+    #[cfg(windows)]
+    {
+        install(account::AccountId::current(), leave_stopped, keep_owner)
+    }
     #[cfg(not(windows))]
-    return install_elevated();
+    {
+        // Neither of the two is the Unix installer's to decide: it registers the service
+        // through its own service manager and records the account in a root-owned file.
+        let _ = (leave_stopped, keep_owner);
+        install_elevated()
+    }
 }
 
 /// Removes the service.

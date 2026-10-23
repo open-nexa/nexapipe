@@ -8,6 +8,7 @@
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
 import ConfigSection from "./ConfigSection.vue";
+import AppIcon from "./base/AppIcon.vue";
 import type { NodeConfig } from "../types";
 
 const props = defineProps<{
@@ -28,66 +29,41 @@ const allDomains = computed(() => {
 
 <template>
   <ConfigSection :title="t('config.domainOverview')">
-    <div class="domain-overview">
-      <div v-if="allDomains.length === 0" class="empty-state">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
-          <path d="M3 3v5h5"/>
-          <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/>
-          <path d="M16 21h5v-5"/>
-          <path d="M12 3v5"/>
-          <path d="M12 16v5"/>
-          <path d="M3 12h5"/>
-          <path d="M16 12h5"/>
-        </svg>
-        <span>{{ t('config.noDomains') }}</span>
-      </div>
-      <div v-else class="domain-tags">
-        <span
-          v-for="domain in allDomains"
-          :key="domain"
-          class="domain-tag"
-        >
-          {{ domain }}
-        </span>
-      </div>
+    <div v-if="allDomains.length === 0" class="overview-empty">
+      <AppIcon name="globe" :size="20" />
+      <span>{{ t("config.noDomains") }}</span>
     </div>
-    <p class="hint">{{ t('config.overviewHint', { count: allDomains.length }) }}</p>
+
+    <div v-else class="domain-tags">
+      <span v-for="domain in allDomains" :key="domain" class="domain-tag">{{ domain }}</span>
+    </div>
+
+    <p class="hint">{{ t("config.overviewHint", { count: allDomains.length }) }}</p>
   </ConfigSection>
 </template>
 
 <style scoped>
-.domain-overview {
-  min-height: 60px;
+.overview-empty {
   display: flex;
   align-items: center;
-}
-
-.empty-state {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
+  padding: var(--space-4) 0;
   color: var(--text-muted);
-  font-size: 13px;
-}
-
-.empty-state svg {
-  width: 20px;
-  height: 20px;
+  font-size: var(--font-size-13);
 }
 
 .domain-tags {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .domain-tag {
-  padding: 4px 12px;
-  background: var(--primary-50);
-  color: var(--primary-600);
-  border-radius: 12px;
-  font-size: 12px;
-  font-weight: 500;
+  padding: var(--space-1) var(--space-3);
+  background: var(--accent-subtle);
+  color: var(--accent-text);
+  border-radius: var(--radius-full);
+  font-size: var(--font-size-12);
+  font-weight: var(--font-weight-medium);
 }
 </style>

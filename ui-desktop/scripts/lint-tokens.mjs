@@ -34,7 +34,6 @@ const stylesDir = join(srcDir, 'styles');
 const LEGACY_EXEMPT = new Set([
   // Phase 3.1–3.4
   'src/pages/DashboardPage.vue',
-  'src/pages/ConfigPage.vue',
   'src/pages/SettingsPage.vue',
   'src/pages/LogsPage.vue',
   // Phase 4 — replaced by ToastHost / AppDialog / domain components

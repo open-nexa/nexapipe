@@ -221,6 +221,12 @@
     "hintProduction": "Service mode is recommended for production"
   },
   "config": {
+    "tabs": {
+      "nodes": "Nodes",
+      "network": "Network",
+      "relay": "Relay"
+    },
+    "tabsLabel": "Configuration sections",
     "noNodes": "No nodes yet",
     "noNodesHint": "Nodes come from an invite. Import one to start routing domains.",
     "nodeConfiguration": "Node Configuration",
@@ -258,8 +264,22 @@
     "relayAuthTokenHint": "Only if the relay requires one. The server needs the same token. A token belongs to the relay it was issued for: change the relay above and it is cleared.",
     "relayAuthTokenBoundTo": "Issued for {relay}.",
     "relayTokenCleared": "The relay auth token was cleared: a token belongs to the relay it was issued for. Type this relay's token if it needs one.",
-    "loadExample": "Load Example",
+    "restoreDefaults": "Restore defaults",
+    "restoreDefaultsHint": "Puts the three addresses and the load-balancing strategy back to what a fresh installation has.",
+    "networkDefaultsRestored": "The three addresses and the load-balancing strategy are back to their defaults.",
     "clearConfig": "Clear Config",
+    "clearConfigTitle": "Clear the configuration?",
+    "clearConfigMessage": "Every node, address and relay setting goes, and the credentials stored on this machine are deleted with them. This cannot be undone.",
+    "dangerZone": "Danger zone",
+    "dangerZoneHint": "Clears every node, address and relay setting, and deletes the credentials stored on this machine.",
+    "expandNode": "Expand this node",
+    "collapseNode": "Collapse this node",
+    "removeNode": "Remove node",
+    "removeNodeTitle": "Remove {name}?",
+    "removeNodeMessage": "A node comes from an invite and cannot be typed back in. Removing {name} deletes its connection string and two-factor credentials from this machine, and it has to be imported again before the proxy can use it.",
+    "removeLastNodeTitle": "Remove the last node?",
+    "removeLastNodeMessage": "This is the only node, so the proxy has nothing to dial and cannot start until another invite is imported. Removing it also deletes its connection string and two-factor credentials from this machine.",
+    "nodeRemoved": "Removed {name}.",
     "nodeFallback": "Node {index}"
   },
   "settings": {
@@ -333,6 +353,7 @@
     "enrolled": "Enrolled as {client} and saved the credentials it was issued."
   },
   "node": {
+    "connection": "Connection string",
     "connectionHint": "Nodes come from invites, so the target cannot be changed here.",
     "reveal": "Reveal",
     "hide": "Hide",

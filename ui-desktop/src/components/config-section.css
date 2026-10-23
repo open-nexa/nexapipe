@@ -3,133 +3,129 @@
  * sections share.
  *
  * The rules that style the shell's own markup are plain; the ones that style a section's markup
- * are written with `:deep()`, because that markup is passed in as a slot and therefore carries
- * the section's scope rather than this one's.
+ * are written with `:deep()`, because that markup is passed in as a slot and therefore carries the
+ * section's scope rather than this one's.
  *
  * The primitives are written down once, here, so that a section cannot drift away from the
  * others: the network section, the relay section and the node list are three different pieces of
  * the same screen, and a field that looked like one field in one of them would be a bug.
+ *
+ * The node list's cards rely on this file for their fields, the same way every other section
+ * does — they are slot content of a section, so the rules reach them. A card that is moved out of
+ * a section would lose them, which is why the node list stays inside one.
  */
 
 /* The card itself. */
 .config-section {
-  background: var(--surface-1);
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
   border-radius: var(--radius-lg);
-  padding: 20px;
-  box-shadow: var(--shadow-card);
-  border: 1px solid var(--border-light);
+  padding: var(--space-5);
 }
 
+/*
+ * The header: a title on the left and whatever the section puts at the right-hand end.
+ *
+ * The rule that used to run between the two is gone: it was a gradient bar that every section
+ * carried, and six identical bars turn a screen into a stack of identical slabs rather than into
+ * six sections of one screen.
+ */
 .card-header {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 16px;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
 }
 
 .card-header h2 {
+  flex: 1;
+  min-width: 0;
   margin: 0;
-  font-size: 16px;
-  font-weight: 600;
+  font-size: var(--font-size-14);
+  font-weight: var(--font-weight-semibold);
   color: var(--text-primary);
 }
 
-.card-header-decoration {
-  flex: 1;
-  height: 2px;
-  background: var(--gradient-primary);
-  border-radius: 1px;
-}
-
 /* The form primitives the sections are built from. */
-:deep(.form-group) {
-  margin-bottom: 14px;
-}
-
-:deep(.form-group:last-child) {
-  margin-bottom: 0;
-}
-
 :deep(.form-grid) {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--space-4);
+}
+
+:deep(.form-group) {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+/*
+ * A field that takes the whole width of the grid.
+ *
+ * A field whose explanation is a paragraph — the DNS strategy's is several
+ * sentences long — cannot live in a third of the width: it wraps into a
+ * column of two or three words and the space beside it goes unused.
+ */
+:deep(.form-group--wide) {
+  grid-column: 1 / -1;
 }
 
 :deep(.form-label) {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 13px;
-  font-weight: 500;
+  gap: var(--space-2);
+  font-size: var(--font-size-13);
+  font-weight: var(--font-weight-medium);
   color: var(--text-primary);
-  margin-bottom: 6px;
-}
-
-:deep(.input-wrapper) {
-  position: relative;
-}
-
-:deep(.input-icon) {
-  position: absolute;
-  left: 12px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 16px;
-  height: 16px;
-  color: var(--text-muted);
-  z-index: 1;
-  /* Decoration only: it is laid over the field, so without this it takes the
-     click — on the leftmost sliver of an input, and on whatever a select would
-     have opened with it. */
-  pointer-events: none;
-}
-
-:deep(.input-icon svg) {
-  width: 100%;
-  height: 100%;
 }
 
 :deep(.form-input),
 :deep(.form-textarea),
 :deep(.form-select) {
   width: 100%;
-  padding: 10px 12px;
-  border: 1.5px solid var(--border-color);
-  border-radius: var(--radius-md);
-  font-size: 13px;
-  transition: all var(--transition-normal);
-  box-sizing: border-box;
-  background: var(--surface-1);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  background: var(--bg-input);
   color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--font-size-13);
+  line-height: var(--line-height-normal);
+  box-sizing: border-box;
+  transition:
+    border-color var(--duration-fast) var(--ease-standard),
+    box-shadow var(--duration-fast) var(--ease-standard);
 }
 
-:deep(.form-input) {
-  padding-left: 40px;
+:deep(.form-textarea) {
+  resize: vertical;
+  min-height: 76px;
 }
 
 :deep(.form-input:focus),
 :deep(.form-textarea:focus),
 :deep(.form-select:focus) {
   outline: none;
-  border-color: var(--primary-500);
-  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+  border-color: var(--border-focus);
+  box-shadow: 0 0 0 3px var(--accent-subtle);
 }
 
-:deep(.form-textarea) {
-  padding-left: 40px;
-  resize: vertical;
-  min-height: 56px;
-  line-height: 1.5;
-}
-
-:deep(.hint) {
-  font-size: 12px;
+:deep(.form-input::placeholder),
+:deep(.form-textarea::placeholder) {
   color: var(--text-muted);
-  margin: 6px 0 0 0;
 }
 
-@media (max-width: 600px) {
+/* A hint under a field: what the field does, not what it is. */
+:deep(.hint) {
+  margin: 0;
+  font-size: var(--font-size-12);
+  line-height: var(--line-height-normal);
+  color: var(--text-muted);
+}
+
+@media (max-width: 640px) {
   :deep(.form-grid) {
     grid-template-columns: 1fr;
   }
