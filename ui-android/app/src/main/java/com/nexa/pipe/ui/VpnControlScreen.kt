@@ -1,15 +1,8 @@
 package com.nexa.pipe.ui
 
-import android.app.Activity
-import android.content.Context
-import android.os.Build
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -19,40 +12,20 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.PasswordVisualTransformation
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.nexa.pipe.R
-import com.nexa.pipe.formatByteCount
-import com.nexa.pipe.nodeTrafficOf
 import com.nexa.pipe.SecretStore
-import com.nexa.pipe.locale.AppLanguage
-import com.nexa.pipe.locale.AppLocale
-import com.nexa.pipe.locale.label
 import com.nexa.pipe.locale.rememberLocalizedContext
-import com.nexa.pipe.ui.components.NexaDangerButton
-import com.nexa.pipe.ui.components.NexaPrimaryButton
-import com.nexa.pipe.ui.components.NexaTonalButton
-import com.nexa.pipe.ui.components.NexaTextButton
-import com.nexa.pipe.ui.theme.Dimens
 import com.nexa.pipe.provisioning.EndpointInvite
 import com.nexa.pipe.provisioning.EndpointInviteCodec
 import com.nexa.pipe.provisioning.InviteParseResult
-import com.nexa.pipe.provisioning.InviteTarget
 import com.nexa.pipe.vpn.VpnTakeoverChoice
-import com.nexa.pipe.vpn.VpnTakeoverDecision
-import kotlinx.coroutines.launch
-import java.util.Locale
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -119,6 +92,31 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     var takeoverRememberChoice by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(true) }
 
+    // The setup an invite import is measured against: the endpoints, the
+    // relay, and the token that relay was issued for.
+    val inviteSetup = InviteSetup(
+        nodes = nodes,
+        relayMode = relayMode,
+        relayUrl = relayUrl,
+        relayAuthToken = relayAuthToken
+    )
+
+    // The one connect path, shared by the button on the status card and the
+    // floating button: ask about a foreign VPN first, then about the
+    // permissions, then connect.
+    val connect = {
+        connectWithTakeoverCheck(
+            context = context,
+            viewModel = viewModel,
+            scope = screenScope,
+            onPermissionsNeeded = { showPermissionGuide = true },
+            onTakeoverQuestion = {
+                takeoverRememberChoice = false
+                showTakeoverDialog = true
+            }
+        )
+    }
+
     // Sync the VPN service state whenever this composable becomes visible,
     // covering cases beyond activity recreation (e.g. navigating back from
     // another screen).
@@ -158,238 +156,6 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     }
 
     /**
-     * True when every permission the connect path needs is already granted.
-     * Otherwise shows the permission guide and returns false.
-     *
-     * Only ever called once the slot is ours to take: the guide is the way into
-     * Android's preparation dialog, and that dialog is what displaces another
-     * VPN app.
-     */
-    fun permissionsReady(context: Context): Boolean {
-        val vpnGranted = viewModel.checkVpnPermission(context)
-        val notificationGranted = viewModel.checkNotificationPermission(context)
-
-        if (!vpnGranted || (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !notificationGranted)) {
-            showPermissionGuide = true
-            return false
-        }
-        return true
-    }
-
-    /**
-     * Connects — asking first, when another VPN app owns the single slot
-     * Android allows.
-     *
-     * The question cannot be asked from the service: it has no UI, and calling
-     * establish() is itself what revokes the other app. So it is asked here,
-     * before anything is started, which is also what makes Cancel free — there
-     * is nothing to undo because nothing has happened yet.
-     *
-     * Permissions come second for the same reason: the permission guide leads
-     * to Android's own preparation dialog, and accepting that dialog is what
-     * grants Nexa the slot and displaces the other app. Reaching it before the
-     * question would leave Cancel unable to keep that app alive.
-     */
-    fun handleConnect(context: Context) {
-        screenScope.launch {
-            when (viewModel.takeoverCheck(context)) {
-                // Nobody else wants the slot, or the user has already said to
-                // take it. The flag only matters while a foreign VPN is up.
-                is VpnTakeoverDecision.Proceed ->
-                    if (permissionsReady(context)) {
-                        viewModel.connect(context, allowTakeover = true)
-                    }
-                // The one case that needs a UI: another VPN is running and the
-                // user has not yet said what to do about it.
-                is VpnTakeoverDecision.Ask -> {
-                    takeoverRememberChoice = false
-                    showTakeoverDialog = true
-                }
-                // Both refusals are reported by the ViewModel.
-                is VpnTakeoverDecision.Refuse,
-                is VpnTakeoverDecision.RefuseAlwaysOn -> Unit
-            }
-        }
-    }
-
-    /**
-     * Switches the UI to [language] and rebuilds the Activity.
-     *
-     * The rebuild is not a shortcut: resources are resolved per context, so the
-     * only way every string on screen changes is going through
-     * `MainActivity.attachBaseContext` again. `recreate()` keeps the
-     * ViewModel (and with it the running session's state) alive, so the UI
-     * comes back where it was — only in the new language.
-     */
-    fun applyLanguage(language: AppLanguage) {
-        AppLocale.select(context, language)
-        (context as? Activity)?.recreate()
-    }
-
-    /**
-     * The endpoint an invite refers to, or null when it carries a ticket
-     * instead — a ticket bundles addresses the endpoint list has no room for.
-     */
-    fun inviteNodeId(invite: EndpointInvite): String? =
-        (invite.target as? InviteTarget.NodeId)?.id
-
-    /**
-     * Applies a scanned endpoint invite: the node, its domains, the relay it
-     * asks for and the 2FA credentials of that endpoint.
-     *
-     * Returns the message to show when the invite cannot be applied at all.
-     */
-    fun applyInviteImport(invite: EndpointInvite): String? {
-        val nodeId = inviteNodeId(invite)
-            // A ticket bundles addresses the node list has no room for. The
-            // server can hand out a Node ID invite instead.
-            ?: return localizedContext.getString(R.string.invite_ticket_unsupported)
-
-        if (nodes.none { it.nodeId == nodeId }) {
-            viewModel.addNode(nodeId)?.let { return it }
-        }
-        if (invite.domains.isEmpty()) {
-            viewModel.addLog("Invite for $nodeId carried no domains")
-        }
-        invite.domains.forEach { viewModel.addDomainToNode(nodeId, it) }
-        // The relay is global, so an invite only proposes one: it says how
-        // *that* endpoint is reachable, not what this phone should use. The
-        // change is listed by `inviteConflicts`, which is what puts the
-        // confirmation dialog in front of it — a relay that would actually be
-        // overwritten is never applied silently.
-        //
-        // The invite carries no token for the relay it names, so the token
-        // this phone holds goes with the import rather than travelling to a
-        // relay of the invite's choosing.
-        invite.relay?.let { relay ->
-            viewModel.updateRelayConfig("custom", relay, RelayTokenChange.Drop)
-        }
-        invite.totp?.let { otp ->
-            viewModel.updateNodeTwoFactor(
-                nodeId,
-                NodeTwoFactor(
-                    enabled = true,
-                    clientId = otp.clientId,
-                    secret = otp.secret,
-                    algorithm = otp.algorithm
-                )
-            )
-            // A token is not a credential, so an invite that hands one over
-            // leaves this endpoint with none until it has been spent.
-            viewModel.updateNodeEnrollment(nodeId, null)
-            invite.warnings().forEach { viewModel.addLog("Invite import: $it") }
-            invite.warnings().firstOrNull()?.let {
-                Toast.makeText(context, it, Toast.LENGTH_LONG).show()
-            }
-        }
-        // An enrollment invite spends its token on the next connect, which is
-        // also when the credentials arrive — so the token itself is the only
-        // thing written here.
-        //
-        // The credential this endpoint holds now goes with it, because what
-        // comes back replaces it: the server issues a fresh one and the old
-        // secret stops being a credential. That is a replacement of something
-        // that works, so `inviteConflicts` names it and the confirmation stands
-        // in front of it.
-        invite.enrollment?.let { enrollment ->
-            viewModel.updateNodeEnrollment(
-                nodeId,
-                NodeEnrollment(clientId = enrollment.clientId, token = enrollment.token)
-            )
-            viewModel.updateNodeTwoFactor(nodeId, null)
-        }
-        // No client id in the log: debug builds expose Log.d, and the id is
-        // half of the 2FA credential pair. What kind of credential arrived is
-        // what the line is about.
-        val credential = when {
-            invite.totp != null -> "totp"
-            invite.enrollment != null -> "enrollment"
-            else -> "none"
-        }
-        viewModel.addLog(
-            "Imported invite: node=$nodeId domains=${invite.domains.size} 2FA=$credential"
-        )
-        Toast.makeText(
-            context,
-            localizedContext.getString(R.string.invite_imported, invite.name ?: nodeId.take(8)),
-            Toast.LENGTH_SHORT
-        ).show()
-        return null
-    }
-
-    /**
-     * The parts of the current setup an invite would overwrite.
-     *
-     * Empty means the import only adds things, so it can go through without a
-     * question; domains merging into an existing node is additive too.
-     *
-     * The rule itself is `inviteConflictKinds`, which is a pure function and
-     * is tested as one; this is the part that turns a conflict into the
-     * sentence the confirmation shows.
-     */
-    fun inviteConflicts(invite: EndpointInvite): List<String> {
-        val current = inviteNodeId(invite)?.let { id -> nodes.firstOrNull { it.nodeId == id } }
-        val conflicts = inviteConflictKinds(current, invite, relayMode, relayUrl).map { kind ->
-            when (kind) {
-                InviteConflict.TwoFactor -> {
-                    val client = current?.twoFactor?.clientId?.ifBlank {
-                        localizedContext.getString(R.string.invite_conflict_2fa_current_client)
-                    } ?: localizedContext.getString(R.string.invite_conflict_2fa_current_client)
-                    localizedContext.getString(R.string.invite_conflict_2fa, client)
-                }
-                InviteConflict.EnrollmentReplacesTwoFactor ->
-                    localizedContext.getString(R.string.invite_conflict_enrollment)
-                InviteConflict.PendingEnrollment ->
-                    localizedContext.getString(R.string.invite_conflict_enrollment_pending)
-                InviteConflict.Relay ->
-                    localizedContext.getString(R.string.invite_conflict_relay)
-            }
-        }.toMutableList()
-        // An invite names a relay and carries no token for it, so the token
-        // this phone holds goes with the import. The confirmation says so:
-        // the user is the one who has to enter the token the relay asks for,
-        // and a credential that quietly travels to another relay is exactly
-        // what this rule exists to stop.
-        if (invite.relay != null && relayAuthToken.isNotBlank()) {
-            conflicts.add(localizedContext.getString(R.string.invite_conflict_relay_token))
-        }
-        return conflicts
-    }
-
-    /** One line per field, so the confirmation reads like the invite itself. */
-    fun inviteSummary(invite: EndpointInvite): String = buildList<String> {
-        add(localizedContext.getString(R.string.invite_summary_node, invite.target.value))
-        invite.name?.let { add(localizedContext.getString(R.string.invite_summary_name, it)) }
-        add(
-            localizedContext.getString(
-                R.string.invite_summary_domains,
-                invite.domains.joinToString(", ").ifEmpty {
-                    localizedContext.getString(R.string.invite_value_none)
-                }
-            )
-        )
-        val otp = invite.totp
-        // A local, so the branch below can smart-cast it: `invite.enrollment!!`
-        // was an assertion the compiler already knows is unnecessary.
-        val enrollment = invite.enrollment
-        add(
-            when {
-                otp != null -> localizedContext.getString(
-                    R.string.invite_summary_2fa,
-                    otp.clientId,
-                    otp.algorithm.uppercase(Locale.ROOT)
-                )
-                enrollment != null -> localizedContext.getString(
-                    R.string.invite_summary_enrollment,
-                    enrollment.clientId
-                )
-                else -> localizedContext.getString(R.string.invite_summary_2fa_none)
-            }
-        )
-        invite.relay?.let { add(localizedContext.getString(R.string.invite_summary_relay, it)) }
-    }.joinToString("\n")
-
-    /**
      * Reads one invite and returns the message to show when it cannot be
      * applied at all, or null when it was accepted.
      *
@@ -406,8 +172,14 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                 // away; otherwise replacing working settings needs a
                 // confirmation. A rejected import (e.g. a ticket invite) comes
                 // back as the status message instead of vanishing.
-                if (inviteConflicts(result.invite).isEmpty()) {
-                    applyInviteImport(result.invite)
+                if (inviteConflicts(inviteSetup, localizedContext, result.invite).isEmpty()) {
+                    applyInviteImport(
+                        viewModel,
+                        inviteSetup,
+                        context,
+                        localizedContext,
+                        result.invite
+                    )
                 } else {
                     pendingInviteImport = result.invite
                     null
@@ -474,41 +246,12 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             )
         },
         floatingActionButton = {
-            FloatingActionButton(
-                onClick = {
-                    if (isVpnRunning) {
-                        viewModel.disconnect(context)
-                    } else {
-                        handleConnect(context)
-                    }
-                },
-                // A reconnect tears the old session down while the new one comes up, so
-                // isVpnRunning briefly goes false. Keying the colour on "running" alone made the
-                // button flip red -> primary -> red around every reconnect; "connecting" wins
-                // until the new session is actually up.
-                containerColor = if (isVpnRunning && !isConnecting) MaterialTheme.colorScheme.error
-                    else MaterialTheme.colorScheme.primary,
-                contentColor = Color.White,
-                modifier = Modifier.size(56.dp)
-            ) {
-                if (isConnecting) {
-                    CircularProgressIndicator(
-                        color = Color.White,
-                        modifier = Modifier.size(24.dp),
-                        strokeWidth = 3.dp
-                    )
-                } else {
-                    Icon(
-                            imageVector = if (isVpnRunning) Icons.Default.Close else Icons.Default.CheckCircle,
-                            contentDescription = if (isVpnRunning) {
-                                stringResource(R.string.action_disconnect)
-                            } else {
-                                stringResource(R.string.action_connect)
-                            },
-                            modifier = Modifier.size(28.dp)
-                        )
-                }
-            }
+            VpnConnectFab(
+                isVpnRunning = isVpnRunning,
+                isConnecting = isConnecting,
+                onConnect = { connect() },
+                onDisconnect = { viewModel.disconnect(context) }
+            )
         },
         floatingActionButtonPosition = FabPosition.End
     ) { paddingValues ->
@@ -522,183 +265,17 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
         ) {
             Spacer(modifier = Modifier.height(24.dp))
 
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(
-                            Icons.Default.CheckCircle,
-                            contentDescription = null,
-                            tint = if (isVpnRunning) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = if (isVpnRunning) stringResource(R.string.status_connected)
-                                else if (connectionStatusText != null) connectionStatusText!!
-                                else if (isConnecting) stringResource(R.string.status_connecting)
-                                else stringResource(R.string.status_disconnected),
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold,
-                            color = if (isVpnRunning) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
-                        )
-                        Spacer(modifier = Modifier.weight(1f))
-                        Box(
-                            modifier = Modifier
-                                .size(12.dp)
-                                .clip(RoundedCornerShape(50))
-                                .background(
-                                    if (isVpnRunning) MaterialTheme.colorScheme.primary
-                                    else if (isConnecting) MaterialTheme.colorScheme.secondary
-                                    else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f)
-                                )
-                        )
-                    }
-                    // Always rendered, even when disconnected: a subtitle that comes and goes
-                    // changes the card's height, which shifts every card below it (twice per
-                    // reconnect - once on teardown, once when the new session comes up).
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = when {
-                            isVpnRunning -> stringResource(R.string.status_connected_subtitle)
-                            isConnecting -> stringResource(R.string.status_connecting_subtitle)
-                            else -> stringResource(R.string.status_disconnected_subtitle)
-                        },
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-
-                    // What every backend has carried together, not one backend's share: the
-                    // card answers "is it working", and the next question is always "how much".
-                    //
-                    // Hidden until the counters have anything to say. "Nothing counted yet" is
-                    // not the same as "counted, and the answer is zero" — see `totalTraffic` —
-                    // and drawing a row of zeroes before the first byte moves would read as a
-                    // tunnel that connects and carries nothing.
-                    AnimatedVisibility(visible = totalTraffic != null) {
-                        val total = totalTraffic
-                        if (total != null) {
-                            Row(
-                                modifier = Modifier.padding(top = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically,
-                            ) {
-                                Text(
-                                    text = stringResource(
-                                        R.string.total_traffic_line,
-                                        formatByteCount(total.sent),
-                                        formatByteCount(total.received),
-                                        pluralStringResource(
-                                            R.plurals.node_traffic_flows,
-                                            total.active.toInt(),
-                                            total.active.toInt()
-                                        )
-                                    ),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurface,
-                                    // Two, not one: on a narrow screen the two byte counts can
-                                    // fill the first line by themselves, and a single line ends
-                                    // by trading the flow count — the figure that says whether
-                                    // the tunnel is carrying anything at all — for an ellipsis.
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                        }
-                    }
-
-                    // The one action this screen is for, as a labelled button in the card.
-                    // It used to live only on the FAB, where a colour and an icon had to stand
-                    // in for the words "connect" and "disconnect".
-                    Spacer(modifier = Modifier.height(Dimens.Space3))
-                    if (isVpnRunning) {
-                        NexaDangerButton(
-                            text = stringResource(R.string.action_disconnect),
-                            onClick = { viewModel.disconnect(context) },
-                            icon = Icons.Default.Close,
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                    } else {
-                        NexaPrimaryButton(
-                            text = if (isConnecting) {
-                                stringResource(R.string.status_connecting)
-                            } else {
-                                stringResource(R.string.action_connect)
-                            },
-                            onClick = { handleConnect(context) },
-                            icon = Icons.Default.CheckCircle,
-                            loading = isConnecting,
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                    }
-
-                    // ...and through *these* backends, over this kind of path. It belongs to
-                    // this card rather than to one of its own: it finishes the sentence the
-                    // subtitle starts.
-                    AnimatedVisibility(visible = connectedEndpoints.isNotEmpty()) {
-                        Column(modifier = Modifier.padding(top = 12.dp)) {
-                            Text(
-                                text = stringResource(R.string.connected_endpoints_title),
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                                connectedEndpoints.forEach { (node, kind) ->
-                                    Row(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clickable { selectedNodeId = node.nodeId },
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Column(modifier = Modifier.weight(1f)) {
-                                            Text(
-                                                text = shortenNodeId(node.nodeId),
-                                                style = MaterialTheme.typography.bodyMedium,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                            )
-                                            // What this backend has carried, in the muted
-                                            // style the card uses for everything that
-                                            // supports the headline. A backend the native
-                                            // side says nothing about has carried nothing —
-                                            // it is absent, not zero — so that is said
-                                            // instead of leaving a gap next to a badge that
-                                            // still reads "connected".
-                                            val volume = nodeTrafficOf(traffic, node.nodeId)
-                                            Text(
-                                                text = if (volume != null) {
-                                                    stringResource(
-                                                        R.string.node_traffic_line,
-                                                        formatByteCount(volume.sent),
-                                                        formatByteCount(volume.received),
-                                                        pluralStringResource(
-                                                            R.plurals.node_traffic_flows,
-                                                            volume.active.toInt(),
-                                                            volume.active.toInt()
-                                                        )
-                                                    )
-                                                } else {
-                                                    stringResource(R.string.node_traffic_none)
-                                                },
-                                                style = MaterialTheme.typography.bodySmall,
-                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                                maxLines = 1,
-                                                overflow = TextOverflow.Ellipsis,
-                                            )
-                                        }
-                                        Spacer(modifier = Modifier.width(8.dp))
-                                        LinkKindBadge(kind)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            VpnStatusCard(
+                isVpnRunning = isVpnRunning,
+                isConnecting = isConnecting,
+                connectionStatusText = connectionStatusText,
+                totalTraffic = totalTraffic,
+                connectedEndpoints = connectedEndpoints,
+                traffic = traffic,
+                onDisconnect = { viewModel.disconnect(context) },
+                onConnect = { connect() },
+                onOpenEndpoint = { selectedNodeId = it }
+            )
 
             Spacer(modifier = Modifier.height(16.dp))
 
@@ -762,328 +339,53 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                 }
             }
 
-            Card(
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Default.Settings, contentDescription = null)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            stringResource(R.string.configurations_title),
-                            style = MaterialTheme.typography.titleMedium
-                        )
-                        Spacer(modifier = Modifier.weight(1f))
-                        IconButton(onClick = { showSettings = !showSettings }) {
-                            Icon(
-                                if (showSettings) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                                contentDescription = stringResource(R.string.action_toggle)
-                            )
-                        }
-                    }
-
-                    AnimatedVisibility(visible = showSettings) {
-                        Column {
-                            Spacer(modifier = Modifier.height(16.dp))
-
-                            EndpointsSection(
-                                nodes = nodes,
-                                // An invite carries a relay and the 2FA
-                                // credentials of an endpoint, so importing one
-                                // is credential-grade: what arrives rewrites
-                                // settings that already work, and it can carry
-                                // a secret of its own. Both entry points — the
-                                // camera and a pasted link — ask first, for
-                                // the same reason and in the same words.
-                                onScanInvite = {
-                                    credentialUnlock.requestIfLocked(
-                                        localizedContext,
-                                        R.string.credential_lock_scan_invite_subtitle
-                                    ) { showInviteScanner = true }
-                                },
-                                onPasteInvite = {
-                                    credentialUnlock.requestIfLocked(
-                                        localizedContext,
-                                        R.string.credential_lock_paste_invite_subtitle
-                                    ) { showInviteLinkDialog = true }
-                                },
-                                onOpenEndpoint = { selectedNodeId = it }
-                            )
-
-                            Spacer(modifier = Modifier.height(Dimens.Space3))
-
-                            LanguageSection(
-                                onLanguagePicked = { language -> applyLanguage(language) }
-                            )
-
-                            // Only once a choice exists: "ask every time" is the
-                            // default, and offering to take back a decision the
-                            // user never made is noise.
-                            if (vpnTakeoverChoice != VpnTakeoverChoice.Ask) {
-                                Spacer(modifier = Modifier.height(Dimens.Space3))
-                                VpnTakeoverSection(
-                                    choice = vpnTakeoverChoice,
-                                    onReset = {
-                                        viewModel.rememberVpnTakeoverChoice(VpnTakeoverChoice.Ask)
-                                    }
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.height(Dimens.Space3))
-
-                            AutoConnectSection(
-                                enabled = autoConnectOnBoot,
-                                consentMissing = vpnConsentMissing,
-                                onChange = { viewModel.setAutoConnectOnBoot(it) }
-                            )
-                        }
-                    }
-                }
-            }
+            VpnSettingsCard(
+                viewModel = viewModel,
+                nodes = nodes,
+                vpnTakeoverChoice = vpnTakeoverChoice,
+                autoConnectOnBoot = autoConnectOnBoot,
+                vpnConsentMissing = vpnConsentMissing,
+                expanded = showSettings,
+                onToggleExpanded = { showSettings = !showSettings },
+                onScanInvite = {
+                    credentialUnlock.requestIfLocked(
+                        localizedContext,
+                        R.string.credential_lock_scan_invite_subtitle
+                    ) { showInviteScanner = true }
+                },
+                onPasteInvite = {
+                    credentialUnlock.requestIfLocked(
+                        localizedContext,
+                        R.string.credential_lock_paste_invite_subtitle
+                    ) { showInviteLinkDialog = true }
+                },
+                onOpenEndpoint = { selectedNodeId = it },
+                onLanguagePicked = { language -> applyLanguage(context, language) }
+            )
 
             // Relay Settings Card
             Spacer(modifier = Modifier.height(16.dp))
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerLow)
-            ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Icon(Icons.Default.Share, contentDescription = null)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            stringResource(R.string.relay_title),
-                            style = MaterialTheme.typography.titleSmall
-                        )
-                        Spacer(modifier = Modifier.weight(1f))
-                        IconButton(onClick = { showRelaySettings = !showRelaySettings }) {
-                            Icon(
-                                if (showRelaySettings) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-                                contentDescription = stringResource(R.string.action_toggle)
-                            )
-                        }
-                    }
-
-                    AnimatedVisibility(visible = showRelaySettings) {
-                        Column {
-                            // Where traffic is sent is decided here, so changing
-                            // it is a credential-grade action even though the
-                            // URL itself is not a secret: an unlocked phone is
-                            // enough to point this device at someone else's
-                            // relay. The invite import path is not gated — it
-                            // is one deliberate action with its own
-                            // confirmation, not a setting left lying around.
-                            val relayLocked = !credentialUnlock.unlocked
-                            if (relayLocked) {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                NexaTonalButton(
-                                    text = stringResource(R.string.credential_lock_relay_action),
-                                    onClick = {
-                                        credentialUnlock.request(
-                                            localizedContext.getString(R.string.credential_lock_title),
-                                            localizedContext.getString(
-                                                R.string.credential_lock_relay_subtitle
-                                            )
-                                        )
-                                    },
-                                    icon = Icons.Default.Lock,
-                                    modifier = Modifier.fillMaxWidth()
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
-                            }
-
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                stringResource(R.string.relay_mode_title),
-                                style = MaterialTheme.typography.labelMedium
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-
-                            val relayModes = listOf(
-                                "pinned" to R.string.relay_mode_pinned,
-                                "default" to R.string.relay_mode_default,
-                                "disabled" to R.string.relay_mode_disabled,
-                                "custom" to R.string.relay_mode_custom
-                            )
-                            relayModes.forEach { (mode, label) ->
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 2.dp)
-                                ) {
-                                    RadioButton(
-                                        selected = relayMode == mode,
-                                        onClick = {
-                                            if (relayLocked) {
-                                                credentialUnlock.request(
-                                                    localizedContext.getString(R.string.credential_lock_title),
-                                                    localizedContext.getString(
-                                                        R.string.credential_lock_relay_subtitle
-                                                    )
-                                                ) {
-                                                    viewModel.updateRelayConfig(
-                                                        mode,
-                                                        relayUrl,
-                                                        RelayTokenChange.Bound
-                                                    )
-                                                }
-                                            } else {
-                                                viewModel.updateRelayConfig(
-                                                    mode,
-                                                    relayUrl,
-                                                    RelayTokenChange.Bound
-                                                )
-                                            }
-                                        }
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(
-                                        stringResource(label),
-                                        style = MaterialTheme.typography.bodySmall
-                                    )
-                                }
-                            }
-
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                stringResource(R.string.discovery_mode_title),
-                                style = MaterialTheme.typography.labelMedium
-                            )
-                            Text(
-                                stringResource(R.string.discovery_mode_note),
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Spacer(modifier = Modifier.height(4.dp))
-
-                            val discoveryModes = listOf(
-                                "n0" to R.string.discovery_mode_n0,
-                                "none" to R.string.discovery_mode_none
-                            )
-                            discoveryModes.forEach { (mode, label) ->
-                                Row(
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 2.dp)
-                                ) {
-                                    RadioButton(
-                                        selected = discoveryMode == mode,
-                                        onClick = { viewModel.updateDiscoveryMode(mode) }
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(
-                                        stringResource(label),
-                                        style = MaterialTheme.typography.bodySmall
-                                    )
-                                }
-                            }
-
-                            if (relayMode == "custom") {
-                                Spacer(modifier = Modifier.height(8.dp))
-                                OutlinedTextField(
-                                    value = relayUrl,
-                                    onValueChange = { newUrl ->
-                                        // The token stays with the relay it was
-                                        // issued for: a URL that names another
-                                        // relay takes it with it.
-                                        if (!relayLocked) {
-                                            viewModel.updateRelayConfig(
-                                                relayMode,
-                                                newUrl,
-                                                RelayTokenChange.Bound
-                                            )
-                                        }
-                                    },
-                                    label = { Text(stringResource(R.string.relay_url_label)) },
-                                    placeholder = {
-                                        Text(stringResource(R.string.relay_url_placeholder))
-                                    },
-                                    enabled = !relayLocked,
-                                    modifier = Modifier.fillMaxWidth(),
-                                    singleLine = true
-                                )
-                                Spacer(modifier = Modifier.height(8.dp))
-                                OutlinedTextField(
-                                    value = relayAuthToken,
-                                    onValueChange = { newToken ->
-                                        // The token the user types belongs to the
-                                        // relay this screen is configuring.
-                                        if (!relayLocked) {
-                                            viewModel.updateRelayConfig(
-                                                relayMode,
-                                                relayUrl,
-                                                RelayTokenChange.Set(newToken)
-                                            )
-                                        }
-                                    },
-                                    label = { Text(stringResource(R.string.relay_token_label)) },
-                                    visualTransformation = PasswordVisualTransformation(),
-                                    enabled = !relayLocked,
-                                    modifier = Modifier.fillMaxWidth(),
-                                    singleLine = true
-                                )
-                                Text(
-                                    stringResource(R.string.relay_token_note),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-
-                        }
-                    }
-                }
-            }
+            VpnRelaySettingsCard(
+                viewModel = viewModel,
+                relayMode = relayMode,
+                relayUrl = relayUrl,
+                relayAuthToken = relayAuthToken,
+                discoveryMode = discoveryMode,
+                credentialUnlock = credentialUnlock,
+                expanded = showRelaySettings,
+                onToggleExpanded = { showRelaySettings = !showRelaySettings },
+                localizedContext = localizedContext
+            )
 
             Spacer(modifier = Modifier.height(80.dp))
         }
 
         if (showLogs) {
-            ModalBottomSheet(
-                onDismissRequest = { showLogs = false },
-                shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
-            ) {
-                Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            stringResource(R.string.logs_title),
-                            style = MaterialTheme.typography.titleLarge
-                        )
-                        Spacer(modifier = Modifier.weight(1f))
-                        IconButton(onClick = { viewModel.clearLogs() }) {
-                            Icon(
-                                Icons.Default.Delete,
-                                contentDescription = stringResource(R.string.logs_clear)
-                            )
-                        }
-                        IconButton(onClick = { showLogs = false }) {
-                            Icon(
-                                Icons.Default.Close,
-                                contentDescription = stringResource(R.string.action_close)
-                            )
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    LazyColumn(modifier = Modifier.height(300.dp)) {
-                        items(logMessages) { message ->
-                            Text(message, style = MaterialTheme.typography.bodySmall)
-                            Spacer(modifier = Modifier.height(4.dp))
-                        }
-                    }
-                }
-            }
+            VpnLogsSheet(
+                logMessages = logMessages,
+                onDismiss = { showLogs = false },
+                onClear = { viewModel.clearLogs() }
+            )
         }
 
         if (showPermissionGuide) {
@@ -1132,7 +434,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                     if (takeoverRememberChoice) {
                         viewModel.rememberVpnTakeoverChoice(VpnTakeoverChoice.TakeOver)
                     }
-                    if (permissionsReady(context)) {
+                    if (permissionsReady(context, viewModel) { showPermissionGuide = true }) {
                         viewModel.connect(context, allowTakeover = true)
                     }
                 },
@@ -1159,40 +461,22 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
         }
 
         pendingInviteImport?.let { invite ->
-            val conflicts = inviteConflicts(invite)
-            AlertDialog(
-                onDismissRequest = { pendingInviteImport = null },
-                title = { Text(stringResource(R.string.invite_import_title)) },
-                text = {
-                    Text(
-                        inviteSummary(invite) +
-                            if (conflicts.isEmpty()) {
-                                ""
-                            } else {
-                                stringResource(
-                                    R.string.invite_replaces,
-                                    conflicts.joinToString(" and ")
-                                )
-                            }
-                    )
+            InviteImportDialog(
+                summary = inviteSummary(invite, localizedContext),
+                conflicts = inviteConflicts(inviteSetup, localizedContext, invite),
+                onConfirm = {
+                    applyInviteImport(
+                        viewModel,
+                        inviteSetup,
+                        context,
+                        localizedContext,
+                        invite
+                    )?.let { failure ->
+                        Toast.makeText(context, failure, Toast.LENGTH_LONG).show()
+                    }
+                    pendingInviteImport = null
                 },
-                confirmButton = {
-                    NexaPrimaryButton(
-                        text = stringResource(R.string.action_import),
-                        onClick = {
-                            applyInviteImport(invite)?.let { failure ->
-                                Toast.makeText(context, failure, Toast.LENGTH_LONG).show()
-                            }
-                            pendingInviteImport = null
-                        }
-                    )
-                },
-                dismissButton = {
-                    NexaTextButton(
-                        text = stringResource(R.string.action_cancel),
-                        onClick = { pendingInviteImport = null }
-                    )
-                }
+                onDismiss = { pendingInviteImport = null }
             )
         }
 
