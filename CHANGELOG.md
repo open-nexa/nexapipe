@@ -1079,6 +1079,23 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **The local proxy no longer drops the bytes that came with the request
+  head.** The head reader keeps everything it read, so a client that wrote the
+  request head and the first bytes of the tunnel in one go has both in the
+  buffer by the time the head is complete. The ordinary HTTP path forwarded
+  them; the CONNECT and WebSocket paths did not, and they read the socket
+  again from there — and the socket had already given those bytes up, so they
+  were gone.
+
+  A CONNECT tunnel therefore began in the middle of whatever the client had
+  sent: a TLS client that pipelined its first record into the CONNECT got a
+  stream the far side could not read, and the failure surfaced as a TLS error
+  behind a `200 Connection Established` that had promised the tunnel was up. A
+  WebSocket lost its first frame for the same reason, and a browser that
+  coalesced the upgrade and the frame lost it.
+
+  Both branches forward the bytes now.
+
 - **The client and the server read the name inside a TLS `ClientHello` the
   same way now.** They each had a reader of their own, and the two did not
   agree. The server's walked the whole `server_name` list and took the entry
