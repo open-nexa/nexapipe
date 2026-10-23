@@ -117,6 +117,12 @@ use tokio::sync::mpsc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
+// The fd plumbing is Unix-only: it works in descriptors, and `dup(2)`,
+// `fcntl(2)` and the Unix socket pair its tests use have no Windows
+// counterpart. Gating the whole module here is what lets a host test build
+// compile on Windows — the gates inside `fd.rs` cannot do it on their own,
+// because `test` is true on every host that builds the unit-test harness.
+#[cfg(unix)]
 mod fd;
 mod tcp;
 mod udp;

@@ -6,7 +6,7 @@ Nexapipe is a Rust workspace: an iroh/QUIC-based proxy server forwarding HTTP/We
 
 - `crates/nexapipe/` — Server binary and library. Entry point `src/main.rs` (clap CLI: `--local-proxy`, `--generate-secret`); config in `src/config/`; iroh connection handling in `src/conn/` (which dispatches on a stream's first byte); HTTP/WebSocket proxying in `src/http/` and `src/proxy/`; TLS/byte passthrough in `src/passthrough.rs`; raw TCP/UDP flows in `src/l4/`; shared byte-copying helpers in `src/stream_util.rs`; routing in `src/routes/` and `src/lb/`; health checks in `src/health/`.
 - `crates/nexapipe-proto/` — The wire format and the rules both sides must agree on, linked by both the server and the client so that a rule is written down once: `preface.rs` (magic/version/proto/host/port plus the status byte), `udp.rs` (`u16`-length datagram framing), `auth.rs` (the handshake, the challenge a response signs and the close codes) and `deadline.rs` (the phase budgets both sides use). Change it here, never by hand on one side.
-- `crates/nexapipe-client/` — Client library (`lib` + `cdylib`). Connection pooling in `connection_pool.rs`, domain-to-endpoint mapping in `endpoint_group.rs`, HTTP/CONNECT/WebSocket tunneling in `local_proxy.rs`, the L4 tunnel client in `l4.rs`, smoltcp-based TUN proxy in `tun_proxy.rs`, per-domain TUN virtual IPs in `virtual_ip.rs`, JNI bindings in `jni.rs`, UniFFI bindings in `uniffi_bindings.rs`.
+- `crates/nexapipe-client/` — Client library (`lib` + `cdylib`). Connection pooling in `connection_pool/`, domain-to-endpoint mapping in `endpoint_group/`, HTTP/CONNECT/WebSocket tunneling in `local_proxy/`, the L4 tunnel client in `l4.rs`, smoltcp-based TUN proxy in `tun_proxy/`, per-domain TUN virtual IPs in `virtual_ip.rs`, JNI bindings in `jni/`, UniFFI bindings in `uniffi_bindings.rs`.
 - `ui-android/` — Android app (Kotlin); VPN/TUN orchestration lives in `app/src/main/java/com/nexa/pipe/vpn/NexaVpnService.kt` and calls the Rust client via JNI.
 - `ui-desktop/` — Tauri 2 desktop app (Vue 3 + TypeScript, Rust backend in `src-tauri/`).
 - Root — workspace `Cargo.toml`, `config.toml`, Dockerfiles, and the per-platform local build scripts (`build_dmg.sh` macOS, `build_deb.sh` Linux, `build_windows.ps1` Windows, `run_android.ps1` Android debug loop). Each mirrors the matching CI job: `--version` reproduces the tag-derived version, and `build_deb.sh` runs the same `verify-deb.sh` check as the Linux CI job.
@@ -23,13 +23,13 @@ This is a monorepo: `ui-android/` and `ui-desktop/` are plain directories (their
 - Android: `run_android.ps1` (cargo-ndk cdylib build with `jni,local-proxy,tun-proxy` + install/run on a device), `ui-android\gradlew.bat :app:compileDebugKotlin`.
 - Desktop: `cd ui-desktop && npm run tauri:dev` (dev) / `npm run tauri:build` (release); for a release-like package use `build_dmg.sh` / `build_deb.sh` / `build_windows.ps1` from the root.
 
-`crates/nexapipe-client/src/tun_proxy.rs` is shared by Android (fd entry, `TunProxy::new`) and the desktop (`TunProxy::with_io`); only the fd plumbing is android-gated inside. Host `cargo check -p nexapipe-client --features tun-proxy` covers the shared code, but the Android half still needs an explicit cross-check after touching the TUN or the L4 client:
+`crates/nexapipe-client/src/tun_proxy/` is shared by Android (fd entry, `TunProxy::new`) and the desktop (`TunProxy::with_io`); the fd plumbing in `tun_proxy/fd.rs` is Unix-only, and only its Android half is compiled there. Host `cargo check -p nexapipe-client --features tun-proxy` covers the shared code, but the Android half still needs an explicit cross-check after touching the TUN or the L4 client:
 
 ```bash
 cargo ndk -t arm64-v8a --platform 26 check -p nexapipe-client --features jni,local-proxy,tun-proxy
 ```
 
-`cargo test -p nexapipe-client --features tun-proxy` still runs on any host: it exercises the platform-independent parts of that feature, today `virtual_ip.rs`.
+`cargo test -p nexapipe-client --features tun-proxy` still runs on any host: it exercises the platform-independent parts of that feature — the DNS cache semantics, the virtual-IP allocation, the stack's own units. The one exception is the descriptor-takeover tests in `tun_proxy/fd.rs`: they need `dup(2)`, `fcntl(2)` and a Unix socket pair, so that module is compiled on Unix hosts only and its tests do not run on Windows.
 
 ## Coding Style & Naming Conventions
 
