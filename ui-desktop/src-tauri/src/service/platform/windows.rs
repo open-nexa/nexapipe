@@ -18,6 +18,7 @@ use super::{
 use crate::error::{codes, AppError};
 use crate::service::platform::account::AccountId;
 use crate::service::platform::install_owner;
+use crate::service::platform::install_version;
 
 /// Text `services.msc` shows for the entry.
 const SERVICE_DESCRIPTION: &str =

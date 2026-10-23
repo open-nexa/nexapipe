@@ -13,7 +13,10 @@
 //! "the installed service is older than this app" instead of showing a service that is
 //! running and an app that cannot talk to it.
 
-use super::install_owner::{self, STATE_DIR, STATE_ROOT};
+use super::install_owner::{self, STATE_DIR};
+#[cfg(unix)]
+use super::install_owner::STATE_ROOT;
+#[cfg(unix)]
 use crate::error::{codes, AppError};
 use std::path::{Path, PathBuf};
 
