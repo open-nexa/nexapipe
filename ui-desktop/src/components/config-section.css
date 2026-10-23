@@ -1,0 +1,136 @@
+/**
+ * The card every section of the configuration screen is drawn on, and the form primitives the
+ * sections share.
+ *
+ * The rules that style the shell's own markup are plain; the ones that style a section's markup
+ * are written with `:deep()`, because that markup is passed in as a slot and therefore carries
+ * the section's scope rather than this one's.
+ *
+ * The primitives are written down once, here, so that a section cannot drift away from the
+ * others: the network section, the relay section and the node list are three different pieces of
+ * the same screen, and a field that looked like one field in one of them would be a bug.
+ */
+
+/* The card itself. */
+.config-section {
+  background: var(--surface-1);
+  border-radius: var(--radius-lg);
+  padding: 20px;
+  box-shadow: var(--shadow-card);
+  border: 1px solid var(--border-light);
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.card-header h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.card-header-decoration {
+  flex: 1;
+  height: 2px;
+  background: var(--gradient-primary);
+  border-radius: 1px;
+}
+
+/* The form primitives the sections are built from. */
+:deep(.form-group) {
+  margin-bottom: 14px;
+}
+
+:deep(.form-group:last-child) {
+  margin-bottom: 0;
+}
+
+:deep(.form-grid) {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+}
+
+:deep(.form-label) {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}
+
+:deep(.input-wrapper) {
+  position: relative;
+}
+
+:deep(.input-icon) {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 16px;
+  height: 16px;
+  color: var(--text-muted);
+  z-index: 1;
+  /* Decoration only: it is laid over the field, so without this it takes the
+     click — on the leftmost sliver of an input, and on whatever a select would
+     have opened with it. */
+  pointer-events: none;
+}
+
+:deep(.input-icon svg) {
+  width: 100%;
+  height: 100%;
+}
+
+:deep(.form-input),
+:deep(.form-textarea),
+:deep(.form-select) {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1.5px solid var(--border-color);
+  border-radius: var(--radius-md);
+  font-size: 13px;
+  transition: all var(--transition-normal);
+  box-sizing: border-box;
+  background: var(--surface-1);
+  color: var(--text-primary);
+}
+
+:deep(.form-input) {
+  padding-left: 40px;
+}
+
+:deep(.form-input:focus),
+:deep(.form-textarea:focus),
+:deep(.form-select:focus) {
+  outline: none;
+  border-color: var(--primary-500);
+  box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+}
+
+:deep(.form-textarea) {
+  padding-left: 40px;
+  resize: vertical;
+  min-height: 56px;
+  line-height: 1.5;
+}
+
+:deep(.hint) {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin: 6px 0 0 0;
+}
+
+@media (max-width: 600px) {
+  :deep(.form-grid) {
+    grid-template-columns: 1fr;
+  }
+}
