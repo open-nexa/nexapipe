@@ -75,12 +75,15 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     val relayMode by viewModel.relayMode.collectAsState()
     val relayUrl by viewModel.relayUrl.collectAsState()
     val discoveryMode by viewModel.discoveryMode.collectAsState()
-    val relayAuthToken by viewModel.relayAuthToken.collectAsState()
+    // The token as it stands, and the relay it was issued for.
+    val relayToken by viewModel.relayToken.collectAsState()
+    val relayAuthToken = relayToken.token
     val credentialProtection by viewModel.credentialProtection.collectAsState()
     val plaintextConsentPending by viewModel.plaintextConsentPending.collectAsState()
     val vpnTakeoverChoice by viewModel.vpnTakeoverChoice.collectAsState()
     val autoConnectOnBoot by viewModel.autoConnectOnBoot.collectAsState()
     val vpnConsentMissing by viewModel.vpnConsentMissing.collectAsState()
+    val notice by viewModel.notice.collectAsState()
     // For the VPN-slot question asked before a connect: the check reads the
     // platform's VPN state off the main thread.
     val screenScope = rememberCoroutineScope()
@@ -143,6 +146,18 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     // user may have scrolled down into the settings when a connect attempt fails.
     LaunchedEffect(errorMessage) {
         errorMessage?.let { Toast.makeText(context, it, Toast.LENGTH_LONG).show() }
+    }
+
+    // What the settings did to a credential, rather than what went wrong: a
+    // relay change that dropped the token is something the user has to act
+    // on, and the settings they were looking at may be a screen away.
+    LaunchedEffect(notice) {
+        notice?.let {
+            Toast.makeText(context, it, Toast.LENGTH_LONG).show()
+            // Taken away once shown, so the same message is shown again the
+            // next time it is raised.
+            viewModel.clearNotice()
+        }
     }
 
     /**
@@ -245,7 +260,13 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
         // change is listed by `inviteConflicts`, which is what puts the
         // confirmation dialog in front of it — a relay that would actually be
         // overwritten is never applied silently.
-        invite.relay?.let { relay -> viewModel.updateRelayConfig("custom", relay) }
+        //
+        // The invite carries no token for the relay it names, so the token
+        // this phone holds goes with the import rather than travelling to a
+        // relay of the invite's choosing.
+        invite.relay?.let { relay ->
+            viewModel.updateRelayConfig("custom", relay, RelayTokenChange.Drop)
+        }
         invite.totp?.let { otp ->
             viewModel.updateNodeTwoFactor(
                 nodeId,
@@ -311,7 +332,7 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
      */
     fun inviteConflicts(invite: EndpointInvite): List<String> {
         val current = inviteNodeId(invite)?.let { id -> nodes.firstOrNull { it.nodeId == id } }
-        return inviteConflictKinds(current, invite, relayMode, relayUrl).map { kind ->
+        val conflicts = inviteConflictKinds(current, invite, relayMode, relayUrl).map { kind ->
             when (kind) {
                 InviteConflict.TwoFactor -> {
                     val client = current?.twoFactor?.clientId?.ifBlank {
@@ -326,7 +347,16 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                 InviteConflict.Relay ->
                     localizedContext.getString(R.string.invite_conflict_relay)
             }
+        }.toMutableList()
+        // An invite names a relay and carries no token for it, so the token
+        // this phone holds goes with the import. The confirmation says so:
+        // the user is the one who has to enter the token the relay asks for,
+        // and a credential that quietly travels to another relay is exactly
+        // what this rule exists to stop.
+        if (invite.relay != null && relayAuthToken.isNotBlank()) {
+            conflicts.add(localizedContext.getString(R.string.invite_conflict_relay_token))
         }
+        return conflicts
     }
 
     /** One line per field, so the confirmation reads like the invite itself. */
@@ -901,10 +931,18 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                                         R.string.credential_lock_relay_subtitle
                                                     )
                                                 ) {
-                                                    viewModel.updateRelayConfig(mode, relayUrl)
+                                                    viewModel.updateRelayConfig(
+                                                        mode,
+                                                        relayUrl,
+                                                        RelayTokenChange.Bound
+                                                    )
                                                 }
                                             } else {
-                                                viewModel.updateRelayConfig(mode, relayUrl)
+                                                viewModel.updateRelayConfig(
+                                                    mode,
+                                                    relayUrl,
+                                                    RelayTokenChange.Bound
+                                                )
                                             }
                                         }
                                     )
@@ -956,7 +994,16 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                 OutlinedTextField(
                                     value = relayUrl,
                                     onValueChange = { newUrl ->
-                                        if (!relayLocked) viewModel.updateRelayConfig(relayMode, newUrl)
+                                        // The token stays with the relay it was
+                                        // issued for: a URL that names another
+                                        // relay takes it with it.
+                                        if (!relayLocked) {
+                                            viewModel.updateRelayConfig(
+                                                relayMode,
+                                                newUrl,
+                                                RelayTokenChange.Bound
+                                            )
+                                        }
                                     },
                                     label = { Text(stringResource(R.string.relay_url_label)) },
                                     placeholder = {
@@ -970,8 +1017,14 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
                                 OutlinedTextField(
                                     value = relayAuthToken,
                                     onValueChange = { newToken ->
+                                        // The token the user types belongs to the
+                                        // relay this screen is configuring.
                                         if (!relayLocked) {
-                                            viewModel.updateRelayConfig(relayMode, relayUrl, newToken)
+                                            viewModel.updateRelayConfig(
+                                                relayMode,
+                                                relayUrl,
+                                                RelayTokenChange.Set(newToken)
+                                            )
                                         }
                                     },
                                     label = { Text(stringResource(R.string.relay_token_label)) },
