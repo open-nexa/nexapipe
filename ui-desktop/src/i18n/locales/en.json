@@ -248,9 +248,11 @@
     "relayDisabled": "Disabled (no relay at all)",
     "relayCustom": "Custom URL (exclusive)",
     "relayUrl": "Relay URL",
-    "relayUrlHint": "Required, and used on its own — no N0 relay. Applies on the next start.",
+    "relayUrlHint": "Required, and used on its own — no N0 relay. Applies on the next start. Changing it clears the relay auth token.",
     "relayAuthToken": "Relay auth token",
-    "relayAuthTokenHint": "Only if the relay requires one. The server needs the same token.",
+    "relayAuthTokenHint": "Only if the relay requires one. The server needs the same token. A token belongs to the relay it was issued for: change the relay above and it is cleared.",
+    "relayAuthTokenBoundTo": "Issued for {relay}.",
+    "relayTokenCleared": "The relay auth token was cleared: a token belongs to the relay it was issued for. Type this relay's token if it needs one.",
     "loadExample": "Load Example",
     "clearConfig": "Clear Config",
     "nodeFallback": "Node {index}"

@@ -19,6 +19,9 @@ import InviteImportDialog from "../components/InviteImportDialog.vue";
 const {
   config,
   updateConfig,
+  setRelayUrl,
+  setRelayMode,
+  setRelayAuthToken,
   removeNode,
   updateNodeDomains,
   applyInvite,
@@ -767,7 +770,7 @@ function clearConfig() {
               id="relayMode"
               v-model="config.relayMode"
               class="form-select"
-              @change="updateConfig({ relayMode: config.relayMode })"
+              @change="setRelayMode(config.relayMode)"
             >
               <option value="pinned">{{ t('config.relayPinned') }}</option>
               <option value="default">{{ t('config.relayDefault') }}</option>
@@ -792,7 +795,7 @@ function clearConfig() {
                 type="text"
                 placeholder="https://relay.example.com"
                 class="form-input"
-                @change="updateConfig({ relayUrl: config.relayUrl.trim() })"
+                @change="setRelayUrl(config.relayUrl)"
               />
             </div>
             <p class="hint">{{ t('config.relayUrlHint') }}</p>
@@ -815,10 +818,16 @@ function clearConfig() {
                 type="password"
                 :placeholder="t('common.optional')"
                 class="form-input"
-                @change="updateConfig({ relayAuthToken: config.relayAuthToken.trim() })"
+                @change="setRelayAuthToken(config.relayAuthToken)"
               />
             </div>
             <p class="hint">{{ t('config.relayAuthTokenHint') }}</p>
+            <!-- Which relay the stored token was issued for, so the pairing is
+                 visible: a token belongs to one relay, and the field says
+                 which. Empty when there is no token to pair it with. -->
+            <p v-if="config.relayAuthTokenRelay" class="hint">
+              {{ t('config.relayAuthTokenBoundTo', { relay: config.relayAuthTokenRelay }) }}
+            </p>
           </div>
         </div>
       </div>
