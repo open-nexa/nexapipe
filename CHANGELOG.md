@@ -1095,6 +1095,7 @@ lookup, which is what a config written before the key existed does.
   coalesced the upgrade and the frame lost it.
 
   Both branches forward the bytes now.
+
 - **The desktop app's check that its commands are granted to the webview runs
   when the command list changes.** The check reads the
   `tauri::generate_handler!` list out of `src/lib.rs` and fails the build when a
