@@ -1930,14 +1930,25 @@ async fn a_request_without_a_declared_length_has_no_body() {
         let mut client = tokio::net::TcpStream::connect(addr)
             .await
             .expect("the proxy is listening");
+        // The head and the request that follows it go out in one write.
+        //
+        // The rule under test is about the bytes that came *with* the head,
+        // and two writes leave their arrival to a race with the proxy's
+        // read: when the second write reaches the proxy in a segment of its
+        // own, the proxy sees a request that declares no body and nothing
+        // after it, and it goes on to serve that request — so the client is
+        // answered with whatever the backend says, or with nothing at all,
+        // rather than with the refusal this test is about.
+        //
+        // One write puts the two in the same segment, which is what "came
+        // with the head" means. A request that arrives in a segment of its
+        // own is a different thing, and
+        // `a_second_request_sent_while_the_first_one_is_waiting_is_not_relayed`
+        // is what says what happens to it.
         client
-            .write_all(head.as_bytes())
+            .write_all(format!("{head}GET /b HTTP/1.1\r\nHost: other.test\r\n\r\n").as_bytes())
             .await
             .expect("the request is written");
-        client
-            .write_all(b"GET /b HTTP/1.1\r\nHost: other.test\r\n\r\n")
-            .await
-            .expect("the second request is written");
 
         let mut answer = Vec::new();
         let _read = tokio::time::timeout(
