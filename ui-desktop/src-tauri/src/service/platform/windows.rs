@@ -5,9 +5,6 @@
 //! re-launched through the UAC prompt. The half that is not Windows is in
 //! `super`, and the two meet at the same public API.
 
-use super::{sc_state, ScState, ServiceState, SERVICE_DISPLAY_NAME, SERVICE_NAME};
-
-use std::io::Write;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};

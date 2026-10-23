@@ -5,7 +5,7 @@
 //! what this code writes has to be what it reads back, or a restore would leave
 //! its own files behind.
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 // The shared half of the configuration. The pure parsers of this platform are
