@@ -76,7 +76,38 @@ const nodeId = ref('');
 const busy = ref(false);
 const startupError = ref<AppError | null>(null);
 const serviceRunning = ref(false);
-const serviceInstalled = ref(false);
+
+/**
+ * What the service manager says about the service: not registered, registered and down, or
+ * registered and up.
+ *
+ * A third question from the IPC, which answers whether something is *answering* — and the
+ * two only agree when the service is the build this app expects.
+ */
+const serviceState = ref<'not_installed' | 'stopped' | 'running'>('not_installed');
+
+/**
+ * The service is registered with the service manager.
+ *
+ * Installed and answering are different facts: the install button disappears as soon as the
+ * unit exists, while TUN stays gated on the IPC connection actually being usable.
+ */
+const serviceInstalled = computed(() => serviceState.value !== 'not_installed');
+
+/**
+ * The service manager says the service is running, and nothing is answering on the IPC.
+ *
+ * The combination an upgrade leaves behind: the job is still there, running the build it
+ * was started with, while the app beside it is a newer one that cannot talk to it. Nothing
+ * is wrong with the service as far as the service manager is concerned, so the drift stays
+ * invisible unless the two answers are compared.
+ *
+ * Not the same as "the service is not running": that is a service that is down, and this is
+ * one that is up and speaking a language the app does not speak.
+ */
+const serviceStale = computed(
+  () => serviceState.value === 'running' && !serviceRunning.value,
+);
 
 /**
  * How each node is currently reaching its backend, filled in from the Rust side while the proxy
@@ -671,8 +702,10 @@ async function refreshServiceRunning(): Promise<void> {
   ]);
   serviceRunning.value = running;
   // Installed and answering are different facts: the install button disappears as soon as the
-  // unit exists, while TUN stays gated on the IPC connection actually being usable.
-  serviceInstalled.value = state !== 'not_installed';
+  // unit exists, while TUN stays gated on the IPC connection actually being usable. Which of
+  // the two says "running" is kept as well, because the service manager saying "running" while
+  // nothing answers is what an upgrade leaves behind.
+  serviceState.value = state;
 
   // TUN cannot run without the service, so an uninstalled service must not leave a latent
   // request behind (rule 3): the toggle flips back off and says why.
@@ -694,7 +727,15 @@ async function refreshServiceRunning(): Promise<void> {
  */
 function setUseTun(enabled: boolean): void {
   if (enabled && !serviceRunning.value) {
-    toast.warning(translate('connect.tunRequiresService'));
+    // Two different refusals: a service that is not there at all, and one that is there
+    // but running a build this app cannot talk to. The second has a way out — a reinstall
+    // — and telling somebody to "install it first" about a service that is already
+    // installed sends them looking for the wrong thing.
+    toast.warning(
+      serviceStale.value
+        ? translate('connect.tunServiceStale')
+        : translate('connect.tunRequiresService'),
+    );
     return;
   }
 
@@ -826,6 +867,8 @@ export function useProxyStore() {
     startupError,
     serviceRunning,
     serviceInstalled,
+    /** The service manager says the service is running and nothing answers it — a drift. */
+    serviceStale,
     /** How each node is currently reaching its backend. */
     endpointLinks,
     /** Whether each node answered its last probe. */

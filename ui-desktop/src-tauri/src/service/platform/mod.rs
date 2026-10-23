@@ -17,6 +17,7 @@ pub const SERVICE_DISPLAY_NAME: &str = "Nexa Service";
 
 pub mod account;
 pub mod install_owner;
+pub mod install_version;
 
 use serde::{Deserialize, Serialize};
 

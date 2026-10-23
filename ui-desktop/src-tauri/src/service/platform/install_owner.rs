@@ -131,7 +131,7 @@ pub fn record_installed_by(account: &AccountId) -> Result<(), crate::error::AppE
 /// the new one and never an empty file; the directory is flushed afterwards,
 /// so the replacement survives a crash.
 #[cfg(unix)]
-fn write_record_atomically(
+pub(super) fn write_record_atomically(
     path: &Path,
     directory: &Path,
     bytes: &[u8],
@@ -250,6 +250,21 @@ fn is_root_owned(path: &Path) -> bool {
 /// registry key.
 #[cfg(windows)]
 fn read_installed_by_windows() -> Option<AccountId> {
+    let text = read_service_registry_value(OWNER_VALUE)?;
+    AccountId::parse(&text)
+}
+
+/// A string value from the service's own registry key.
+///
+/// The key is the one the control manager owns, so only SYSTEM and the administrators may
+/// write in it — which is what makes a value in it a record rather than a note. The desktop
+/// may read `HKLM` without any rights of its own, so a value written here is one the
+/// unprivileged panel can read.
+///
+/// `None` when the value is not there, or is not a string: a value of another type is not
+/// the one that was written.
+#[cfg(windows)]
+pub(super) fn read_service_registry_value(value_name: &str) -> Option<String> {
     use crate::service::platform::SERVICE_NAME;
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::WIN32_ERROR;
@@ -259,7 +274,7 @@ fn read_installed_by_windows() -> Option<AccountId> {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
-    let value: Vec<u16> = OWNER_VALUE
+    let value: Vec<u16> = value_name
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -298,7 +313,9 @@ fn read_installed_by_windows() -> Option<AccountId> {
 
         // The size the call reports includes the terminator.
         let units = (read as usize / 2).saturating_sub(1);
-        AccountId::parse(&String::from_utf16_lossy(&buffer[..units]))
+        let text = String::from_utf16_lossy(&buffer[..units]);
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
     }
 }
 

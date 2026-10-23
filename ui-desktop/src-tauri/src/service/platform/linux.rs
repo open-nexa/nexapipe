@@ -41,6 +41,12 @@ pub fn install_service_linux(
         );
     }
 
+    // Which build this service is, written beside the account record. The desktop reads it
+    // to tell an old service from its own — a question the service itself cannot answer
+    // once it has been left behind by an upgrade, because the two no longer speak the same
+    // protocol.
+    install_version::record_installed_version(crate::service::ipc::BUILD_VERSION)?;
+
     let output = Command::new("systemctl")
         .args(["daemon-reload"])
         .output()
@@ -180,6 +186,10 @@ pub fn uninstall_service_linux() -> Result<(), AppError> {
     // The record of which account the service served goes with it: a service
     // that is no longer installed has no account to serve.
     install_owner::forget_installed_by();
+    // And so does the record of which build it was: a service that is gone has
+    // no build, and a version left behind would be read as the version of a
+    // service that is not there.
+    install_version::forget_installed_version();
 
     let _ = Command::new("systemctl").args(["daemon-reload"]).output();
 
