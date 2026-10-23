@@ -8,6 +8,7 @@ mod client;
 mod forward;
 mod legacy;
 mod response;
+pub mod server;
 
 #[cfg(test)]
 mod tests;
