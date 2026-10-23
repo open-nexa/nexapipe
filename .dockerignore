@@ -4,8 +4,6 @@ certs/
 .git/
 .gitignore
 .dockerignore
-.workbuddy/
-.workbuddy-ai/
 .worktrees/
 examples/
 ui-android/

@@ -312,7 +312,7 @@ fn enrollment_messages_keep_their_wire_names() {
         device_id: None,
         public_key: None,
     };
-    let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(start.to_bytes().unwrap().to_vec()).unwrap();
     assert!(json.contains(r#""type":"ENROLL_START""#), "{json}");
 
     let issue = AuthMessage::EnrollIssue {
@@ -323,13 +323,13 @@ fn enrollment_messages_keep_their_wire_names() {
         period: 30,
         device_id: None,
     };
-    let json = String::from_utf8(issue.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(issue.to_bytes().unwrap().to_vec()).unwrap();
     assert!(json.contains(r#""type":"ENROLL_ISSUE""#), "{json}");
 
     let failed = AuthMessage::EnrollFailed {
         reason: "no".to_string(),
     };
-    let json = String::from_utf8(failed.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(failed.to_bytes().unwrap().to_vec()).unwrap();
     assert!(json.contains(r#""type":"ENROLL_FAILED""#), "{json}");
 }
 
@@ -347,7 +347,7 @@ fn an_enrollment_without_a_key_still_parses_on_the_wire() {
         other => panic!("expected ENROLL_START, got {other:?}"),
     }
     assert_eq!(
-        start.to_bytes().unwrap(),
+        *start.to_bytes().unwrap(),
         wire.to_vec(),
         "no public_key goes out as no public_key"
     );
@@ -366,7 +366,7 @@ fn an_enrollment_offering_a_key_round_trips_byte_exactly() {
         ),
         other => panic!("expected ENROLL_START, got {other:?}"),
     }
-    assert_eq!(start.to_bytes().unwrap(), wire.to_vec());
+    assert_eq!(*start.to_bytes().unwrap(), wire.to_vec());
 }
 
 /// The offer is made of the public half, lowercase hex — the spelling the
@@ -395,7 +395,7 @@ fn an_enrollment_can_offer_a_key_beside_its_device_name() {
             .as_ref()
             .map(|key| hex::encode(key.public().as_bytes())),
     };
-    let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(start.to_bytes().unwrap().to_vec()).unwrap();
     assert!(
         json.contains(&format!(r#""public_key":"{public_key}""#)),
         "{json}"
@@ -512,7 +512,7 @@ fn a_named_device_speaks_on_both_messages() {
         device_id: auth.device_id().map(str::to_string),
         version: None,
     };
-    let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(start.to_bytes().unwrap().to_vec()).unwrap();
     assert!(json.contains(r#""device_id":"laptop-7f3a9c21""#), "{json}");
 
     let response = AuthMessage::Response {
@@ -522,7 +522,7 @@ fn a_named_device_speaks_on_both_messages() {
         signature: vec![0u8; 32],
         device_id: auth.device_id().map(str::to_string),
     };
-    let json = String::from_utf8(response.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(response.to_bytes().unwrap().to_vec()).unwrap();
     assert!(json.contains(r#""device_id":"laptop-7f3a9c21""#), "{json}");
 }
 
@@ -541,7 +541,7 @@ fn an_unnamed_device_leaves_the_field_off_the_wire() {
         device_id: auth.device_id().map(str::to_string),
         version: None,
     };
-    let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(start.to_bytes().unwrap().to_vec()).unwrap();
     assert!(!json.contains("device_id"), "{json}");
 }
 
@@ -648,7 +648,7 @@ fn the_first_message_announces_the_version_the_client_speaks() {
         Some(VERSION_BINARY),
         "the client says which version it speaks"
     );
-    let json = String::from_utf8(start.to_bytes().unwrap()).unwrap();
+    let json = String::from_utf8(start.to_bytes().unwrap().to_vec()).unwrap();
     assert!(json.contains(r#""version":1"#), "{json}");
 }
 

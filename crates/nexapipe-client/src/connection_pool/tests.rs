@@ -7,10 +7,9 @@ use super::borrow::{MAX_FLOWS_PER_CONNECTION, is_idle_since};
 use super::link_status::is_measured_rtt;
 use super::paths::PathHealth;
 use super::{
-    ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY, BorrowState, CONNECTION_IDLE_TIMEOUT, DialOutcome,
-    IrohConnectionPool, LinkKind, LinkStatus, MAX_CONNECTIONS_PER_PROTOCOL, PoolRefusal,
-    connections_for, drop_stale_connections, encode_link_status, identity_changed, may_pool,
-    may_publish,
+    BorrowState, CONNECTION_IDLE_TIMEOUT, DialOutcome, IrohConnectionPool, LinkKind, LinkStatus,
+    MAX_CONNECTIONS_PER_PROTOCOL, PoolRefusal, connections_for, drop_stale_connections,
+    encode_link_status, identity_changed, may_pool, may_publish,
 };
 use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
 #[cfg(feature = "local-proxy")]
@@ -20,6 +19,7 @@ use iroh::endpoint::presets;
 use nexapipe_proto::auth::{Algorithm, AuthMessage, Format};
 use nexapipe_proto::protocol::Protocol;
 use nexapipe_proto::secret::SecretString;
+use nexapipe_proto::{ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY};
 use nexapipe_proto::{L4Proto, Preface};
 use std::net::SocketAddr;
 use std::sync::Arc;

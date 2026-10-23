@@ -22,7 +22,7 @@
                           platform — a thing to fix in the lockfile rather than
                           at build time. Probe first, wipe and reinstall from the
                           committed lockfile if it fails.
-      3. Override       - write ui-desktop/.workbuddy/build-override.json (not tracked)
+      3. Override       - write ui-desktop/src-tauri/target/build-override.json (not tracked)
                           doing three things:
                           * bundle.resources: pick wintun/bin/<arch>/wintun.dll by
                             architecture - an arm64 bundle must never ship the amd64 DLL
@@ -151,9 +151,9 @@ $NodeModules = [IO.Path]::Combine($DesktopDir, 'node_modules')
 # src-tauri/Cargo.toml depends on ../../crates/nexapipe-client: two levels above
 # src-tauri is exactly the repository root, where crates/ lives in this monorepo.
 $ClientCrate = [IO.Path]::Combine($RepoRoot, 'crates', 'nexapipe-client', 'Cargo.toml')
-# The generated override goes under ui-desktop/.workbuddy: that directory is already
-# ignored by ui-desktop/.gitignore, so it never pollutes git status.
-$OverrideDir = [IO.Path]::Combine($DesktopDir, '.workbuddy')
+# The generated override goes under src-tauri/target: that directory is already
+# ignored by the root .gitignore, so it never pollutes git status.
+$OverrideDir = [IO.Path]::Combine($SrcTauriDir, 'target')
 $OverrideFile = [IO.Path]::Combine($OverrideDir, 'build-override.json')
 $ProfileDir  = [IO.Path]::Combine($SrcTauriDir, 'target', $Triple, $CargoProfile)
 $BundleDir   = [IO.Path]::Combine($ProfileDir, 'bundle')

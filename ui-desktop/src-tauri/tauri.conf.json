@@ -36,7 +36,9 @@
     "windows": {
       "nsis": {
         "installerHooks": "./windows/hooks.nsh"
-      }
+      },
+      "digestAlgorithm": "sha256",
+      "timestampUrl": "http://timestamp.digicert.com"
     },
     "resources": [
       "wintun/bin/amd64/wintun.dll"

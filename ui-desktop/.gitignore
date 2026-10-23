@@ -22,7 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
-.workbuddy
 
 # 防止误提交签名密钥。
 # 注意：在 Git Bash 里 `npx tauri signer generate -w ~/.tauri/x.key` 不会展开 ~，
