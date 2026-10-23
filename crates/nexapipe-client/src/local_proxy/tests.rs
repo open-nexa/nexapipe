@@ -2237,7 +2237,7 @@ async fn a_second_request_sent_while_the_first_one_is_waiting_is_not_relayed() {
     // is still to come.
     tokio::time::sleep(Duration::from_millis(100)).await;
     let _ = stream
-        .write_all(format!("GET /b HTTP/1.1\r\nHost: other.test\r\n\r\n").as_bytes())
+        .write_all(b"GET /b HTTP/1.1\r\nHost: other.test\r\n\r\n")
         .await;
 
     let mut answer = Vec::new();
