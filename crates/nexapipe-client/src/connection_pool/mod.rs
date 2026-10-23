@@ -100,7 +100,14 @@ const RTT_POLL_INTERVAL: tokio::time::Duration = tokio::time::Duration::from_sec
 /// preconnect at its own deadline, and a cancelled connect reports nothing — so a
 /// node that hangs stayed silent, which is exactly the case that needs explaining.
 /// With a smaller budget here, the timeout (or iroh's error) surfaces in the log.
-const PRECONNECT_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(6);
+///
+/// Ten seconds, because a handshake over a relayed path was measured at about
+/// seven: four when the relay was quick, and more than the old six-second
+/// budget when it was not. A budget shorter than the handshake abandons it half
+/// way — the backend is reported unreachable for being slow, and the server,
+/// still waiting for a handshake that will never finish, logs the abandoned one
+/// as a timeout of its own.
+const PRECONNECT_CONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(10);
 
 /// How long a freshly established connection is watched for a 2FA refusal when
 /// this client has no credentials.
@@ -128,7 +135,10 @@ const AUTH_REQUIRED_GRACE: tokio::time::Duration = tokio::time::Duration::from_s
 /// a backend that demands 2FA starts to look like one that is merely
 /// unreachable, with the reason lost — which is why this is the sum and not
 /// something tighter.
-pub(crate) const PRECONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(12);
+///
+/// Eighteen seconds, which is the ten the connect may spend plus the six the
+/// observation may, with the slack the sum does not need.
+pub(crate) const PRECONNECT_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(18);
 
 /// Both halves have to fit, or the observation is what gets cut.
 const _: () = assert!(
