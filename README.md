@@ -120,8 +120,8 @@ bindings for Swift/Kotlin/Python. See
 | `third_party/smoltcp` | Vendored smoltcp 0.12 with a patch for the sequence-number underflow panic. Wired in through `[patch.crates-io]`. Do not edit. |
 | `ui-android/` | Android app (Kotlin + Compose). |
 | `ui-desktop/` | Tauri 2 desktop app (Vue 3 + TypeScript). |
-| `config.toml.example` | Example server + client configuration covering every section (2FA off). Copy it to `config.toml` — that name is gitignored, it is the operator's live config. The docker compose file uses `config/config.toml` instead, picked up via `NEXAPIPE_CONFIG_DIR=/app/config`. |
-| `config.toml.2fa.example` | The same, with 2FA enabled and a `[auth.clients]` entry. |
+| `config.toml.example` | Example server + client configuration covering every section (2FA on, no client enrolled). Copy it to `config.toml` — that name is gitignored, it is the operator's live config. The docker compose file uses `config/config.toml` instead, picked up via `NEXAPIPE_CONFIG_DIR=/app/config`. |
+| `config.toml.2fa.example` | The short file that is only about 2FA, with a `[auth.clients]` entry. 2FA is on in both examples. |
 | `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat). |
 
 ---
@@ -144,7 +144,15 @@ Three lines is a working server: one catch-all route, one backend, every other k
 left at its default. The client side is the same length — see
 [Minimal config](#minimal-config), which also lists what each omitted key
 defaults to. Start from `config.toml.example` instead when you want every
-section written out, or `config.toml.2fa.example` when you want 2FA on.
+section written out, or `config.toml.2fa.example` for the short file that is
+only about 2FA.
+
+The example ships with 2FA on and no client enrolled, so nothing connects until
+the first client is — enroll it with
+`nexapipe --generate-invite client-001 --create-client`. The runtime default is
+still 2FA **off**: a config with no `[auth]` section keeps it, so a deployment
+that upgrades is not suddenly asked for a credential its clients were never
+given. The example is where a fresh install's defaults live.
 
 Leave the file out entirely and the server writes a minimal `config.toml` for you
 instead of refusing to start — 2FA on, nothing routed, nothing enrolled. It is a
@@ -233,6 +241,17 @@ sudo chown -R 1000:1000 config secrets logs # the image runs as uid 1000
 docker compose up -d --build
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
+
+The example ships with 2FA on and no client enrolled, so the server refuses
+every connection until the first client exists. Enroll it inside the container:
+
+```bash
+docker compose exec nexapipe nexapipe --generate-invite client-001 --create-client --config /app/config/config.toml
+```
+
+The invite it prints carries a one-time enrollment token rather than the
+secret: the first device to scan it trades the token for a secret of its own,
+and the link stops being a credential there and then.
 
 `docker-compose.yaml` mounts a `config/` directory — the one holding your
 `config.toml` — a `secrets/` directory for the endpoint identity, and a `logs/`
@@ -391,6 +410,13 @@ sudo chmod 700 /etc/nexapipe
 sudo chmod 600 /etc/nexapipe/config.toml
 ```
 
+The copied file ships with 2FA on and no client enrolled, so nothing connects
+until the first client is:
+
+```bash
+nexapipe --generate-invite client-001 --create-client --config /etc/nexapipe/config.toml
+```
+
 Then `/etc/systemd/system/nexapipe.service`:
 
 ```ini
@@ -524,8 +550,8 @@ will name.
 | `--qr-format <FMT>` | `unicode` (default), `plain`, `ascii`, `svg`, `none`. |
 | `--qr-invert` | Draw the QR code inverted (light on dark). |
 | `--qr-out <PATH>` | Also write the QR code to a file (`.svg` → SVG, anything else → ASCII). |
-| `--generate-invite [CLIENT_ID]` | Print a scannable `nexapipe://` invite. With a `CLIENT_ID` it carries the 2FA secret too; without one, only endpoint and domains. |
-| `--registration` | With `--generate-invite CLIENT_ID`: put a one-time enrollment token in the link instead of the secret. |
+| `--generate-invite [CLIENT_ID]` | Print a scannable `nexapipe://` invite. With a `CLIENT_ID` it carries that client's 2FA credential — the long-lived secret for a client that already exists, or a one-time enrollment token for a client `--create-client` just created; without one, only endpoint and domains. |
+| `--registration` | With `--generate-invite CLIENT_ID`: put a one-time enrollment token in the link instead of the secret. That is already what a client `--create-client` creates in the same run gets. |
 | `--create-client` | With `--generate-invite CLIENT_ID`: create the client if it does not exist yet, generating and writing its secret in the same run. |
 | `--invite-domains <LIST>` | Domains to put in the invite, comma-separated (default: `[local_proxy] proxy_domains`, else the route hosts). |
 | `--invite-name <NAME>` | Label stored alongside the endpoint. |
@@ -1678,18 +1704,24 @@ terminal entirely.
 
 `--generate-invite CLIENT_ID` hands out the secret a client *already* has, so it
 refuses a `CLIENT_ID` that is not in `[auth.clients]`. `--create-client` folds
-"create" and "invite" into one run — the secret is generated, written to the
-config and put into the invite:
+"create" and "invite" into one run — the secret is generated and written to the
+config, and the invite carries a **one-time enrollment token** for it:
 
 ```bash
 cargo run -p nexapipe -- --generate-invite client-001 --create-client
 cargo run -p nexapipe -- --generate-invite client-001 --create-client --registration
 ```
 
+- **The link carries a token, not the secret.** The secret was minted a moment
+  earlier and was in nobody's hands, so the first device to scan the link trades
+  the token for a secret of its own — and the link stops being a credential
+  there and then. With `[auth] enabled = false` the token could never be
+  exchanged, so the secret form stands and the output says why.
 - **It never touches a client that already exists.** A run against a configured
   client reuses the stored secret instead of minting a second one, which would
-  lock out every device enrolled with the first. Rotating stays the explicit
-  `--generate-2fa CLIENT_ID --force`.
+  lock out every device enrolled with the first. That link keeps carrying the
+  secret — a credential for as long as that secret lives — and the output says
+  so. Rotating stays the explicit `--generate-2fa CLIENT_ID --force`.
 - **It only fills in a client that is missing entirely.** A `[auth.clients.x]`
   section that exists with no `secret` is a broken file, not a blank to fill in.
 - **It is not a standalone "add a client" command** — it requires
@@ -1704,7 +1736,9 @@ picked up on its own (the file is re-read every 5 seconds), but changing
 ### Enrollment invites (`--registration`)
 
 The code above stays a credential for as long as the secret lives.
-`--registration` puts a **one-time enrollment token** in the link instead:
+`--registration` puts a **one-time enrollment token** in the link instead — and
+that is what the link already carries for a client `--create-client` created in
+the same run:
 
 ```bash
 cargo run -p nexapipe -- --generate-invite client-001 --registration
