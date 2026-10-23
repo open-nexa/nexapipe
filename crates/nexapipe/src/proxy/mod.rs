@@ -26,7 +26,7 @@ use iroh_tickets::Ticket;
 use iroh_tickets::endpoint::EndpointTicket;
 use nexapipe_client::discovery::DiscoveryMode;
 use nexapipe_client::relay::RelayModeSpec;
-use nexapipe_proto::protocol::Protocol;
+use nexapipe_proto::protocol::accepted_alpns;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -324,13 +324,10 @@ pub async fn run_proxy(
     // The last entry is the spelling clients used before the prefix byte was
     // dropped; a client of that vintage offers only that, and it reaches a
     // server of this one.
-    let mut builder = Endpoint::builder(presets::N0).alpns(vec![
-        Protocol::Http.alpn().to_vec(),
-        Protocol::L4.alpn().to_vec(),
-        Protocol::Tls.alpn().to_vec(),
-        ALPN_NEXAPIPE.to_vec(),
-        ALPN_NEXAPIPE_LEGACY.to_vec(),
-    ]);
+    //
+    // The list itself is written down once, in the crate the client links
+    // too: a list written down twice is a list that eventually differs.
+    let mut builder = Endpoint::builder(presets::N0).alpns(accepted_alpns());
 
     // Which relay we use, resolved by the same code the clients use, so the two cannot drift
     // apart. `None` means nothing was configured, which is iroh's default (every N0 relay).
@@ -1150,20 +1147,6 @@ pub async fn run_local_proxy(
 ) -> anyhow::Result<()> {
     local_proxy::run_local_proxy(local_proxy_config, shutdown_signal).await
 }
-
-// The ALPN this build speaks, and the one clients built before the prefix
-// byte was dropped use.
-//
-// The name used to carry a `0x05` prefix byte — the same byte the L4 preface
-// starts with — in front of the name. That byte was never part of a length
-// encoding; it made the protocol name a nine-byte string that began with a
-// control byte, which is a fingerprint on the wire and nothing else. The name
-// is now the name.
-//
-// The constants live in `nexapipe-proto`, which the client links too: the two
-// ends have to agree on the name, and a name written down twice is a name
-// that eventually differs.
-use nexapipe_proto::{ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY};
 
 #[cfg(test)]
 mod tests {

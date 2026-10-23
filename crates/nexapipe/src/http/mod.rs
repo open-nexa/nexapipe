@@ -12,10 +12,12 @@ mod response;
 pub mod server;
 mod websocket;
 
+// The tests of the HTTP half: the ones that need nothing but the code, and
+// the ones that need a backend that speaks TLS.
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-mod transport;
+mod transport_tests;
 
 pub use body::*;
 pub use client::*;

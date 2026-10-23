@@ -124,6 +124,51 @@ impl Protocol {
     }
 }
 
+/// Every ALPN the server accepts, in the order that decides the negotiation.
+///
+/// **This list is what decides.** QUIC picks the first of the *accept side's*
+/// entries that the peer also offers — not the first of the peer's offer. So
+/// the order below is the preference order: the per-protocol names first, so
+/// a client that asks for one protocol by name gets that one, and the generic
+/// names behind them for a client that asks for nothing in particular.
+///
+/// The list is written down once, here, because the two ends have to agree on
+/// it and a list written down twice is a list that eventually differs: the
+/// server builds its accept list from this, and the client builds its offer
+/// list from [`offered_alpns`].
+pub fn accepted_alpns() -> Vec<Vec<u8>> {
+    let mut list: Vec<Vec<u8>> = [Protocol::Http, Protocol::L4, Protocol::Tls]
+        .iter()
+        .map(|protocol| protocol.alpn().to_vec())
+        .collect();
+    list.extend(crate::ALPN_NEXAPIPE_ALL.iter().map(|alpn| alpn.to_vec()));
+    list
+}
+
+/// The ALPNs a client offers for a protocol.
+///
+/// The protocol it wants first, and the two generic names behind it: the
+/// current one, which says "the first byte of each stream decides", and the
+/// spelling that predates the prefix byte being dropped.
+///
+/// The order of the *offer* does not decide anything — the negotiation picks
+/// the first of the **accept side's** entries that the peer also offers — so
+/// what matters is that the server's list has the per-protocol names in front
+/// of the generic one, and that the client offers the one it wants.
+pub fn offered_alpns(protocol: Protocol) -> Vec<Vec<u8>> {
+    let mut list = vec![protocol.alpn().to_vec()];
+    // The generic names, minus the one the protocol already is: the generic
+    // protocol speaks the current generic name, and offering it twice would
+    // be the same name in the list twice.
+    list.extend(
+        crate::ALPN_NEXAPIPE_ALL
+            .iter()
+            .filter(|alpn| **alpn != protocol.alpn())
+            .map(|alpn| alpn.to_vec()),
+    );
+    list
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,16 +227,70 @@ mod tests {
     /// is refused at the door — so the two lists have to agree.
     #[test]
     fn every_alpn_the_server_accepts_names_a_protocol() {
-        for alpn in [
-            crate::ALPN_NEXAPIPE,
-            crate::ALPN_NEXAPIPE_LEGACY,
-            ALPN_HTTP,
-            ALPN_L4,
-            ALPN_TLS,
-        ] {
+        for alpn in accepted_alpns() {
             assert!(
-                Protocol::from_alpn(alpn).is_some(),
+                Protocol::from_alpn(&alpn).is_some(),
                 "{:?} is on the server's accept list and names no protocol",
+                String::from_utf8_lossy(&alpn)
+            );
+        }
+    }
+
+    /// The two lists negotiate the same thing.
+    ///
+    /// The server's accept list and the client's offer list are written down
+    /// once and composed from the same names, and this is what says the
+    /// composition did not change what is negotiated: the name QUIC picks is
+    /// the first of the *accept side's* entries that the peer also offers, and
+    /// that has to be the protocol the client asked for.
+    #[test]
+    fn the_two_lists_negotiate_the_same_thing() {
+        for protocol in [
+            Protocol::Http,
+            Protocol::L4,
+            Protocol::Tls,
+            Protocol::Legacy,
+        ] {
+            let offered = offered_alpns(protocol);
+            let accepted = accepted_alpns();
+            let negotiated = accepted
+                .iter()
+                .find(|alpn| offered.contains(alpn))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: the server accepts none of the names the client offers",
+                        protocol.name()
+                    )
+                });
+            assert_eq!(
+                negotiated,
+                &offered[0],
+                "{}: the server does not pick the protocol the client asked for",
+                protocol.name()
+            );
+        }
+    }
+
+    /// The generic names are in both lists, and the client offers the current
+    /// one first.
+    ///
+    /// The generic names are what a client of the older vintage speaks, and a
+    /// server that dropped them would refuse exactly the client they were
+    /// there for.
+    #[test]
+    fn the_generic_names_are_in_both_lists() {
+        let accepted = accepted_alpns();
+        let offered = offered_alpns(Protocol::Http);
+
+        for alpn in crate::ALPN_NEXAPIPE_ALL {
+            assert!(
+                accepted.contains(&alpn.to_vec()),
+                "{:?} is not on the server's accept list",
+                String::from_utf8_lossy(alpn)
+            );
+            assert!(
+                offered.contains(&alpn.to_vec()),
+                "{:?} is not in the client's offer",
                 String::from_utf8_lossy(alpn)
             );
         }

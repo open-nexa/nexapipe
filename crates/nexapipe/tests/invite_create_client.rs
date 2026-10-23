@@ -9,6 +9,13 @@
 //! behaviour and, just as importantly, the parts that must *not* change: an
 //! existing client keeps the secret it has, and `--create-client` on its own
 //! stays a usage error.
+//!
+//! The form of the invite is part of it. A client this run creates is handed
+//! out as a one-time enrollment token rather than as the secret: the secret was
+//! minted a moment ago and no device is enrolled with it, so the first device
+//! to scan the link trades the token for a secret of its own and the link stops
+//! being a credential there and then. A client that exists already keeps the
+//! secret its devices are enrolled with, and the link that carries it says so.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -99,11 +106,16 @@ fn configured_secret(config: &Path, client_id: &str) -> Option<String> {
     })
 }
 
-/// The whole point: one command creates the client *and* hands out its
-/// credential, and the two have to be the same secret or the invite is a
-/// credential the server rejects.
+/// The whole point: one command creates the client *and* hands out a
+/// credential for it.
+///
+/// The credential is the one-time token, not the secret. The secret was minted
+/// a moment ago and no device is enrolled with it, so there is nothing to lose
+/// by the first device trading the token for a secret of its own — and a link
+/// that carries the secret stays a password for as long as that secret lives,
+/// while a link that carries the token stops being one the moment it is used.
 #[test]
-fn creates_a_missing_client_and_puts_its_secret_in_the_invite() {
+fn creates_a_missing_client_and_puts_a_one_time_token_in_the_invite() {
     let (_dir, path) = scratch_config("config.toml");
 
     let (ok, output) = invite(
@@ -121,11 +133,25 @@ fn creates_a_missing_client_and_puts_its_secret_in_the_invite() {
         "creating and inviting in one step has to succeed:\n{output}"
     );
 
-    let invite_secret = invite_secret(&output).expect("the invite carries a secret");
-    assert_eq!(
-        configured_secret(&path, "client-001").as_deref(),
-        Some(invite_secret.as_str()),
-        "the invite must carry the very secret that was written to disk"
+    assert!(
+        output.contains("enroll="),
+        "the invite carries a one-time token:\n{output}"
+    );
+    assert!(
+        invite_secret(&output).is_none(),
+        "the invite must not carry the secret:\n{output}"
+    );
+
+    let (_, auth) = nexapipe::config::ProxyConfig::load_with_auth(path.to_str().unwrap())
+        .expect("config still parses");
+    let client = &auth.expect("[auth] exists").clients["client-001"];
+    assert!(
+        !client.secret.expose_secret().is_empty(),
+        "the client exists in the config"
+    );
+    assert!(
+        client.pending_enrollment.is_some(),
+        "the token is recorded in the config, so the server accepts it"
     );
 
     // The operator has to be told a client appeared, or the next `git diff`
@@ -183,6 +209,10 @@ fn creates_a_missing_client_for_an_enrollment_invite() {
 /// An existing client must keep the secret it has: `--create-client` says "make
 /// one if there is none", not "rotate this one". Silently issuing a second
 /// secret would lock every already-enrolled device out.
+///
+/// The first run creates the client and the second finds it, so the second
+/// invite carries the secret that is in the config — and that secret is the one
+/// the first run wrote, not a new one.
 #[test]
 fn an_existing_client_is_not_recreated() {
     let (_dir, path) = scratch_config("config.toml");
@@ -198,7 +228,7 @@ fn an_existing_client_is_not_recreated() {
         ],
     );
     assert!(ok, "{first}");
-    let original = invite_secret(&first).expect("secret in invite");
+    let original = configured_secret(&path, "client-001").expect("the client was created");
 
     let (ok, second) = invite(
         &path,
@@ -224,6 +254,95 @@ fn an_existing_client_is_not_recreated() {
     assert_eq!(
         configured_secret(&path, "client-001").as_deref(),
         Some(original.as_str())
+    );
+}
+
+/// A client that exists already is handed out as the secret it has, and the
+/// link says what that is: a password that stays one until the secret is
+/// rotated. The one-time form is named beside it, because the operator is the
+/// one who has to choose between them.
+#[test]
+fn an_existing_client_gets_a_link_that_says_it_is_a_credential() {
+    let (_dir, path) = scratch_config("config.toml");
+
+    let (ok, first) = invite(
+        &path,
+        &[
+            "--generate-invite",
+            "client-001",
+            "--create-client",
+            "--qr-format",
+            "none",
+        ],
+    );
+    assert!(ok, "{first}");
+
+    let (ok, second) = invite(
+        &path,
+        &["--generate-invite", "client-001", "--qr-format", "none"],
+    );
+    assert!(ok, "{second}");
+
+    assert!(
+        invite_secret(&second).is_some(),
+        "the link carries the secret:\n{second}"
+    );
+    assert!(
+        !second.contains("enroll="),
+        "the secret form is not the one-time form:\n{second}"
+    );
+    assert!(
+        second.contains("THIS LINK IS A CREDENTIAL"),
+        "the link says what it is:\n{second}"
+    );
+    assert!(
+        second.contains("--registration"),
+        "the one-time form is named:\n{second}"
+    );
+}
+
+/// The one-time form is only worth anything while the server runs the 2FA
+/// handshake, so with 2FA off a client this run creates falls back to the
+/// secret — and the output says why. "The link is a password" is a worse
+/// answer than "the link is a password because the server never asks for one".
+#[test]
+fn without_the_handshake_the_one_time_form_is_not_used() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "# my proxy\n\
+         \n\
+         [iroh]\n\
+         secret_key = \"f3d4cade20c162ac5bb9d582b84a10755b1bf61a44c05f4fec4e4282f2f1f9c0\"\n\
+         \n\
+         [auth]\n\
+         enabled = false\n",
+    )
+    .expect("write config");
+
+    let (ok, output) = invite(
+        &path,
+        &[
+            "--generate-invite",
+            "client-001",
+            "--create-client",
+            "--qr-format",
+            "none",
+        ],
+    );
+    assert!(ok, "{output}");
+    assert!(
+        invite_secret(&output).is_some(),
+        "the link carries the secret:\n{output}"
+    );
+    assert!(
+        !output.contains("enroll="),
+        "a token that could never be exchanged is not in the link:\n{output}"
+    );
+    assert!(
+        output.contains("one-time enrollment form was not used"),
+        "the output says why:\n{output}"
     );
 }
 
