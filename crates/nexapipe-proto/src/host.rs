@@ -9,8 +9,8 @@
 //!   `host_pattern` and against a client's `allow_hosts`;
 //! - the **client library**, deciding whether a `CONNECT` target is one it
 //!   proxies and whether a DNS query is for a name that belongs in the tunnel;
-//! - the **desktop app**, which has a second DNS server of its own and
-//!   therefore a second copy of the same question.
+//! - the **desktop app**, which answers the question through the client's own
+//!   DNS server rather than through a second copy of it.
 //!
 //! They drifted, and the drift was not cosmetic. The server's rule is strict —
 //! `*.example.com` is the subdomains and not the apex — while the client's was
@@ -21,10 +21,11 @@
 //! answered `NoRoute`, and the failure looked like the tunnel was broken
 //! rather than like the two halves spelled the pattern differently.
 //!
-//! The desktop made it worse by accident: on Windows the query is
-//! local-delivered to the app's own DNS server, and on macOS and Linux it
-//! traverses the TUN and reaches the library's. The same config, the same
-//! name, two different answers, decided by the platform.
+//! The desktop made it worse by accident: it ran a DNS server of its own, so
+//! on Windows the query was local-delivered to the app's own resolver and on
+//! macOS and Linux it traversed the TUN and reached the library's. The same
+//! config, the same name, two different answers, decided by the platform.
+//! There is one DNS server now — the client's — and the desktop asks it.
 //!
 //! So the rule lives here, in the crate both sides already link, and there is
 //! exactly one of it.

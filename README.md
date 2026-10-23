@@ -1943,7 +1943,15 @@ the same tags as the server.
 ### First launch on macOS
 
 The desktop bundles in a GitHub release are code-signed and notarized **when the
-release pipeline has the credentials for it**, and not when it does not.
+release pipeline has the credentials for it**, and the pipeline fails when it
+does not: a release with no signing material is not published, so a bundle that
+reaches a user carries a signature.
+
+(An operator who wants a test build without the credentials can say so
+explicitly — the release workflow's `allow_unsigned` input names the platforms
+to publish unsigned, logs it, and puts a warning at the top of the release
+notes. It is a decision somebody makes on purpose, not a fallback that
+happens.)
 
 The **application inside the disk image** is what is notarized: the bundler
 submits it to Apple, waits for the answer and staples the ticket to it, so a
@@ -1956,8 +1964,8 @@ application and signs the image. The release job says out loud whether
 Gatekeeper accepts the image it produced, so a gap here shows up in the job
 log rather than in a user's first launch.
 
-Without the credentials the bundle is unsigned, and Safari marks the
-downloaded DMG — and the app copied from it — as quarantined, so the first
+A bundle that is **not** signed — one published through the `allow_unsigned`
+opt-out, or one built locally — is quarantined by Safari, so the first
 launch is refused with:
 
 > "nexa" is damaged and can't be opened. You should move it to the Trash.
