@@ -112,6 +112,24 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 /// log as fast as it can connect.
 const REJECTED_LOG_EVERY: usize = 100;
 
+/// How long a plain-HTTP response's backend may be quiet before it is cut.
+///
+/// **An idle window, not a total.** Every chunk that arrives re-arms it, so
+/// a response that keeps arriving keeps its exchange alive however long it
+/// takes — a large download, an SSE stream, a long-poll — and only a *gap*
+/// of silence ends it.
+///
+/// The bound this replaces was a total one: sixty seconds from the moment
+/// the request went out, whatever else was happening. A response that was
+/// still arriving was cut at the minute, and because the socket was dropped
+/// rather than an answer written, the client was left holding a truncated
+/// body and no error to explain it.
+///
+/// The same quiet window the server gives a response — `response_idle_secs`,
+/// 120 s by default — so the two ends of a tunnel give up at about the same
+/// moment.
+const RESPONSE_IDLE: tokio::time::Duration = tokio::time::Duration::from_secs(120);
+
 #[derive(Clone)]
 pub struct LocalProxy {
     listener: Arc<TcpListener>,
@@ -1108,68 +1126,15 @@ where
     };
 
     let backend_to_client = async move {
-        let mut buf = vec![0u8; STREAM_BUF_SIZE];
-        let mut total_bytes = 0;
-        // The preview is only ever read when the debug log is on, so it is only
-        // built then: a 1.5 KiB buffer filled for every response, for a log
-        // line nobody asked for.
-        let mut debug_preview = debug_log_enabled().then(|| Vec::with_capacity(1500));
-        let mut response_sent = false;
-        loop {
-            match recv.read(&mut buf).await {
-                Ok(None) => break,
-                Ok(Some(n)) => {
-                    total_bytes += n;
-                    if let Some(preview) = debug_preview.as_mut()
-                        && !response_sent
-                        && preview.len() < 1500
-                    {
-                        preview.extend_from_slice(&buf[..std::cmp::min(n, 1500 - preview.len())]);
-                    }
-                    if let Err(e) = client_write.write_all(&buf[..n]).await {
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!("Backend to client write error: {}", e);
-                        break;
-                    }
-                    if let Err(e) = client_write.flush().await {
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!("Backend to client flush error: {}", e);
-                        break;
-                    }
-                    count_from_backend.record_received(n as u64);
-                    if !response_sent {
-                        response_sent = true;
-                        jni_log!("[DEBUG:local-proxy] Response sent: {} bytes", total_bytes);
-                        if let Some(preview) = debug_preview.as_ref()
-                            && !preview.is_empty()
-                        {
-                            jni_log!(
-                                "[DEBUG:local-proxy] Response preview: {}",
-                                String::from_utf8_lossy(preview)
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!("Backend read error: {}", e);
-                    break;
-                }
-            }
-        }
-        if !response_sent && total_bytes > 0 {
+        let outcome = relay_the_response(&mut recv, &mut client_write, RESPONSE_IDLE, &mut |n| {
+            count_from_backend.record_received(n as u64)
+        })
+        .await;
+        if matches!(outcome, ResponseRelay::Quiet) {
             jni_log!(
-                "[DEBUG:local-proxy] Response sent (late): {} bytes",
-                total_bytes
+                "[DEBUG:local-proxy] The backend went quiet for {:?} and the response was cut",
+                RESPONSE_IDLE
             );
-            if let Some(preview) = debug_preview.as_ref()
-                && !preview.is_empty()
-            {
-                jni_log!(
-                    "[DEBUG:local-proxy] Response preview: {}",
-                    String::from_utf8_lossy(preview)
-                );
-            }
         }
     };
     // END regular HTTP closures
@@ -1189,18 +1154,25 @@ where
         backend_task.abort_handle(),
     ]);
 
-    // Wait for the backend response to be fully relayed back to the client
-    // (bounded for streaming/long-lived responses). We must NOT wait for the
-    // client to close its TCP connection first: HTTP clients routinely keep the
-    // connection alive (keep-alive) after reading the response, so client_task
-    // would block indefinitely and the iroh connection would never be returned
-    // to the pool -- which defeats pre-connect/connection warm-up and leaks
-    // pooled connections.
-    // The timer and the cancel switch, together: this is the one path here that
-    // is bounded by a clock instead of by a peer going quiet, and being asked to
-    // end has to be able to cut that short rather than wait out the minute.
+    // Wait for the backend response to be fully relayed back to the client.
+    // We must NOT wait for the client to close its TCP connection first:
+    // HTTP clients routinely keep the connection alive (keep-alive) after
+    // reading the response, so client_task would block indefinitely and the
+    // iroh connection would never be returned to the pool -- which defeats
+    // pre-connect/connection warm-up and leaks pooled connections.
+    //
+    // **There is no clock of its own here.** The bound is the quiet window
+    // inside the relay: a response that keeps arriving keeps the exchange
+    // alive however long it takes, and only a backend that has gone quiet
+    // for a whole window ends it. The bound that used to sit here was a
+    // total one -- sixty seconds from the moment the request went out --
+    // which cut a response that was still arriving and left the client with
+    // a truncated body rather than an error.
+    //
+    // The cancel switch is still here: being asked to end has to be able to
+    // cut the exchange short rather than wait out the window.
     tokio::select! {
-        _ = tokio::time::timeout(tokio::time::Duration::from_secs(60), &mut backend_task) => (),
+        _ = &mut backend_task => (),
         _ = flow.cancelled() => (),
     }
 
@@ -1212,6 +1184,125 @@ where
 
     jni_log!("[DEBUG:local-proxy] Connection closed");
     Ok(())
+}
+
+/// How a relayed response ended.
+#[derive(Debug)]
+enum ResponseRelay {
+    /// The backend closed the stream: the response is over.
+    Complete,
+    /// The backend went quiet for a whole window: it is not coming back.
+    Quiet,
+    /// The backend's stream failed.
+    Failed,
+    /// The client is gone, or the write to it failed.
+    ClientGone,
+}
+
+/// Relay the backend's response to the client, with the quiet window as the
+/// bound.
+///
+/// **The bound is a gap, not a clock over the whole exchange.** Every chunk
+/// that arrives gives the next read a fresh window, so a response that keeps
+/// arriving keeps the exchange alive however long it takes — a large
+/// download, an SSE stream, a long-poll — and only a *gap* of silence ends
+/// it.
+///
+/// The bound that used to sit around this loop was a total one: sixty
+/// seconds from the moment the request went out, whatever else was
+/// happening. A response that was still arriving was cut at the minute, and
+/// because the socket was dropped rather than an answer written, the client
+/// was left holding a truncated body and no error to explain it.
+///
+/// `counted` is told how many bytes each chunk carried, so the flow's
+/// counter sees the response as it is relayed.
+async fn relay_the_response<R, W>(
+    backend: &mut R,
+    client: &mut W,
+    quiet: tokio::time::Duration,
+    counted: &mut (dyn FnMut(usize) + Send),
+) -> ResponseRelay
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; STREAM_BUF_SIZE];
+    let mut total_bytes = 0usize;
+    // The preview is only ever read when the debug log is on, so it is only
+    // built then: a 1.5 KiB buffer filled for every response, for a log
+    // line nobody asked for.
+    let mut debug_preview = debug_log_enabled().then(|| Vec::with_capacity(1500));
+    let mut response_sent = false;
+    let mut outcome = ResponseRelay::Complete;
+    loop {
+        // **The bound is here, on the read.** The window goes to the read
+        // that waits for the next chunk, and every chunk that arrives gives
+        // the next read a fresh one: a response that keeps arriving never
+        // runs out of time, and only a backend that has gone quiet for the
+        // whole window is cut.
+        let n = match tokio::time::timeout(quiet, backend.read(&mut buf)).await {
+            // The backend closed its side: the response is over.
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => {
+                #[cfg(feature = "tracing")]
+                tracing::debug!("Backend read error: {}", e);
+                outcome = ResponseRelay::Failed;
+                break;
+            }
+            Err(_) => {
+                outcome = ResponseRelay::Quiet;
+                break;
+            }
+        };
+        total_bytes += n;
+        if let Some(preview) = debug_preview.as_mut()
+            && !response_sent
+            && preview.len() < 1500
+        {
+            preview.extend_from_slice(&buf[..std::cmp::min(n, 1500 - preview.len())]);
+        }
+        if let Err(e) = client.write_all(&buf[..n]).await {
+            #[cfg(feature = "tracing")]
+            tracing::debug!("Backend to client write error: {}", e);
+            outcome = ResponseRelay::ClientGone;
+            break;
+        }
+        if let Err(e) = client.flush().await {
+            #[cfg(feature = "tracing")]
+            tracing::debug!("Backend to client flush error: {}", e);
+            outcome = ResponseRelay::ClientGone;
+            break;
+        }
+        counted(n);
+        if !response_sent {
+            response_sent = true;
+            jni_log!("[DEBUG:local-proxy] Response sent: {} bytes", total_bytes);
+            if let Some(preview) = debug_preview.as_ref()
+                && !preview.is_empty()
+            {
+                jni_log!(
+                    "[DEBUG:local-proxy] Response preview: {}",
+                    String::from_utf8_lossy(preview)
+                );
+            }
+        }
+    }
+    if !response_sent && total_bytes > 0 {
+        jni_log!(
+            "[DEBUG:local-proxy] Response sent (late): {} bytes",
+            total_bytes
+        );
+        if let Some(preview) = debug_preview.as_ref()
+            && !preview.is_empty()
+        {
+            jni_log!(
+                "[DEBUG:local-proxy] Response preview: {}",
+                String::from_utf8_lossy(preview)
+            );
+        }
+    }
+    outcome
 }
 
 /// Answer a `CONNECT` that cannot be served.
