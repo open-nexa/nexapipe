@@ -1079,6 +1079,21 @@ lookup, which is what a config written before the key existed does.
 
 ### Fixed
 
+- **A backend stays busy on the tunnel path for as long as its answer is out
+  there.** The count is what `least_conn` balances on, and an answer whose body
+  has not been read yet is a request the backend is still working on.
+
+  The plaintext path has always held the lease with the body. The tunnel path
+  dropped it with the head: the backend info was dropped when the forward
+  returned, and the lease went with it. A backend that was streaming a
+  response therefore looked idle to the balancer, and the next request was
+  handed to a backend that was already busy — which is the whole failure
+  `least_conn` exists to avoid.
+
+  The lease rides with the answer's body now, and the backend is free again
+  when the body is dropped: when the client has read it, or when the
+  connection goes away instead.
+
 - **The local proxy no longer drops the bytes that came with the request
   head.** The head reader keeps everything it read, so a client that wrote the
   request head and the first bytes of the tunnel in one go has both in the
