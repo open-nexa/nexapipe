@@ -319,7 +319,7 @@ docker compose exec nexapipe /usr/local/bin/nexapipe \
   从不把它写回，所以输掉这次竞争等于白丢一个邀请码，日志里什么都不留。
   2FA 计数曾经也在这个名单里——每次 2FA 尝试，服务端都要重写整个文件来落盘
   `failed_attempts` / `locked_until` / `last_used`。它们现在住在服务端自己的
-  `state.toml` 里，这场竞争也跟着一起没了。
+  状态文件（配置旁边的 `config.state.toml`）里，这场竞争也跟着一起没了。
 - **宿主机的二进制不是服务端的二进制。** `--generate-invite` 的端点由
   `[iroh] secret_key` 推导，所以 `nexapipe` 若和正在跑的那个不是同一个提交编出来的，
   生成的邀请码会指向一个没人在跑的端点。（"宿主机那份配置缺这个键"曾经也是触发方式之一；
@@ -430,7 +430,7 @@ systemd 替它建的目录外什么都不拥有」的服务准备的：那个 UI
 
 **配置目录必须保持可写。** 服务端会把已注册设备的密钥写回 `config.toml`，
 并在首次启动时在旁边写出 `config.toml.admin-token`。2FA 的计数
-（`failed_attempts`、`locked_until`、`last_used`）落在旁边的 `state.toml` 里 ——
+（`failed_attempts`、`locked_until`、`last_used`）落在旁边的 `config.state.toml` 里 ——
 那个文件归服务端自己所有，配置不会因为它被重写。首次启动时服务端也会写配置
 这个文件 —— 配置里没有 `[iroh] secret_key` 就会补上：所以即使从不注册客户端，目录
 也必须可写，否则 Node ID 每次重启都会变。`ReadWritePaths` 只放开这一个目录。
@@ -559,15 +559,20 @@ created_at = "1723756800"
 
 `config.toml` 是运维者的文件：他写的、他读的、他放进版本控制的。而运行中的服务端
 学到的东西——某个客户端输错几次密码、锁到什么时候、最后一次出现是什么时候——
-不属于这一类，所以它们住在配置**旁边**的 `state.toml` 里，格式相同，客户端与设备
+不属于这一类，所以它们住在配置**旁边**的状态文件里，格式相同，客户端与设备
 的名字也相同。
 
 ```
 /etc/nexapipe/
-├── config.toml     运维者的文件
-├── state.toml      服务端的计数（0600，由服务端写入）
+├── config.toml          运维者的文件
+├── config.state.toml    服务端的计数（0600，由服务端写入）
 └── config.toml.admin-token
 ```
+
+状态文件按配置文件的名称命名：`config.toml` 把状态放在 `config.state.toml`，
+`config.prod.toml` 放在 `config.prod.state.toml`，这样一个目录里的两份配置不会
+共用同一份锁定计数。命名规则出现之前留下的部署，其计数仍在旁边的 `state.toml`
+里——新文件还不存在时就读它。
 
 状态文件由服务端写，除此之外没有别人写它；配置也不会为了这些计数被重写。这个
 分离不只是为了整洁：服务端会盯着配置文件的修改时间，所以一个把计数写回配置的

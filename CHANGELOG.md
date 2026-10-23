@@ -1788,6 +1788,81 @@ lookup, which is what a config written before the key existed does.
   and a client built against the old one still talks to a server built against
   the new one.
 
+### Before upgrading
+
+No configuration key is removed or renamed, and every key this cycle adds is
+optional, so a `config.toml` that works on 0.6.1 still loads. Five things
+behave differently without being configured to.
+
+**The server**
+
+- **A config key the file does not know now refuses the start.** In 0.6.1 only
+  `[peers]` and `[auth]` refused unknown keys and the rest dropped them
+  silently; every section refuses them now, the top level included. The error
+  names the key and says what to do with it:
+
+  ```
+  unknown field `stray_key`, expected one of `default_backend`, `debug`, `routes`, `server`, `iroh`, ...
+  This build does not know that key: remove it, or fix its spelling.
+  ```
+
+  Run the server once against your config and fix what it names.
+
+- **The container image no longer runs as root.** It runs as uid 1000, so the
+  three mounted directories have to be writable by that uid. Run this **before
+  the first start** of an upgraded deployment, and with `sudo` — the files the
+  old root image wrote are root-owned:
+
+  ```bash
+  sudo chown -R 1000:1000 config secrets logs
+  ```
+
+  Skipping it does not always fail loudly: an `iroh.key` that cannot be opened
+  is *regenerated*, which is a new Node ID, and every client that stored the
+  old one stops finding the server.
+
+- **The runtime state moves into a file of its own.** The counters
+  (`failed_attempts`, `locked_until`, `last_used`) and the TOTP step memories
+  are written to a file named after the configuration — `config.toml` puts its
+  state in `config.state.toml`, `config.prod.toml` in
+  `config.prod.state.toml`. The old `state.toml` beside the configuration is
+  still read when the new one is not there yet, and the counters are still
+  read from `config.toml`, so **existing lockouts survive the upgrade**. The
+  configuration directory has to stay writable.
+
+- **Removed keys are still accepted and logged as ignored**: `[server]
+  tls_enabled`, `tls_listen_addr`, `cert_path` and `key_path`, the route-level
+  `cert_path`, `key_path` and `redirect_to_https`, and the `[acme]` section.
+  TLS is terminated by the backend now.
+
+- **What did not change.** `[auth] enabled` still defaults to `false` for a
+  config that has no `[auth]` section, so an existing deployment does not
+  suddenly demand a credential its clients were never given — only the
+  *shipped example* now starts with 2FA on and no client enrolled. The config
+  file's own permissions are still not gated, and the CLI is unchanged apart
+  from `client add --public-key`.
+
+**The clients**
+
+- **Nothing to enroll, nothing to rescan.** An existing secret keeps working:
+  the handshake, the ALPN and the L4 preface are unchanged on the wire, so a
+  0.6.1 client talks to a 1.0.0 server and the other way round. A client that
+  has no key keeps using its secret.
+
+- **Android: the tunnel's address block changes.** It was `10.0.1.0/24` and is
+  now the first block the host will take out of `198.18.0.0/24`,
+  `198.19.0.0/24`, `100.100.0.0/24`, `172.26.0.0/24`, `10.200.0.0/24` and
+  `10.0.0.0/24`. The addresses are internal to the tunnel; a rule of your own
+  that hard-codes `10.0.1.x` needs updating.
+
+- **Desktop: the credentials move out of `localStorage`.** They go into an
+  encrypted file whose master key the OS keychain holds. The migration is
+  automatic — a payload written before it is read once and its secrets are
+  written into the encrypted store. Nothing to do by hand.
+
+- **New, and off until asked for:** starting with the system, coming back
+  after a reboot, and a device key instead of a secret.
+
 ## [0.6.1] — 2026-10-11
 
 Two configuration keys are added (`[iroh] secret_key_file` and

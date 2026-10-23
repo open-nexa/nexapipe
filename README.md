@@ -356,8 +356,9 @@ goes wrong:
   writes it back, so losing the race costs you the invite and prints nothing.
   The 2FA counters used to be in this list too — the server rewrote the file to
   persist `failed_attempts` / `locked_until` / `last_used` whenever a 2FA
-  attempt happened. They live in `state.toml` now, a file of the server's own,
-  so that race is gone with them.
+  attempt happened. They live in a state file of the server's own now
+  (`config.state.toml`, beside the configuration), so that race is gone with
+  them.
 - **The host binary is not the server's binary.** `--generate-invite` derives the
   endpoint from `[iroh] secret_key`, so a `nexapipe` built from another commit
   than the running one can issue an invite pointing at an endpoint nobody is
@@ -370,8 +371,8 @@ goes wrong:
   into a sidecar file or the environment.
 
 The mount is read-write on purpose: the server writes `[iroh] secret_key` into
-`config.toml` on the first start, and the 2FA counters into `state.toml` beside
-it after every attempt, so a `:ro` mount would cost a lockout its persistence
+`config.toml` on the first start, and the 2FA counters into `config.state.toml`
+beside it after every attempt, so a `:ro` mount would cost a lockout its persistence
 and log an error on every attempt — and leave the Node ID changing on every
 restart. Set `NEXAPIPE_NO_PERSIST_IDENTITY=1` if the config genuinely has to stay
 read-only, and pin `[iroh] secret_key` by hand in that case, so the identity at
@@ -483,7 +484,7 @@ credential file in `/etc` is not one of them.
 **The config directory has to stay writable.** The server writes back into
 `config.toml` — an enrolled device's secret — and writes `config.toml.admin-token`
 beside it the first time it starts. The 2FA counters (`failed_attempts`,
-`locked_until`, `last_used`) go into `state.toml` beside it, and the state file
+`locked_until`, `last_used`) go into `config.state.toml` beside it, and the state file
 is the server's own: the configuration is not rewritten for them. On the very
 first start it writes there too, adding `[iroh] secret_key` when the config has
 none: a deployment that never enrolls a client still needs the directory
@@ -633,15 +634,21 @@ refused outright.
 `config.toml` is the operator's file: what they wrote, what they read, what they
 keep in version control. The things a running server learns — how many times a
 client mistyped a code, until when it is locked out, when it was last seen —
-are not that, so they live in `state.toml` **beside** the configuration, in the
+are not that, so they live in a state file **beside** the configuration, in the
 same shape and with the same client and device names.
 
 ```
 /etc/nexapipe/
-├── config.toml     the operator's file
-├── state.toml      the server's counters (0600, written by the server)
+├── config.toml          the operator's file
+├── config.state.toml    the server's counters (0600, written by the server)
 └── config.toml.admin-token
 ```
+
+The state file is named after the configuration: `config.toml` puts its state
+in `config.state.toml`, and `config.prod.toml` in `config.prod.state.toml`, so
+two configurations in one directory do not share their lockouts. A `state.toml`
+beside the configuration is still read when the named file is not there yet,
+which is where a deployment that predates the naming rule keeps its counters.
 
 The state file is written by the server and by nobody else, and the
 configuration file is never rewritten for the counters. That separation is not
