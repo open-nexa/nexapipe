@@ -147,8 +147,8 @@ secret = "JBSWY3DPEHPK3PXP"
 ///
 /// An inline `[iroh]` key is a credential on its own, and the files this
 /// server actually ships — `config.toml.example`, the generated first-run
-/// template — have no `[auth]` at all. A warning that only ran when an
-/// `AuthConfig` existed was silent for exactly those.
+/// template — carry one. A warning that only ran when an `AuthConfig`
+/// existed was silent for exactly those.
 #[cfg(unix)]
 #[test]
 fn an_inline_key_without_an_auth_section_is_warned_about() {
@@ -244,6 +244,67 @@ secret = "JBSWY3DPEHPK3PXP"
     .expect("the auth config parses");
 
     assert!(auth.holds_inline_secrets(), "a device's seed is a seed");
+}
+
+/// The port rule is read at the top level as well, so the server can say which
+/// of the two rules a client is held against.
+///
+/// A client with a port list and the strict flag off is the one an operator
+/// has to be told about: the list is checked against the port the client
+/// *names*, and a request that names no port is not checked at all. A client
+/// with no port list is not limited by ports at all, and a client with the
+/// strict flag on is held against the port the request is *served from* — the
+/// stronger rule, and the one that needs no warning.
+#[test]
+fn the_port_rule_is_read_at_the_top_level() {
+    let config = parse(
+        "[auth]\n\
+         enabled = true\n\
+         \n\
+         [auth.clients.named]\n\
+         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         allow_ports = [443]\n\
+         \n\
+         [auth.clients.strict]\n\
+         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         allow_ports = [443]\n\
+         allow_ports_strict = true\n\
+         \n\
+         [auth.clients.unlimited]\n\
+         secret = \"JBSWY3DPEHPK3PXP\"\n",
+    );
+
+    let rules = config.auth.expect("the [auth] section was read");
+    assert_eq!(
+        rules.clients_with_the_named_port_rule(),
+        vec!["named"],
+        "only the client with a port list and the strict flag off is reported"
+    );
+}
+
+/// The summary holds no credential.
+///
+/// The section it is read from holds the seeds, and a copy of them inside the
+/// configuration would be a second copy of every secret in the file, held for
+/// as long as the configuration lives. The two keys it keeps are not secrets,
+/// and nothing else is kept at all.
+#[test]
+fn the_port_rule_summary_holds_no_credential() {
+    let config = parse(
+        "[auth]\n\
+         enabled = true\n\
+         \n\
+         [auth.clients.client-001]\n\
+         secret = \"JBSWY3DPEHPK3PXP\"\n\
+         allow_ports = [443]\n",
+    );
+
+    let rules = config.auth.expect("the [auth] section was read");
+    let debug = format!("{rules:?}");
+    assert!(
+        !debug.contains("JBSWY3DPEHPK3PXP"),
+        "the seed was copied into the configuration: {debug}"
+    );
 }
 
 fn parse(source: &str) -> ProxyConfig {

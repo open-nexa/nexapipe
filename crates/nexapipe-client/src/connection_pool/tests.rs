@@ -5,10 +5,12 @@
 //! testing.
 use super::borrow::{MAX_FLOWS_PER_CONNECTION, is_idle_since};
 use super::link_status::is_measured_rtt;
+use super::paths::PathHealth;
 use super::{
     ALPN_NEXAPIPE, ALPN_NEXAPIPE_LEGACY, BorrowState, CONNECTION_IDLE_TIMEOUT, DialOutcome,
     IrohConnectionPool, LinkKind, LinkStatus, MAX_CONNECTIONS_PER_PROTOCOL, PoolRefusal,
-    connections_for, encode_link_status, identity_changed, may_pool, may_publish,
+    connections_for, drop_stale_connections, encode_link_status, identity_changed, may_pool,
+    may_publish,
 };
 use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
 #[cfg(feature = "local-proxy")]
@@ -1103,6 +1105,7 @@ async fn the_ceiling_is_refused_for_that_protocol_alone() {
                 Arc::new(BorrowState::new()),
                 Protocol::Http,
                 generation(&pool),
+                Arc::new(PathHealth::default()),
             )
             .await
             .is_ok(),
@@ -1124,6 +1127,7 @@ async fn the_ceiling_is_refused_for_that_protocol_alone() {
                 Arc::new(BorrowState::new()),
                 Protocol::Http,
                 generation(&pool),
+                Arc::new(PathHealth::default()),
             )
             .await,
             Err(PoolRefusal::Full)
@@ -1142,6 +1146,7 @@ async fn the_ceiling_is_refused_for_that_protocol_alone() {
             Arc::new(BorrowState::new()),
             Protocol::L4,
             generation(&pool),
+            Arc::new(PathHealth::default()),
         )
         .await
         .is_ok(),
@@ -1165,4 +1170,191 @@ fn a_protocol_is_counted_on_its_own() {
     assert_eq!(connections_for(Protocol::Http, held.iter().copied()), 2);
     assert_eq!(connections_for(Protocol::L4, held.iter().copied()), 1);
     assert_eq!(connections_for(Protocol::Tls, held.iter().copied()), 0);
+}
+
+/// Waits for the watcher to have seen the connection's path.
+///
+/// The watcher runs in a task of its own, and iroh records a path once a
+/// datagram has come back on it — so a test that reads the record straight
+/// after the handshake is reading a race.
+async fn wait_for_open_path(paths: &PathHealth) {
+    for _ in 0..250 {
+        if paths.has_open_path() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the watcher did not see the connection's path");
+}
+
+/// **A connection whose path is gone is not live.**
+///
+/// The liveness check used to ask "was it closed", and a QUIC connection
+/// whose path died is not closed by either side: QUIC keeps it open,
+/// waiting for a path to come back. So the warm-up found the connection
+/// "live" and did not dial, and the first real request went out over a
+/// connection with nowhere to send — and the user waited for a handshake
+/// timeout instead of getting a fresh connection.
+///
+/// The connection here is a real one and it is **not closed**: that is the
+/// whole point. The old check answered "alive" for it.
+///
+/// The path record is driven directly, because a test cannot kill a real
+/// path without unplugging the network. What is under test is the rule the
+/// pool applies to that record, not the record itself.
+#[tokio::test]
+async fn a_connection_whose_path_is_gone_is_not_live() {
+    let (pool, _accepted) = pool_harness().await;
+    let borrowed = pool
+        .get_connection(Protocol::Http)
+        .await
+        .expect("the connection is borrowed");
+
+    let connections = pool.inner.connections.lock().await;
+    let pooled = connections
+        .first()
+        .expect("the pool holds the connection it just made");
+
+    assert!(
+        pooled.conn.close_reason().is_none(),
+        "the connection is not closed: QUIC keeps a connection whose path died open"
+    );
+
+    // The path was there, and now it is gone — what a network switch looks
+    // like to the watcher.
+    pooled.paths.opened();
+    pooled.paths.closed(0);
+
+    assert!(
+        !pooled.is_live(),
+        "a connection whose path is gone cannot carry traffic"
+    );
+
+    drop(connections);
+    drop(borrowed);
+}
+
+/// **A healthy connection is still live.**
+///
+/// The probe must not be trigger-happy: a connection that is called dead
+/// while it is not is thrown away and dialled again — a handshake per
+/// request, which is worse than the defect this fixes.
+#[tokio::test]
+async fn a_healthy_connection_is_live() {
+    let (pool, accepted) = pool_harness().await;
+    let borrowed = pool
+        .get_connection(Protocol::Http)
+        .await
+        .expect("the connection is borrowed");
+    wait_for_accepted(&accepted, 1).await;
+
+    let paths = {
+        let connections = pool.inner.connections.lock().await;
+        connections
+            .first()
+            .expect("the pool holds the connection it just made")
+            .paths
+            .clone()
+    };
+    // The watcher has seen the path, so the record is a real reading and
+    // not the "not looked at yet" one.
+    wait_for_open_path(&paths).await;
+
+    let connections = pool.inner.connections.lock().await;
+    let pooled = connections
+        .first()
+        .expect("the pool holds the connection it just made");
+    assert!(pooled.is_live(), "a connection with a path is live");
+    drop(connections);
+
+    // And the warm-up finds it: the pool has a connection to give, so it
+    // does not dial again.
+    assert!(
+        pool.preconnect().await,
+        "the warm-up finds the connection the pool already has"
+    );
+    assert_eq!(
+        pool.inner.connections.lock().await.len(),
+        1,
+        "the warm-up dialled nothing: the connection it has is live"
+    );
+    drop(borrowed);
+}
+
+/// **The pool drops a connection whose path is gone.**
+///
+/// A connection that is only dropped stays open as far as QUIC is concerned:
+/// the path watcher still holds a handle, so the socket and the NAT mapping
+/// on both sides live on. A connection with nowhere to send is closed with a
+/// reason instead, the way an idle one is.
+#[tokio::test]
+async fn the_pool_drops_a_connection_whose_path_is_gone() {
+    let (pool, _accepted) = pool_harness().await;
+    let borrowed = pool
+        .get_connection(Protocol::Http)
+        .await
+        .expect("the connection is borrowed");
+
+    let mut connections = pool.inner.connections.lock().await;
+    let mut held = std::mem::take(&mut *connections);
+    assert_eq!(held.len(), 1, "the pool holds the connection it just made");
+    let conn = held[0].conn.clone();
+
+    held[0].paths.opened();
+    held[0].paths.closed(0);
+
+    drop_stale_connections(&mut held);
+
+    assert!(
+        held.is_empty(),
+        "a connection whose path is gone is not left in the pool"
+    );
+    assert!(
+        conn.close_reason().is_some(),
+        "a connection with nowhere to send is closed, not left on the network"
+    );
+    drop(connections);
+    drop(borrowed);
+}
+
+/// A connection whose paths have never been seen is not a dead one.
+///
+/// The watcher may not have looked at the connection yet, and a connection
+/// declared dead before it has been looked at is a connection the pool
+/// throws away for nothing.
+#[test]
+fn a_connection_that_has_not_been_looked_at_is_not_a_dead_one() {
+    let paths = PathHealth::default();
+
+    assert!(
+        !paths.all_gone(),
+        "a connection that has not been looked at is not a dead one"
+    );
+}
+
+/// A connection whose path is gone has nothing left to send on — and a path
+/// that opens again gives it somewhere to send.
+#[test]
+fn a_connection_whose_path_is_gone_has_nothing_left_to_send_on() {
+    let paths = PathHealth::default();
+
+    paths.opened();
+    assert!(
+        !paths.all_gone(),
+        "a connection with a path is not all gone"
+    );
+
+    paths.closed(0);
+    assert!(
+        paths.all_gone(),
+        "a connection whose path is gone is all gone"
+    );
+
+    // The probe is not a one-way door: a path that comes back is a path to
+    // send on, and the connection is live again.
+    paths.opened();
+    assert!(
+        !paths.all_gone(),
+        "a connection whose path came back is live again"
+    );
 }

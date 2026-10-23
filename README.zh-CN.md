@@ -106,8 +106,8 @@ Android JNI 用的 `cdylib`，以及面向 Swift/Kotlin/Python 的 UniFFI 绑定
 | `third_party/smoltcp` | 内置的 smoltcp 0.12，附带序列号下溢 panic 的补丁。通过 `[patch.crates-io]` 接入。不要改动。 |
 | `ui-android/` | Android 应用（Kotlin + Compose）。 |
 | `ui-desktop/` | Tauri 2 桌面应用（Vue 3 + TypeScript）。 |
-| `config.toml.example` | 覆盖全部配置项的示例（服务端 + 客户端，2FA 开启，且没有 enrolled 客户端）。复制成 `config.toml` —— 该文件名已被 gitignore，它是运维者的实际配置。Docker compose 用的是 `config/config.toml`，通过 `NEXAPIPE_CONFIG_DIR=/app/config` 让二进制默认读取。 |
-| `config.toml.2fa.example` | 只讲 2FA 的短文件，带一个 `[auth.clients]` 条目。两份示例现在都是 2FA 开启。 |
+| `config.toml.example` | 覆盖全部配置项的示例（服务端 + 客户端）。它出厂即开启 2FA 且没有任何已 enrolled 的客户端，因此全新安装在 enrolled 第一个客户端之前会拒绝所有连接。复制成 `config.toml` —— 该文件名已被 gitignore，它是运维者的实际配置。Docker compose 用的是 `config/config.toml`，通过 `NEXAPIPE_CONFIG_DIR=/app/config` 让二进制默认读取。 |
+| `config.toml.2fa.example` | 同一个文件，但更短：它不含日志、健康检查和指标这三段，并带有一个 `[auth.clients]` 条目 —— 一个已经 enrolled 的客户端。两份示例都是 2FA 开启。 |
 | `run_android.ps1` | 一键 Android 调试循环（构建 → 安装 → 启动 → logcat）。 |
 
 ---
@@ -128,8 +128,8 @@ nexapipe                                # 默认读取 ./config.toml
 
 三行就是一个能跑的服务端：一条全捕获路由、一个后端，其余配置全部取默认值。客户端
 同样只需要几行，见[最小配置](#最小配置)（那里也列出了每个省略的键默认是什么）。
-想要每个配置段都写出来的版本请从 `config.toml.example` 开始，只讲 2FA 的短文件则从
-`config.toml.2fa.example` 开始。
+想要每个配置段都写出来的版本请从 `config.toml.example` 开始，想要一个已经 enrolled
+的客户端则从 `config.toml.2fa.example` 开始。
 
 这份示例是 2FA 开启且没有 enrolled 客户端的，所以在第一个客户端存在之前谁都连不上 ——
 用 `nexapipe --generate-invite client-001 --create-client` 注册它。运行时的默认值仍然是
@@ -214,18 +214,18 @@ mkdir -p config secrets logs
 cp config.toml.example config/config.toml   # config.toml 已被 gitignore
 sudo chown -R 1000:1000 config secrets logs # 镜像以 uid 1000 运行
 docker compose up -d --build
+# 示例出厂即开启 2FA，所以在 enrolled 一个客户端之前没有任何连接能进来。
+# 这一条会打印可扫描的邀请链接。
+docker compose exec nexapipe /usr/local/bin/nexapipe \
+    --config /app/config/config.toml --generate-invite client-001 --create-client
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
 
-这份示例是 2FA 开启且没有 enrolled 客户端的，所以在第一个客户端存在之前服务端会拒绝所有
-连接。在容器里注册它：
-
-```bash
-docker compose exec nexapipe nexapipe --generate-invite client-001 --create-client --config /app/config/config.toml
-```
-
-打印出来的邀请码携带的是一次性注册令牌而不是密钥：第一台设备扫描它时用令牌换一份自己的
-密钥，邀请码也就此不再是凭证。
+示例出厂即开启 2FA 且没有任何已 enrolled 的客户端，因此服务端会启动，然后拒绝所有
+连接，直到有一个客户端被 enrolled —— 上面的 `--generate-invite client-001
+--create-client` 就是 enrolled 第一个客户端的命令。它会把客户端写进配置文件，并
+在链接里打印一个一次性的 enrollment token；第一个扫描它的设备用该 token 换取一个
+只属于自己的 secret，而链接从那一刻起就不再是凭据。
 
 `docker-compose.yaml` 挂载的是**目录** `config/`（你的 `config.toml` 就放在里面）、
 存放端点身份的 `secrets/` 目录和一个 `logs/` 卷，并把 `NEXAPIPE_LOG_DIR` 指向
@@ -359,11 +359,16 @@ sudo chmod 700 /etc/nexapipe
 sudo chmod 600 /etc/nexapipe/config.toml
 ```
 
-复制过去的文件是 2FA 开启且没有 enrolled 客户端的，所以在第一个客户端存在之前谁都连不上：
+示例出厂即开启 2FA 且没有任何已 enrolled 的客户端，因此服务会启动，然后拒绝所有
+连接，直到有一个客户端被 enrolled。在把设备指过去之前先 enrolled 第一个：
 
 ```bash
-nexapipe --generate-invite client-001 --create-client --config /etc/nexapipe/config.toml
+sudo -u nexapipe nexapipe \
+    --config /etc/nexapipe/config.toml --generate-invite client-001 --create-client
 ```
+
+它必须以服务运行所用的账号执行：配置文件的写入方式是先写一个新文件再改名覆盖，
+因此以 root 写出的文件属于 root，而读不到自己配置的服务就是停着的服务。
 
 然后写 `/etc/systemd/system/nexapipe.service`：
 
