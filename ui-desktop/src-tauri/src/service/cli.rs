@@ -10,6 +10,17 @@ use crate::service::elevate;
 use crate::service::platform;
 use crate::service::runner::ServiceRunner;
 
+/// Flag that tells the install to leave the service stopped, as `--leave-stopped`.
+///
+/// For the installer: an upgrade has to leave the machine the way it found it, and a service
+/// the user had stopped is not theirs to start behind their back. The registration itself is
+/// the same either way — the entry, the binary under Program Files, the account it serves —
+/// only the service is left down.
+///
+/// Windows only in its effect. The Unix install starts the service through its own service
+/// manager, and the installer that asks for this is the Windows one.
+pub const LEAVE_STOPPED_ARG: &str = "--leave-stopped";
+
 /// Consumes the service-management verbs.
 ///
 /// Returns `true` when `args` named one of them and the process should exit
@@ -36,7 +47,17 @@ pub fn handle_args(args: &mut Vec<String>) -> bool {
             // The guard is held to the end of the arm, so the message is
             // flushed before the process reports its outcome and exits.
             let _guard = crate::init_tracing_in(crate::service_log_dir(), "nexa-service.log");
-            elevate::report_result(result_file.as_deref(), &platform::install_service());
+
+            // Read here rather than in the elevated child: the decision changes what the
+            // install does, and the install is what the elevated child runs.
+            let leave_stopped = args.iter().any(|arg| arg == LEAVE_STOPPED_ARG);
+            let outcome = if leave_stopped {
+                platform::install_service_without_starting()
+            } else {
+                platform::install_service()
+            };
+
+            elevate::report_result(result_file.as_deref(), &outcome);
             true
         }
         "--uninstall" => {

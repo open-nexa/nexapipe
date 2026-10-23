@@ -67,7 +67,24 @@ use std::path::{Path, PathBuf};
 /// Registers the service and starts it.
 pub fn install_service() -> Result<(), AppError> {
     #[cfg(windows)]
-    return install(account::AccountId::current());
+    return install(account::AccountId::current(), false);
+
+    #[cfg(not(windows))]
+    return install_elevated();
+}
+
+/// Registers the service and leaves it stopped.
+///
+/// For the installer: an upgrade has to leave the machine the way it found it, and a service
+/// the user had stopped is not theirs to start behind their back. The registration itself is
+/// the same — the entry, the binary under Program Files, the account it serves — only the
+/// service is left down.
+///
+/// Windows only in its effect. The Unix half starts the service through its own service
+/// manager, and the installer that asks for this is the Windows one.
+pub fn install_service_without_starting() -> Result<(), AppError> {
+    #[cfg(windows)]
+    return install(account::AccountId::current(), true);
 
     #[cfg(not(windows))]
     return install_elevated();

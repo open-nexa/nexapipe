@@ -100,7 +100,13 @@ enum Escalation {
     OnAccessDenied,
 }
 
-pub fn install(installing_by: Option<AccountId>) -> Result<(), AppError> {
+/// Registers the service, and starts it unless `leave_stopped` says otherwise.
+///
+/// `leave_stopped` is what the installer uses: an upgrade has to leave the machine the way it
+/// found it, and a service the user had stopped is not theirs to start behind their back.
+/// The registration itself is the same either way — the entry, the binary under Program
+/// Files, the account it serves — only the service is left down.
+pub fn install(installing_by: Option<AccountId>, leave_stopped: bool) -> Result<(), AppError> {
     let exe = std::env::current_exe().map_err(|e| AppError::cause(codes::SERVICE_EXE_PATH, e))?;
     let app_dir = exe
         .parent()
@@ -145,6 +151,15 @@ pub fn install(installing_by: Option<AccountId>) -> Result<(), AppError> {
                 "if errorlevel 1 exit /b %errorlevel%".to_string(),
                 format!("copy /y \"{source}\" \"{}\"", system.display()),
                 "if errorlevel 1 exit /b %errorlevel%".to_string(),
+                // The copy is a promise until it has been checked. The control
+                // manager keeps running whatever was copied the day the service
+                // was registered, so a copy that did not land is a service that
+                // goes on running the old build while the app is new — and the
+                // user has no way to tell. Compared here, in the same elevated
+                // run and before the entry is touched, so a copy that is not
+                // the binary that was asked for stops the install outright.
+                format!("fc /b \"{source}\" \"{}\"", system.display()),
+                "if errorlevel 1 exit /b %errorlevel%".to_string(),
                 format!("icacls \"{}\" {FILE_ACL}", system.display()),
                 "if errorlevel 1 exit /b %errorlevel%".to_string(),
                 format!("sc.exe query {SERVICE_NAME} >nul 2>&1"),
@@ -172,14 +187,21 @@ pub fn install(installing_by: Option<AccountId>) -> Result<(), AppError> {
                 ),
             }
 
-            lines.extend([
-                format!("sc.exe start {SERVICE_NAME}"),
-                // Nothing should be up at this point — [`stop_if_running`] brought the old
-                // process down first — so 1056 means the service was started again by
-                // something else, which is still the state the install asked for.
-                tolerate(ALREADY_RUNNING),
-                "exit /b %errorlevel%".to_string(),
-            ]);
+            if !leave_stopped {
+                lines.extend([
+                    format!("sc.exe start {SERVICE_NAME}"),
+                    // Nothing should be up at this point — [`stop_if_running`] brought the old
+                    // process down first — so 1056 means the service was started again by
+                    // something else, which is still the state the install asked for.
+                    tolerate(ALREADY_RUNNING),
+                    "exit /b %errorlevel%".to_string(),
+                ]);
+            } else {
+                // Left down on purpose: the service was stopped before the upgrade and has to
+                // stay stopped. The entry still says `start= auto`, so the next boot brings it
+                // up — the service manager's own answer, not this installer's.
+                lines.push("exit /b 0".to_string());
+            }
 
             lines
         },
@@ -187,12 +209,85 @@ pub fn install(installing_by: Option<AccountId>) -> Result<(), AppError> {
         Escalation::Always,
         codes::SERVICE_INSTALL_FAILED,
     )
+    .and_then(|()| verify_copied(Path::new(&source), &system))
     .and_then(|()| verify_present())
     // `sc start` returns success as soon as the SCM has launched the process, which says
     // nothing about whether it stays up: a service that dies during startup still reports a
     // successful start. Waiting for the state to become RUNNING is what turns "installed but
     // not running" into a reported failure instead of a mystery.
-    .and_then(|()| settle(ServiceState::Running, codes::SERVICE_START_FAILED))
+    //
+    // Only for an install that started the service: one that was asked to leave it down has
+    // nothing to wait for.
+    .and_then(|()| {
+        if leave_stopped {
+            Ok(())
+        } else {
+            settle(ServiceState::Running, codes::SERVICE_START_FAILED)
+        }
+    })
+}
+
+/// Checks that the copy that was made is the file that was asked for.
+///
+/// The elevated run compares the two files as well — `fc /b`, before the entry is touched —
+/// and this is the same question asked again from the outside, where a mismatch can be
+/// reported with both paths in the message and where the check can be tested without a
+/// service manager.
+///
+/// A copy that is not the copy is the whole bug this install exists to prevent: the control
+/// manager keeps running whatever it was pointed at, so a service that was registered against
+/// an older binary goes on running it while the app beside it is new.
+fn verify_copied(source: &Path, system: &Path) -> Result<(), AppError> {
+    if files_match(source, system) {
+        return Ok(());
+    }
+
+    Err(AppError::with_detail(
+        codes::SERVICE_INSTALL_FAILED,
+        format!(
+            "the service binary at {} is not the copy of {} that was installed",
+            system.display(),
+            source.display()
+        ),
+    ))
+}
+
+/// Whether two files hold the same bytes.
+///
+/// Read in blocks rather than whole: the service binary is tens of megabytes, and the
+/// comparison is the one thing this install must not get wrong, so it reads what it has to
+/// and stops at the first difference.
+fn files_match(left: &Path, right: &Path) -> bool {
+    use std::io::Read;
+
+    let (Ok(mut left), Ok(mut right)) = (std::fs::File::open(left), std::fs::File::open(right))
+    else {
+        return false;
+    };
+
+    let mut left_block = [0u8; 64 * 1024];
+    let mut right_block = [0u8; 64 * 1024];
+
+    loop {
+        let left_read = match left.read(&mut left_block) {
+            Ok(read) => read,
+            Err(_) => return false,
+        };
+        let right_read = match right.read(&mut right_block) {
+            Ok(read) => read,
+            Err(_) => return false,
+        };
+
+        if left_read != right_read {
+            return false;
+        }
+        if left_read == 0 {
+            return true;
+        }
+        if left_block[..left_read] != right_block[..right_read] {
+            return false;
+        }
+    }
 }
 
 /// Brings a running service down, so that [`install`] can start it from the binary it has
@@ -802,6 +897,39 @@ fn temp_path(extension: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two files match only when their bytes do.
+    ///
+    /// The comparison is what makes "the service was replaced" a checked fact rather than a
+    /// hope: the control manager keeps running whatever was copied the day the service was
+    /// registered, so a copy that did not land leaves the old build serving the new app — and
+    /// the user has no way to tell.
+    #[test]
+    fn two_files_match_only_when_their_bytes_do() {
+        let dir = std::env::temp_dir().join(format!("nexa-service-match-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("the scratch directory");
+
+        let left = dir.join("left.bin");
+        let right = dir.join("right.bin");
+        let different = dir.join("different.bin");
+        let shorter = dir.join("shorter.bin");
+        let missing = dir.join("missing.bin");
+
+        std::fs::write(&left, b"the service binary").expect("the first file");
+        std::fs::write(&right, b"the service binary").expect("the second file");
+        std::fs::write(&different, b"the service binarY").expect("the third file");
+        std::fs::write(&shorter, b"the service binar").expect("the fourth file");
+
+        assert!(files_match(&left, &right), "the same bytes are the same file");
+        assert!(!files_match(&left, &different), "one byte is one byte");
+        assert!(!files_match(&left, &shorter), "a shorter file is not the file");
+        assert!(
+            !files_match(&left, &missing),
+            "a file that is not there is not a match"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The installer writes `"<exe>" --service`; the whole value has to stay one argument.
     #[test]
