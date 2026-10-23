@@ -51,7 +51,7 @@ So, when the server changes:
 
 | What changed | What the server sees | What to do |
 | --- | --- | --- |
-| The endpoint — another server, or the same one rebuilt | another client id; no row for this device | enrol again against the new server, **with the same key** |
+| The endpoint — another server, or the same one rebuilt | another client id; no row for this device | enroll again against the new server, **with the same key** |
 | The device name — a renamed host, or a reinstall that lost it | another device | the old row is dead weight: `nexapipe client revoke <client> --device <old name>` |
 | The client id | another client | `nexapipe client list` shows what exists |
 
@@ -64,7 +64,7 @@ the client does when it enrolls:
   one would make the node a different device to the server, and the server
   refuses an enrollment that tries to take over a device that is already there.
 - A node with no key of its own uses the **machine's** key, so a second server
-  this machine enrols with is answered with the same key rather than a new one.
+  this machine enrolls with is answered with the same key rather than a new one.
 - A machine with no key at all mints one — for the machine, not for a node.
 
 That is why the device name does not follow the server: the name is the
@@ -84,7 +84,7 @@ The server's access log says the same thing per request, in the last two
 fields — `client=acme device=laptop-7f3a9c21` — which is the quickest way to
 see which device the server thinks the caller is.
 
-**How to recover.** Free the name, then enrol again:
+**How to recover.** Free the name, then enroll again:
 
 ```bash
 nexapipe client revoke client-001 --device laptop-7f3a9c21 --config config.toml
@@ -149,7 +149,9 @@ different builds.
 
 **The symptom.** The handshake fails in a way the new code cannot produce. The
 old client opened a *second* stream for the handshake after its enrollment, and
-the server read the first bytes of that stream as a handshake message:
+the server — which had already read the connection's first stream and decided
+what it carried — read that stream's bytes as an HTTP request. The client's own
+log says it like this:
 
 ```text
 Enrollment succeeded for client 'win11'; the token is spent
@@ -158,7 +160,10 @@ Authenticating connection with 2FA as client 'win11'
 ```
 
 The middle line is the give-away on its own: a client that has just enrolled
-does not authenticate a second time.
+does not authenticate a second time. The last line is what the client saw when
+the server closed that stream — the server's own log says `the connection ended
+in error: invalid HTTP method parsed`, because the bytes it was sent were not
+an HTTP request, and the answer the client got back was not an auth message.
 
 **How to check.** Compare the two files:
 
@@ -209,7 +214,9 @@ The lines that matter:
 | `Enrollment succeeded for client 'client-001'; the token is spent` | client | the enrollment worked and the token cannot be used again |
 | `Authenticating connection with 2FA as client 'client-001'` | client | a handshake on a fresh stream — right after an enrollment this means the client is an older build (§3) |
 | `auth message length 1347703880 is out of range` | client or server | the peer sent something that is not a handshake message |
-| `2FA authentication failed: …` | server | the credential was refused |
+| `2FA authentication failed: …` | client | the handshake was refused; the detail says why |
+| `Authentication failed for <peer id>: …` | server | the same refusal, from the other side |
+| `the connection ended in error: invalid HTTP method parsed` | server | the connection carried something that was not an HTTP request |
 | `No reachable backend out of 1 probed node(s)` | desktop | the proxy found no endpoint it could use |
 | `client=acme device=laptop-7f3a9c21` | server access log | which client and which device the server thinks the caller is |
 
