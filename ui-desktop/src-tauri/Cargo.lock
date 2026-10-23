@@ -3612,6 +3612,7 @@ dependencies = [
  "tracing",
  "url",
  "webpki-roots",
+ "zeroize",
 ]
 
 [[package]]
