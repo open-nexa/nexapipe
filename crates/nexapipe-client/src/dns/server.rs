@@ -131,7 +131,7 @@ pub async fn handle_dns_query(
 /// Forward a DNS query to the real DNS server and return the response as-is.
 ///
 /// A name that was resolved recently is answered from a cache instead, for as
-/// long as the answer's own records say it is good — see [`remember_answer`].
+/// long as the answer's own records say it is good — see `remember_answer`.
 /// The transaction ID of the query asking now is written into the answer before
 /// it goes out.
 ///

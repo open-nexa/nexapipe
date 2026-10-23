@@ -1,5 +1,5 @@
 //! TUN proxy: a user-space TCP/IP stack implemented in Rust with netstack-smoltcp,
-//! shared by the Android client (fd-based entry, [`TunProxy::new`]) and the desktop
+//! shared by the Android client (fd-based entry, `TunProxy::new`) and the desktop
 //! app (IP-packet reader/writer entry, [`TunProxy::with_io`]).
 //!
 //! Data flow:
@@ -47,7 +47,7 @@
 //! On Android, the legacy proxy address is still accepted **for TCP only**, so
 //! applications that cached the address before the per-domain change keep
 //! working; it goes down the old payload-sniffing path
-//! ([`handle_local_connection`]). The desktop never handed out a fixed proxy
+//! (`handle_local_connection`). The desktop never handed out a fixed proxy
 //! address, so it passes no legacy IP.
 
 use crate::ClientError;
@@ -394,9 +394,9 @@ struct TunContext {
 /// The platform-independent half of [`TunProxy::with_io`]: the network layout
 /// the stack is expected to live in.
 pub struct TunStackConfig {
-    /// See [`TunContext::dns_ip`].
+    /// See `TunContext::dns_ip`.
     pub dns_ip: Ipv4Addr,
-    /// See [`TunContext::legacy_proxy_ip`].
+    /// See `TunContext::legacy_proxy_ip`.
     pub legacy_proxy_ip: Option<Ipv4Addr>,
     /// The per-domain virtual IP mapping. Must be the same instance the DNS
     /// answers are handed out from — on the desktop the local DNS server and the
@@ -941,7 +941,7 @@ impl TunProxy {
     ///
     /// The desktop uses this with a `tun` crate `AsyncDevice`'s split halves:
     /// each `read`/`write_all` carries exactly one IP packet. The Android
-    /// fd-based entry point is [`TunProxy::new`].
+    /// fd-based entry point is `TunProxy::new`.
     pub fn with_io<R, W>(
         reader: R,
         writer: W,
