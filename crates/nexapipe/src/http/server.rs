@@ -39,6 +39,7 @@ use std::time::Duration;
 pub use hyper::body::{Frame, Incoming};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
+use tracing::Instrument;
 
 use crate::auth::ClientAcl;
 use crate::conn::peers::PeerIdentity;
@@ -61,6 +62,10 @@ pub const MAX_HEAD: usize = 64 * 1024;
 /// Everything here is the tunnel path's own rules. The connection's peer and
 /// its credentials travel with the request because the service runs once per
 /// request, on a connection that may carry several.
+///
+/// It is cloned per request rather than shared: the id of a request is the
+/// id of that request, and a connection may carry several.
+#[derive(Clone)]
 pub struct Context {
     /// The routes, and the timeouts they carry.
     pub config: Arc<RoutingTable>,
@@ -71,6 +76,12 @@ pub struct Context {
     /// Who may use which route. `None` when there is no allow list.
     pub acl: Option<Arc<ClientAcl>>,
     /// The id of this request, for the access log and the `x-request-id` header.
+    ///
+    /// **The id of the request, not of the connection.** The connection's own
+    /// context starts with the id of the stream, and the service hands each
+    /// request a context of its own with the id of that request in it — hyper
+    /// serves keep-alive requests on one stream, so an id that belonged to the
+    /// connection would belong to every request on it.
     pub request_id: String,
     /// Who the connection authenticated as, for the access log.
     pub who: PeerIdentity,
@@ -94,8 +105,42 @@ pub async fn serve(
 ) -> anyhow::Result<()> {
     let io =
         crate::hyper_io::IrohIo::reading_through(send, crate::hyper_io::Replay::new(prefix, recv));
+    serve_io(io, head_timeout, ctx).await
+}
+
+/// The same, over any IO hyper can read and write.
+///
+/// Split out from [`serve`] so that the path can be driven over a plain
+/// duplex pair: the rules this path follows are worth more than the iroh
+/// stream they arrive on, and a test can make a stream of its own.
+async fn serve_io<IO>(io: IO, head_timeout: Duration, ctx: Arc<Context>) -> anyhow::Result<()>
+where
+    IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
     let service_ctx = ctx.clone();
-    let service = service_fn(move |req| handle(req, service_ctx.clone()));
+    // **One id and one span per request.** `service_fn` is called once per
+    // request rather than once per connection, which is what makes the two
+    // line up: hyper serves keep-alive requests on one stream, so an id
+    // minted per connection would be the id of every request on it, and a
+    // client quoting that id could not be matched to one log line.
+    //
+    // The plaintext listener does the same, and for the same reason.
+    let service = service_fn(move |req| {
+        let request_id = crate::log::next_request_id();
+        let span = tracing::info_span!(
+            "request",
+            id = %request_id,
+            method = tracing::field::Empty,
+            uri = tracing::field::Empty,
+            status = tracing::field::Empty,
+        );
+        // The context of **this** request: the connection's own, with the id
+        // of this request in it. Everything the handler logs — the access
+        // line, the `x-request-id` header — carries that id.
+        let mut request_ctx = (*service_ctx).clone();
+        request_ctx.request_id = request_id;
+        handle(req, Arc::new(request_ctx)).instrument(span)
+    });
 
     hyper::server::conn::http1::Builder::new()
         // The deadline below is measured with this.
@@ -131,12 +176,21 @@ pub async fn serve(
 /// what the client was told is part of what the request was: the plaintext
 /// listener and the L4 tunnel both record it, and a span that never gets a
 /// status is a span that says the request never finished.
+///
+/// The span is the request's own: the service opened it around this future,
+/// so the fields filled in here belong to this request and not to the last one
+/// on the stream.
 async fn handle(
     req: Request<Incoming>,
     ctx: Arc<Context>,
 ) -> Result<Response<crate::http::body::ProxyBody>, Infallible> {
+    let span = tracing::Span::current();
+    let method = req.method().as_str().to_string();
+    let target = req.uri().to_string();
+    crate::log::record_request_on_span(&span, &method, &target);
+
     let response = handle_one(req, ctx).await?;
-    tracing::Span::current().record("status", response.status().as_u16() as u64);
+    span.record("status", response.status().as_u16() as u64);
     Ok(response)
 }
 
@@ -259,8 +313,6 @@ async fn handle_one(
     let started = std::time::Instant::now();
     let method = request.method().clone();
     let request_target = request.uri().to_string();
-    let span = tracing::Span::current();
-    crate::log::record_request_on_span(&span, method.as_ref(), &request_target);
 
     // The body, in the shape the backend is sent it in.
     let body = match read_request_body(request.headers(), body, ctx.config.timeouts()).await {
@@ -491,6 +543,10 @@ pub(super) async fn forward(
                 return Ok(answer.with_lease(lease).with_report(
                     crate::http::server::AccessReport {
                         request_id: ctx.request_id.clone(),
+                        // The span of the request being answered: the line is
+                        // written when the body is over, and it belongs to
+                        // this request rather than to the stream.
+                        span: tracing::Span::current(),
                         peer: ctx.peer.clone(),
                         method: method.as_str().to_string(),
                         request_target: request_target.to_string(),
@@ -907,6 +963,13 @@ where
 pub struct AccessReport {
     /// The id of the request.
     pub request_id: String,
+    /// The span the request was served under.
+    ///
+    /// The line is written when the answer's body is over, which is after the
+    /// request's own future is gone — so the span travels with the report for
+    /// the line to be logged under the request it belongs to, rather than
+    /// under the stream it arrived on.
+    pub span: tracing::Span,
     /// Who sent it.
     pub peer: String,
     /// The method.
@@ -976,16 +1039,21 @@ impl<B> Drop for CountedBody<B> {
             return;
         };
         let bytes_sent = self.bytes_sent.load(Ordering::Relaxed);
-        crate::log::log_access(
-            &report.request_id,
-            &report.peer,
-            &report.method,
-            &report.request_target,
-            report.status,
-            report.started.elapsed().as_millis() as u64,
-            bytes_sent,
-            Some(&report.who),
-        );
+        // Under the request's own span: the line is written here, but it is
+        // about the request, and the span it is logged under is the one that
+        // request was served in.
+        report.span.in_scope(|| {
+            crate::log::log_access(
+                &report.request_id,
+                &report.peer,
+                &report.method,
+                &report.request_target,
+                report.status,
+                report.started.elapsed().as_millis() as u64,
+                bytes_sent,
+                Some(&report.who),
+            );
+        });
     }
 }
 
@@ -1041,5 +1109,188 @@ where
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A backend that answers every request with an empty body.
+    async fn answering_backend() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback listener");
+        let port = listener.local_addr().expect("an address").port();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    // **Every request on this connection is answered.** The
+                    // client pools the connection, so the second request may
+                    // arrive on the one the first request used, and a
+                    // connection that answers once would leave it hanging.
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    loop {
+                        let read = stream.read(&mut byte).await.expect("the request comes in");
+                        if read == 0 {
+                            break;
+                        }
+                        head.push(byte[0]);
+                        if !head.ends_with(b"\r\n\r\n") {
+                            continue;
+                        }
+                        // The head, and an empty body: what the test is about
+                        // is the ids, and a body would only have to be read.
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await;
+                        let _ = stream.flush().await;
+                        head.clear();
+                    }
+                });
+            }
+        });
+
+        port
+    }
+
+    /// The context of a connection that serves one host.
+    fn context_for(port: u16) -> Arc<Context> {
+        let route = crate::routes::Route::new(
+            "app.test",
+            "/",
+            true,
+            vec![format!("http://127.0.0.1:{port}")],
+            crate::lb::LoadBalancingStrategy::RoundRobin,
+            crate::config::RouteMode::Http,
+            None,
+        );
+        let config = Arc::new(crate::routes::RoutingTable::new(vec![route]));
+        let clients =
+            crate::http::client::BackendClients::new(std::time::Duration::from_secs(5), None)
+                .expect("the clients");
+
+        Arc::new(Context {
+            config,
+            clients: Arc::new(clients),
+            peer: "peer.test".to_string(),
+            acl: None,
+            // The id of the stream. The service replaces it with the id of
+            // the request it is serving.
+            request_id: "stream-id".to_string(),
+            who: crate::conn::peers::PeerIdentity::default(),
+        })
+    }
+
+    /// The head of a response, up to the blank line that ends it.
+    async fn read_head(stream: &mut tokio::io::DuplexStream) -> String {
+        let mut head = Vec::new();
+        loop {
+            let mut byte = [0u8; 1];
+            let read = stream.read(&mut byte).await.expect("the answer comes back");
+            assert!(read > 0, "the answer ended before its head was whole");
+            head.push(byte[0]);
+            if head.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8_lossy(&head).to_string()
+    }
+
+    /// The value of a header in a response head.
+    fn header(head: &str, name: &str) -> String {
+        head.lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim().to_string())
+            .unwrap_or_else(|| panic!("the head carries no {name}: {head}"))
+    }
+
+    /// The access lines, once there are `want` of them for this peer.
+    ///
+    /// The line of a request that was answered is written when its body is
+    /// over, which is after the answer has been read — so the test waits for
+    /// it rather than assuming it is there.
+    async fn wait_for_lines(
+        capture: &crate::log::AccessLineCapture,
+        peer: &str,
+        want: usize,
+    ) -> Vec<String> {
+        for _ in 0..200 {
+            let lines = capture.lines();
+            if lines.iter().filter(|line| line.contains(peer)).count() >= want {
+                return lines;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        capture.lines()
+    }
+
+    /// Two requests on one stream get two ids.
+    ///
+    /// The id belongs to the request. Hyper serves keep-alive requests on one
+    /// stream, so an id minted per stream would be the id of every request on
+    /// it: the client would be handed the same `x-request-id` twice, and a
+    /// client quoting it could not be matched to one log line.
+    #[tokio::test]
+    async fn two_requests_on_one_stream_get_two_request_ids() {
+        let port = answering_backend().await;
+        let ctx = context_for(port);
+        let capture = crate::log::capture_access_lines();
+
+        // One stream, and two requests on it.
+        let (mut client, server) = tokio::io::duplex(4096);
+        let serving = tokio::spawn(async move {
+            serve_io(
+                hyper_util::rt::TokioIo::new(server),
+                std::time::Duration::from_secs(5),
+                ctx,
+            )
+            .await
+        });
+
+        client
+            .write_all(b"GET /one HTTP/1.1\r\nHost: app.test\r\n\r\n")
+            .await
+            .expect("the first request goes out");
+        let first = read_head(&mut client).await;
+
+        client
+            .write_all(b"GET /two HTTP/1.1\r\nHost: app.test\r\n\r\n")
+            .await
+            .expect("the second request goes out");
+        let second = read_head(&mut client).await;
+
+        let first_id = header(&first, "x-request-id");
+        let second_id = header(&second, "x-request-id");
+        assert_ne!(
+            first_id, second_id,
+            "two requests on one stream were given one id"
+        );
+
+        // And the access log has a line for each of them, carrying its own
+        // id: the id the client was given is the id of one log line.
+        let lines = wait_for_lines(&capture, "peer.test", 2).await;
+        let mine: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("peer.test"))
+            .collect();
+        assert_eq!(mine.len(), 2, "one access line per request: {lines:?}");
+        assert!(
+            mine.iter()
+                .any(|line| line.contains(&format!("id={first_id}")) && line.contains("/one")),
+            "the first request's line does not carry its own id: {mine:?}"
+        );
+        assert!(
+            mine.iter()
+                .any(|line| line.contains(&format!("id={second_id}")) && line.contains("/two")),
+            "the second request's line does not carry its own id: {mine:?}"
+        );
+
+        serving.abort();
     }
 }

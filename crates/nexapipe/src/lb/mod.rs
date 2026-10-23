@@ -316,6 +316,9 @@ pub struct BackendPool {
     /// counter, and the queue was an async one. The increment is the only
     /// thing that has to be exclusive, and an atomic increment is exclusive by
     /// itself.
+    ///
+    /// Both rotations share it — the round-robin's own and the `least_conn`
+    /// tie-break's — so a pool has one cursor rather than two.
     round_robin_index: Arc<AtomicUsize>,
 }
 
@@ -348,15 +351,18 @@ impl BackendPool {
     ///
     /// It takes a snapshot rather than the pool because the minimum and the tie
     /// have to come from the same reading of the counters, and only one reading
-    /// can guarantee that — see the caller. Returns the chosen backend's index
-    /// and how many backends tied at the least, so the caller can advance its
-    /// cursor over the set it chose from.
+    /// can guarantee that — see the caller.
+    ///
+    /// `cursor` is where the rotation is, and it is taken modulo the size of
+    /// the tie here, where the tie is known: the tie's size decides where the
+    /// rotation continues, and it is not known until the counts have been
+    /// read, so the cursor cannot be reduced to it before the call.
     ///
     /// `counts` is never empty: a pool with no healthy backend either refuses
     /// or hands out its single entry before reaching here, so the tie — which
     /// always contains whoever holds the minimum, and the minimum comes from
     /// this same slice — is never empty either.
-    fn least_conn_pick(counts: &[(usize, usize)], cursor: usize) -> (usize, usize) {
+    fn least_conn_pick(counts: &[(usize, usize)], cursor: usize) -> usize {
         debug_assert!(
             !counts.is_empty(),
             "a pool with nothing healthy answers before it reaches the balancer"
@@ -373,7 +379,7 @@ impl BackendPool {
             .map(|(index, _)| *index)
             .collect();
 
-        (tied[cursor % tied.len()], tied.len())
+        tied[cursor % tied.len()]
     }
 
     /// A backend to send this flow to, or `None` when the pool has nothing left
@@ -533,17 +539,23 @@ impl BackendPool {
                     .collect();
 
                 // The tie is broken by the rotation, so that a pool of equal
-                // backends does not send everything to the first one. The
-                // counter is read and written rather than incremented, because
-                // the tie's own size decides where the rotation continues; a
-                // request that slips in between loses one step of the
-                // rotation and nothing else — the backends it could have
-                // chosen are tied.
-                let index = self.round_robin_index.load(Ordering::Relaxed);
-                let (idx, tied) = Self::least_conn_pick(&counts, index);
-                self.round_robin_index
-                    .store((index + 1) % tied, Ordering::Relaxed);
-                idx
+                // backends does not send everything to the first one.
+                //
+                // The cursor is advanced by one atomic increment, the same one
+                // the round-robin uses: two requests that arrive together get
+                // two different cursors, and neither waits for the other.
+                // That is what makes the rotation a rotation under a burst —
+                // a read followed by a write is not one thing, and two
+                // requests that read the same cursor pick the same backend,
+                // which lands the burst on one backend while its peers sit
+                // idle.
+                //
+                // The tie's own size decides where the rotation continues, and
+                // that size is only known once the counts have been read, so
+                // the modulo is applied where the cursor is used — picking
+                // from the tie — and not where it is stored.
+                let cursor = self.round_robin_index.fetch_add(1, Ordering::Relaxed);
+                Self::least_conn_pick(&counts, cursor)
             }
         };
 
@@ -1057,20 +1069,20 @@ mod tests {
     fn least_conn_pick_takes_the_backend_with_the_least_outstanding() {
         assert_eq!(
             BackendPool::least_conn_pick(&[(0, 3), (1, 1), (2, 7)], 0),
-            (1, 1),
+            1,
             "one backend carries a single flow against three and seven"
         );
     }
 
-    /// Ties rotate, and over the tied set rather than the whole pool: the caller
-    /// advances its cursor by the number the pick reports, so three idle
-    /// backends are walked in turn instead of the first one taking everything.
+    /// Ties rotate, and over the tied set rather than the whole pool: the pick
+    /// takes the cursor modulo the tie, so three idle backends are walked in
+    /// turn instead of the first one taking everything.
     #[test]
     fn least_conn_pick_rotates_through_every_backend_tied_at_the_least() {
         let counts = vec![(0, 0), (1, 0), (2, 0)];
 
         let picked: Vec<usize> = (0..4)
-            .map(|cursor| BackendPool::least_conn_pick(&counts, cursor).0)
+            .map(|cursor| BackendPool::least_conn_pick(&counts, cursor))
             .collect();
         assert_eq!(
             picked,
@@ -1079,10 +1091,10 @@ mod tests {
         );
 
         // A unique minimum leaves nothing to rotate, however far the cursor has
-        // run — and it reports a tie of one, not of zero.
+        // run — and it is still a backend to choose from, not nothing at all.
         assert_eq!(
             BackendPool::least_conn_pick(&[(0, 9), (1, 4), (2, 9)], 41),
-            (1, 1)
+            1
         );
     }
 
@@ -1111,12 +1123,8 @@ mod tests {
             // `usize::MAX` included: the cursor is only ever taken modulo the
             // tie, so it must not be able to overflow its way out of one.
             for cursor in [0, 1, 2, 5, usize::MAX] {
-                let (index, tied) = BackendPool::least_conn_pick(&counts, cursor);
+                let index = BackendPool::least_conn_pick(&counts, cursor);
 
-                assert!(
-                    tied >= 1,
-                    "a tie of {tied} would divide by zero in the caller: {counts:?}"
-                );
                 let (_, outstanding) = counts
                     .iter()
                     .find(|(i, _)| *i == index)
@@ -1127,5 +1135,64 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The tie-break cursor is advanced atomically, so a burst of requests that
+    /// arrive together spreads over the pool instead of landing on one backend.
+    ///
+    /// The cursor used to be read and written in two steps, and the two steps
+    /// were not one: two requests that arrived together read the same cursor,
+    /// picked the same backend, and wrote the same value back. The rotation
+    /// stood still while the burst went on, and one backend took the burst
+    /// while the others sat idle — the spread this strategy exists to provide.
+    ///
+    /// The cursor is now advanced by an atomic increment, so every request is
+    /// handed a cursor of its own. That is what the counter says afterwards:
+    /// one step per request, whatever order they arrived in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_tie_break_cursor_advances_once_per_request_under_a_burst() {
+        const REQUESTS: usize = 64;
+
+        let pool = Arc::new(pool_with(
+            LoadBalancingStrategy::LeastConn,
+            &["http://a:80", "http://b:80", "http://c:80", "http://d:80"],
+        ));
+        let barrier = Arc::new(tokio::sync::Barrier::new(REQUESTS));
+
+        let mut requests = Vec::with_capacity(REQUESTS);
+        for _ in 0..REQUESTS {
+            let pool = Arc::clone(&pool);
+            let barrier = Arc::clone(&barrier);
+            requests.push(tokio::spawn(async move {
+                // They start together, so the requests really do arrive at the
+                // same time rather than one after the other.
+                barrier.wait().await;
+                let lease = pool
+                    .select_backend()
+                    .await
+                    .expect("the pool has a healthy backend");
+                let url = lease.url().to_string();
+                drop(lease);
+                url
+            }));
+        }
+
+        let mut picked: Vec<String> = Vec::with_capacity(REQUESTS);
+        for request in requests {
+            picked.push(request.await.expect("the request finished"));
+        }
+
+        let spread: std::collections::HashSet<&str> =
+            picked.iter().map(|url| url.as_str()).collect();
+        assert!(
+            spread.len() > 1,
+            "a burst of {REQUESTS} requests all landed on one backend: {picked:?}"
+        );
+
+        assert_eq!(
+            pool.round_robin_index.load(Ordering::Relaxed),
+            REQUESTS,
+            "every request advanced the cursor by exactly one step"
+        );
     }
 }

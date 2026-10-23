@@ -69,6 +69,7 @@
     <string name="invite_conflict_enrollment">该端点的两步验证凭据（一次性注册将替换它们）</string>
     <string name="invite_conflict_enrollment_pending">该端点的一次性注册令牌</string>
     <string name="invite_conflict_relay">中继设置</string>
+    <string name="invite_conflict_relay_token">该中继的鉴权令牌</string>
     <string name="invite_summary_node">节点：%1$s</string>
     <string name="invite_summary_name">名称：%1$s</string>
     <string name="invite_summary_domains">域名：%1$s</string>
@@ -178,6 +179,7 @@
     <string name="relay_url_placeholder">https://relay.example.com</string>
     <string name="relay_token_label">中继鉴权令牌（可选）</string>
     <string name="relay_token_note">仅当中继要求时才需要填写，且服务器必须使用相同的令牌。</string>
+    <string name="relay_token_cleared_notice">中继鉴权令牌已被清除：令牌只属于签发它的那个中继。</string>
 
     <!-- 凭据锁：挡在已保存凭据前面的那道门 -->
     <string name="credential_lock_title">验证你的身份</string>

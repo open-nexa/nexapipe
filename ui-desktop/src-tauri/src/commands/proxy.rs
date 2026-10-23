@@ -91,6 +91,12 @@ pub(crate) async fn start_proxy(
     if let Some(addr) = dns_addr.as_deref() {
         service::runner::require_tun_subnet(addr)?;
     }
+    // The interface name ends up in a PowerShell script in the service, which runs as
+    // LocalSystem, so it is checked here rather than trusted: the caller gets the
+    // precise error instead of a mysterious failure much later.
+    if let Some(name) = tun_name.as_deref() {
+        service::runner::require_tun_name(name)?;
+    }
 
     if use_service {
         match IpcClient::start_proxy(StartProxyRequest {
@@ -202,6 +208,7 @@ pub(crate) async fn start_proxy(
     service::runner::require_tun_subnet(&dns_addr)?;
 
     let tun_name = tun_name.unwrap_or_else(|| "nexa-tun".to_string());
+    service::runner::require_tun_name(&tun_name)?;
 
     let config = ProxyManagerConfig {
         nodes: parsed_nodes,
