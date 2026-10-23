@@ -63,18 +63,22 @@ function labelFor(node: NodeConfig): string {
  */
 async function requestRemove(node: NodeConfig): Promise<void> {
   const isLast = visibleNodes.value.length === 1;
+  // The label is read while the node is still on the list: an unnamed node's
+  // fallback carries its position in the list, and once the node is gone there
+  // is no position to carry.
+  const label = labelFor(node);
   const ok = await confirm({
     title: isLast ? t("config.removeLastNodeTitle") : t("config.removeNodeTitle"),
     message: isLast
       ? t("config.removeLastNodeMessage")
-      : t("config.removeNodeMessage", { name: labelFor(node) }),
+      : t("config.removeNodeMessage", { name: label }),
     tone: "danger",
     confirmText: t("config.removeNode"),
   });
   if (!ok) return;
 
   removeNode(node.id);
-  toast.success(t("config.nodeRemoved", { name: labelFor(node) }));
+  toast.success(t("config.nodeRemoved", { name: label }));
 }
 </script>
 

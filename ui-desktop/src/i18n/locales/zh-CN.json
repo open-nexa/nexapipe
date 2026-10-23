@@ -261,7 +261,7 @@
     "relayTokenCleared": "中继鉴权令牌已清除：令牌只属于签发它的中继。如果这个中继需要令牌，请重新填写。",
     "restoreDefaults": "恢复默认",
     "restoreDefaultsHint": "把三个地址和负载均衡策略恢复为全新安装时的值。",
-    "networkDefaultsRestored": "网络设置已恢复为默认值。",
+    "networkDefaultsRestored": "三个地址和负载均衡策略已恢复为默认值。",
     "clearConfig": "清空配置",
     "clearConfigTitle": "清空配置？",
     "clearConfigMessage": "所有节点、地址和中继设置都会消失，本机保存的凭据也会一并删除。此操作无法撤销。",

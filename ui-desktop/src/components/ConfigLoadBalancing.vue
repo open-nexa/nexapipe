@@ -44,6 +44,7 @@ const description = computed(() => {
           v-model="loadBalancing"
           :value="option.value"
           type="radio"
+          name="load-balancing"
           class="strategy-radio"
         />
         <span class="strategy-label">{{ t(option.label) }}</span>

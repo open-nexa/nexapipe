@@ -261,7 +261,7 @@
     "relayTokenCleared": "The relay auth token was cleared: a token belongs to the relay it was issued for. Type this relay's token if it needs one.",
     "restoreDefaults": "Restore defaults",
     "restoreDefaultsHint": "Puts the three addresses and the load-balancing strategy back to what a fresh installation has.",
-    "networkDefaultsRestored": "The network settings are back to their defaults.",
+    "networkDefaultsRestored": "The three addresses and the load-balancing strategy are back to their defaults.",
     "clearConfig": "Clear Config",
     "clearConfigTitle": "Clear the configuration?",
     "clearConfigMessage": "Every node, address and relay setting goes, and the credentials stored on this machine are deleted with them. This cannot be undone.",

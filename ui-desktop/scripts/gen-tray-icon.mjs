@@ -305,6 +305,16 @@ function parseArguments() {
     if (arg === '--size' || arg === '--threshold') {
       const value = Number(args[++i]);
       if (!Number.isFinite(value) || value <= 0) die(`${arg} needs a positive number`);
+      // The extraction maps brightness onto alpha over the span between the
+      // threshold and full opacity. A threshold at or above that point leaves no
+      // span to divide by, and one above it inverts the mapping: the background
+      // becomes opaque and the mark becomes transparent. Either way the script
+      // would write a blank or inverted icon and exit zero, and the icon is
+      // embedded at compile time — so the value is refused here instead.
+      if (arg === '--threshold' && value >= FULL_ALPHA) {
+        die(`--threshold must be below ${FULL_ALPHA}`);
+      }
+      if (arg === '--size' && !Number.isInteger(value)) die('--size needs an integer');
       options[arg.slice(2)] = value;
     } else if (arg === '-h' || arg === '--help') {
       process.stdout.write(
