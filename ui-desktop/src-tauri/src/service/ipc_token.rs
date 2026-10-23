@@ -107,7 +107,13 @@ pub fn ensure_token_at(path: &Path) -> Result<String, AppError> {
             "token path has no parent directory",
         )
     })?;
-    std::fs::create_dir_all(parent).map_err(|e| {
+    // The directory that holds the token must not be writable by group or
+    // other, whatever the umask says: `create_dir_all` would leave it at 0777
+    // minus the umask, which is 0775 under a umask of 002 — and a
+    // group-writable directory is one the service refuses to read a token
+    // from, so the desktop would be locked out of its own service. The mode
+    // is asked for instead, and the umask can only take bits away from it.
+    create_private_dir(parent).map_err(|e| {
         AppError::cause(
             codes::SERVICE_IPC_TOKEN,
             format!("cannot create {parent:?}: {e}"),
@@ -141,6 +147,37 @@ pub fn ensure_token_at(path: &Path) -> Result<String, AppError> {
             format!("cannot read {path:?}: {e}"),
         )),
     }
+}
+
+/// Creates the directory that holds the token, private to its owner.
+///
+/// The umask cannot make a directory more private than it was asked to be,
+/// but it can leave it less private than the service insists on — so the mode
+/// is asked for rather than inherited.
+#[cfg(unix)]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    // The parents are made with the mode the system would give them; only the
+    // directory that holds the secret is asked to be private.
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => Ok(()),
+        // It was already there. Whether that directory is private enough is
+        // the service's rule to refuse, not this one's to change.
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The token's directory on Windows is the account's own, and its access is
+/// the file's own ACL rather than a mode bit.
+#[cfg(not(unix))]
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)
 }
 
 /// A token the service found, with the account that owns the file it came from.

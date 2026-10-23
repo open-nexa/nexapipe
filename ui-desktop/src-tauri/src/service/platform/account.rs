@@ -329,7 +329,14 @@ fn peer_uid(stream: &tokio::net::TcpStream) -> Option<u32> {
 fn peer_sid(stream: &tokio::net::TcpStream) -> Option<String> {
     let local = stream.local_addr().ok()?;
     let remote = stream.peer_addr().ok()?;
-    let pid = owning_pid(local, remote)?;
+    // The table holds a row per **endpoint**, and the two ends of a
+    // connection have their addresses the other way round: this socket's row
+    // says local = this side's address and remote = the peer's, and the
+    // peer's row says the opposite. The peer is the owner of the second one,
+    // so the addresses are swapped for the lookup — looking for this
+    // socket's own row answers with this process, and every client would be
+    // read as the account the service itself runs as.
+    let pid = owning_pid(remote, local)?;
     process_user_sid(pid)
 }
 
@@ -435,8 +442,14 @@ fn process_user_sid(pid: u32) -> Option<String> {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
 
         let mut token = HANDLE(std::ptr::null_mut());
-        OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+        // The process handle is closed whether the token opened or not: an
+        // early return between the two would leak it, and this runs for every
+        // IPC connection, so the leak would run the handle table down.
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token).is_ok();
         let _ = CloseHandle(process);
+        if !opened {
+            return None;
+        }
 
         let account = token_user_sid(token);
 

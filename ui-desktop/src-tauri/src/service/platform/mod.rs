@@ -245,7 +245,11 @@ where
 }
 
 /// The account the elevation channel says asked for it.
-#[cfg(unix)]
+///
+/// The channel is unix's, but the function is not unix's alone: the rest of
+/// the elevation path is `not(windows)`, and a target that is neither unix
+/// nor windows would not compile if this one were unix-only.
+#[cfg(not(windows))]
 fn installing_account_from_env() -> Option<AccountId> {
     for name in ["PKEXEC_UID", "SUDO_UID"] {
         let Ok(value) = std::env::var(name) else {
