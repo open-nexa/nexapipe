@@ -1097,6 +1097,16 @@ lookup, which is what a config written before the key existed does.
   dropped, and a hello whose name carries a control character is closed
   rather than logged.
 
+  It reads the record and nothing past it as well. The record's own length
+  says where the `ClientHello` ends, and the two ends of the tunnel do not
+  have the same buffer: the client has whatever its read pulled in, the server
+  has what arrived on the tunnel, and the tunnel path's own sniffer has the
+  record and nothing else. A hello whose record understates the message
+  inside it could therefore be read as one name on one end and as another on
+  the other — and a name sitting in the bytes after the record could be read
+  as the name of the hello at all. The reader stops at the record's end now,
+  so the answer is about the `ClientHello` and about nothing else.
+
 - **The client's own documentation builds without a warning.** `cargo doc -p
   nexapipe-client` reported sixteen. Fifteen of them were links that pointed at
   nothing: five named a thing the crate does not have — `Secret::expose_secret`,

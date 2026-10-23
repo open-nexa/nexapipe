@@ -12,6 +12,11 @@
 //! The two could disagree about the same `ClientHello` — and the disagreement
 //! is not visible in either of them, because each looks right on its own. One
 //! copy, and both sides link it.
+//!
+//! The reader reads the **record** and nothing past it. The record's own
+//! length says where the `ClientHello` ends, and the two ends do not have the
+//! same buffer around those bytes, so an answer that depended on what
+//! followed the record would be an answer they could disagree about.
 
 /// TLS record content type: handshake (a `ClientHello` starts with this).
 pub const TLS_HANDSHAKE: u8 = 0x16;
@@ -71,16 +76,33 @@ fn is_presentable_host_name(name: &str) -> bool {
 ///
 /// Returns `None` for anything that does not fit that shape, including a
 /// `ClientHello` that carries no `server_name` extension.
+///
+/// Only the record is read: the bytes after it are not part of the
+/// `ClientHello`, and the answer must not depend on them.
 pub fn extract_sni(data: &[u8]) -> Option<String> {
-    let mut record = Cursor::new(data);
-    if record.u8()? != TLS_HANDSHAKE {
+    let mut header = Cursor::new(data);
+    if header.u8()? != TLS_HANDSHAKE {
         return None;
     }
-    record.skip(2)?; // legacy record version
-    let record_len = record.u16()? as usize;
-    if data.len() < 5 + record_len {
+    header.skip(2)?; // legacy record version
+    let record_len = header.u16()? as usize;
+    let record_end = 5 + record_len;
+    if data.len() < record_end {
         return None;
     }
+
+    // **The record's own bytes, and nothing past them.**
+    //
+    // The record's length says where the `ClientHello` ends, and the answer
+    // has to be about the `ClientHello` alone. Reading past the record makes
+    // the answer depend on what else was in the buffer — and the two ends of
+    // the tunnel do not have the same buffer: the client has whatever its
+    // read pulled in, the server has what arrived on the tunnel, and the
+    // tunnel path's sniffer has the record and nothing else. A hello whose
+    // record understates the message inside it would then read as one name
+    // on one end and another on the other.
+    let mut record = Cursor::new(&data[..record_end]);
+    record.skip(5)?; // the header that was just read
 
     // Handshake header. Its own length is redundant with the record length, so
     // only the type is checked.
@@ -276,5 +298,45 @@ mod tests {
     fn something_that_is_not_a_hello_is_refused() {
         assert_eq!(extract_sni(&[]), None);
         assert_eq!(extract_sni(b"GET / HTTP/1.1\r\n\r\n"), None);
+    }
+
+    /// **The record's own length is the boundary of the answer.**
+    ///
+    /// The bytes after the record are not part of the `ClientHello`. A peer
+    /// that puts a name there — a record whose own length understates the
+    /// message inside it is enough — must not have that name read as the route
+    /// key.
+    ///
+    /// This is not a corner case for its own sake: the two ends of the tunnel
+    /// hand this reader **different amounts of the same bytes** — the client
+    /// has whatever its read pulled in, the server has what arrived on the
+    /// tunnel — and an answer that depended on what followed the record would
+    /// be an answer the two ends could disagree about, which is the whole
+    /// failure the shared reader was written to remove.
+    #[test]
+    fn a_name_past_the_record_is_not_read() {
+        let mut hello = hello("example.com");
+        // The record claims to be ten bytes long, which is far short of the
+        // message inside it — so the name that follows is not the name of
+        // this `ClientHello`.
+        hello[3] = 0x00;
+        hello[4] = 0x0a;
+        assert_eq!(
+            extract_sni(&hello),
+            None,
+            "the name was read from past the end of the record"
+        );
+    }
+
+    /// The same hello, read out of a buffer that carries more than the record,
+    /// gives the same answer — because the answer is about the record.
+    #[test]
+    fn what_follows_the_record_does_not_change_the_answer() {
+        let hello = hello("example.com");
+        let mut with_more = hello.clone();
+        // A second record, the way a client that has sent its `ClientHello`
+        // and moved on would have it.
+        with_more.extend_from_slice(b"\x16\x03\x03\x00\x02\xff\xff");
+        assert_eq!(extract_sni(&hello), extract_sni(&with_more));
     }
 }
