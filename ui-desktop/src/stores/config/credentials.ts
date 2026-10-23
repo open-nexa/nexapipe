@@ -20,6 +20,7 @@ import {
   takeRuntimeCredentials,
 } from '../../api/credentials';
 import type { NodeConfig, ProxyConfig } from '../../types';
+import { isKeyNode } from './keys';
 import { relayTokenRelayFor } from './relay';
 
 /**
@@ -72,23 +73,36 @@ export async function persistCredentials(config: ProxyConfig): Promise<void> {
       await deleteCredential('totp', node.id);
     } else if (node.twoFactor.secret.trim()) {
       await putCredential('totp', node.twoFactor.secret, node.id);
-    } else if (node.deviceKey?.trim()) {
+    } else if (isKeyNode(node)) {
       // A key node stores no seed: a secret left in the store would be a
       // credential the server never issued this device, and the one thing
       // that store is for is answering with what the server holds.
+      //
+      // **The node's own key, not the one it answers with.** Every node of a
+      // machine that has a key carries it, so a node whose credential is a
+      // secret carries one too — and asking "does this node have a key?" of
+      // that would have deleted the seed the invite had just filed, leaving
+      // the node with no credential at all.
       await deleteCredential('totp', node.id);
     }
 
-    // A device key, when this node has one.
+    // A device key is not mirrored here.
     //
-    // Left alone when the node has neither a credential nor a pending
-    // enrollment: `accept_invite` put the key in the store when the invite
-    // was imported, and the enrollment that is about to spend its token
-    // offers exactly that key. Deleting it here would drop it before it was
-    // ever used.
-    if (node.deviceKey?.trim()) {
-      await putCredential('devicekey', node.deviceKey, node.id);
-    } else if (!node.deviceKey && !node.enrollment) {
+    // It belongs to the machine rather than to the node: the store holds the
+    // machine's key, and a node's own key is the one the server holds under
+    // this machine's name — which outlives every server the machine comes
+    // back to. So the backend owns it: `accept_invite` files the key it is
+    // about to offer, and a node that no longer has one has it dropped
+    // there. Writing it back from here would file the machine's key under
+    // every node, and a node would then look like it had enrolled with a key
+    // of its own when it had not.
+    //
+    // What is left is the deletion: a node whose key was cleared here must
+    // not leave one behind in the store. And "whose key was cleared" is
+    // about the node's own key: the machine's is not this node's to drop,
+    // and a node that never had one of its own has nothing of its own
+    // filed here.
+    if (!isKeyNode(node) && !node.enrollment) {
       await deleteCredential('devicekey', node.id);
     }
 
@@ -177,10 +191,17 @@ export async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConf
     // and lives in the store like the secret beside it; the public half is
     // derived by the backend from that same key, so the two can never
     // disagree about which key this is.
+    //
+    // The key the store answers with is the machine's: the backend falls back
+    // to the machine's key for a node that has none of its own, so a node
+    // without one still signs with the key the server holds under this
+    // machine's name.
     const deviceKey = stored?.deviceKey ?? null;
     if (deviceKey) {
       node.deviceKey = deviceKey;
     } else if (node.deviceKey?.trim()) {
+      // A payload from before the store held the secrets: the key is in the
+      // clear there, and this is where it leaves.
       await putCredential('devicekey', node.deviceKey, node.id);
     }
     if (stored?.publicKey) {

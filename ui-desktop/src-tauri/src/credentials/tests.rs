@@ -344,6 +344,13 @@ fn a_connection_string_is_keyed_by_the_node_it_connects() {
     );
 }
 
+/// A device key is a credential like the secret beside it, and it is filed
+/// under its node the same way: a key that outlived the node it belonged to
+/// would be handed to whatever node reuses that id.
+///
+/// It is filed under the machine as well, because a key belongs to the machine
+/// rather than to the node: the server files a credential under the machine's
+/// name, and that name outlives every server the machine comes back to.
 #[test]
 fn a_key_is_per_node_and_a_relay_token_is_global() {
     assert_eq!(
@@ -354,9 +361,6 @@ fn a_key_is_per_node_and_a_relay_token_is_global() {
         super::secret_key(CredentialKind::EnrollmentToken, "node-1"),
         "enrollment:node-1"
     );
-    // A device key is a credential like the secret beside it, and it is
-    // filed under its node the same way: a key that outlived the node it
-    // belonged to would be handed to whatever node reuses that id.
     assert_eq!(
         super::secret_key(CredentialKind::DeviceKey, "node-1"),
         "devicekey:node-1"
@@ -364,6 +368,121 @@ fn a_key_is_per_node_and_a_relay_token_is_global() {
     assert_eq!(
         super::secret_key(CredentialKind::RelayToken, "ignored"),
         "relay:global"
+    );
+}
+
+/// A machine that has no key of its own adopts the key of a node that has
+/// one: that is the key the server holds under this machine's name, and
+/// adopting it is what keeps the two the same. Without it, a machine that
+/// comes back to a rebuilt server would offer a new key and be refused as a
+/// takeover.
+#[test]
+fn a_machine_adopts_the_key_of_a_node_that_has_one() {
+    let (_dir, store) = store("adopt");
+
+    super::device_key::file_device_key(&store, "node-1", "aa").expect("filed");
+
+    assert_eq!(
+        super::device_key::machine_device_key(&store)
+            .expect("readable")
+            .as_deref(),
+        Some("aa")
+    );
+}
+
+/// The machine's key is never replaced once it exists: the servers holding it
+/// are the ones that would stop recognising this machine.
+#[test]
+fn the_machine_key_is_not_replaced() {
+    let (_dir, store) = store("keep");
+
+    super::device_key::file_device_key(&store, "node-1", "aa").expect("filed");
+    super::device_key::file_device_key(&store, "node-2", "bb").expect("filed");
+
+    assert_eq!(
+        super::device_key::machine_device_key(&store)
+            .expect("readable")
+            .as_deref(),
+        Some("aa"),
+        "the machine kept the key it had"
+    );
+}
+
+/// A node that enrolled with a key answers with that key, whatever the
+/// machine does afterwards: the server holds it under this machine's name.
+#[test]
+fn a_node_answers_with_its_own_key_first() {
+    let (_dir, store) = store("own");
+
+    super::device_key::file_device_key(&store, "node-1", "aa").expect("filed");
+    super::device_key::file_device_key(&store, "node-2", "bb").expect("filed");
+
+    assert_eq!(
+        super::device_key::effective_device_key(&store, "node-1")
+            .expect("readable")
+            .as_deref(),
+        Some("aa")
+    );
+    assert_eq!(
+        super::device_key::effective_device_key(&store, "node-2")
+            .expect("readable")
+            .as_deref(),
+        Some("bb")
+    );
+}
+
+/// A node without a key of its own answers with the machine's — the same key
+/// every other server this machine comes back to is answered with.
+#[test]
+fn a_node_without_one_answers_with_the_machine_key() {
+    let (_dir, store) = store("fallback");
+
+    super::device_key::file_device_key(&store, "node-1", "aa").expect("filed");
+
+    assert_eq!(
+        super::device_key::effective_device_key(&store, "node-2")
+            .expect("readable")
+            .as_deref(),
+        Some("aa")
+    );
+}
+
+/// A machine that has never had a key has none to answer with: it is not a
+/// key that is looked up wrongly, it is the absence of one.
+#[test]
+fn a_machine_with_no_key_at_all_has_none() {
+    let (_dir, store) = store("empty");
+
+    assert_eq!(
+        super::device_key::machine_device_key(&store)
+            .expect("readable")
+            .as_deref(),
+        None
+    );
+    assert_eq!(
+        super::device_key::effective_device_key(&store, "node-1")
+            .expect("readable")
+            .as_deref(),
+        None
+    );
+}
+
+/// The machine's own entry is not filed under a node id, so it cannot be
+/// mistaken for one of a node's own — the ids are `node-<hex>` or a
+/// 64-character Node ID.
+#[test]
+fn the_machine_key_is_filed_under_a_scope_of_its_own() {
+    let (_dir, store) = store("scope");
+
+    super::device_key::file_device_key(&store, "node-1", "aa").expect("filed");
+
+    assert!(
+        store
+            .keys()
+            .expect("the keys are read")
+            .contains(&"devicekey:global".to_string()),
+        "the machine's key is filed under its own scope: {:?}",
+        store.keys().expect("the keys are read")
     );
 }
 

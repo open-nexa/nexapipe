@@ -58,6 +58,10 @@ internal fun EndpointTwoFactorCard(
         )
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
+            // What this endpoint is: a pending enrollment is neither on nor
+            // off, and saying "off" is what made a scanned invite look like
+            // it had not been applied.
+            val state = twoFactorUiState(twoFactor, enrollment)
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
@@ -70,17 +74,24 @@ internal fun EndpointTwoFactorCard(
                         style = MaterialTheme.typography.titleSmall
                     )
                     Text(
-                        text = if (twoFactor.enabled) {
-                            stringResource(R.string.two_factor_on)
-                        } else {
-                            stringResource(R.string.two_factor_off)
+                        text = when (state) {
+                            TwoFactorUiState.On -> stringResource(R.string.two_factor_on)
+                            TwoFactorUiState.Off -> stringResource(R.string.two_factor_off)
+                            TwoFactorUiState.PendingEnrollment ->
+                                stringResource(R.string.two_factor_pending)
                         },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 Switch(
-                    checked = twoFactor.enabled,
+                    checked = state != TwoFactorUiState.Off,
+                    // A pending enrollment cannot be switched off: the token
+                    // is armed and the credential comes with the next
+                    // connect. Letting the switch move wrote a credential with
+                    // nothing in it over the registration that was about to
+                    // succeed.
+                    enabled = state != TwoFactorUiState.PendingEnrollment,
                     onCheckedChange = { enabled ->
                         // Switching this off stops the endpoint
                         // from presenting a token at all, and

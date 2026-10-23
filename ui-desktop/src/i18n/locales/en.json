@@ -341,6 +341,7 @@
     "deviceHint": "A named device gets a secret of its own, so revoking it leaves every other device of this client alone. Naming one takes a registration invite: a token is what issues a credential, and a secret typed by hand is the client's.",
     "deviceReenroll": "Re-enroll this device",
     "enrollmentPending": "Waiting to enroll as {id}: the server issues this node's credentials on the next connect.",
+    "twoFactorPending": "Pending enrollment",
     "twoFactorPublicKey": "Public key",
     "twoFactorKeyHint": "This node proves itself with a key of its own. The private half never leaves this machine, and the server holds only the public half above — so this node can be revoked on its own, and a leaked configuration is no longer a way in as it."
   },

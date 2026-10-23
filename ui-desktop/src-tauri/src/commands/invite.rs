@@ -205,31 +205,44 @@ pub(crate) fn accept_invite(uri: String) -> Result<InviteAccepted, AppError> {
     // is spent — a token cannot be spent twice, and a node whose key was lost
     // afterwards cannot enroll again from the same code.
     //
-    // Only for a node that has no key yet: the key belongs to the device, and
-    // replacing it here would leave the server holding the old public half
-    // while this machine signs with a new one. Re-importing the same invite
-    // keeps the key it already has.
+    // The key is the machine's, not this node's: the server files a credential
+    // under the machine's name, and that name does not change when the server
+    // does — a server that is rebuilt or copied keeps the row, while the
+    // endpoint id it answers to changes. A node that answers a rebuilt server
+    // with a different key is a different device to it, and is refused as a
+    // takeover.
+    //
+    // So the key a node already enrolled with comes first — that is the one
+    // the server holds under this machine's name, and offering another would
+    // be a different device as far as the server is concerned — and the
+    // machine's own key comes next, so that every server this machine comes
+    // back to is answered with the same key. Only a machine that has none yet
+    // mints one, and it mints one for the machine.
     //
     // The private half is filed in the store and never crosses to the
     // renderer; only the public half does, because it is not a secret and it
     // is what names this key to an operator.
     let public_key = match &invite.enrollment {
         Some(_) => {
-            let key = match credentials::get(&credentials::secret_key(
-                credentials::CredentialKind::DeviceKey,
-                &node_id,
-            ))? {
-                Some(spelled) => DeviceKey::from_hex(&spelled)
-                    .map_err(|e| AppError::cause(codes::CREDENTIALS_STORE_FAILED, e))?,
+            let private = match credentials::node_device_key(&node_id)? {
+                Some(own) => {
+                    // Kept as the node's own, and adopted as the machine's
+                    // when the machine has none: the server holds this key
+                    // under this machine's name.
+                    credentials::file_device_key(&node_id, &own)?;
+                    own
+                }
                 None => {
-                    let key = DeviceKey::generate();
-                    credentials::put(
-                        &credentials::secret_key(credentials::CredentialKind::DeviceKey, &node_id),
-                        &key.private_hex(),
-                    )?;
-                    key
+                    let private = match credentials::machine_device_key()? {
+                        Some(machine) => machine,
+                        None => DeviceKey::generate().private_hex(),
+                    };
+                    credentials::file_device_key(&node_id, &private)?;
+                    private
                 }
             };
+            let key = DeviceKey::from_hex(&private)
+                .map_err(|e| AppError::cause(codes::CREDENTIALS_STORE_FAILED, e))?;
             Some(key.public_hex())
         }
         None => None,

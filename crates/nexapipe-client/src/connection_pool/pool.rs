@@ -326,7 +326,7 @@ impl IrohConnectionPool {
     /// every connection in flight over a rotation that changes nothing about
     /// who they are.
     pub async fn set_two_factor(&self, auth: Option<TwoFactorAuth>) {
-        self.set_credential(auth).await;
+        let _ = self.set_credential(auth).await;
     }
 
     /// Writes the pool's credential, and closes the connections of the
@@ -336,7 +336,16 @@ impl IrohConnectionPool {
     /// writes a credential of its own — and it writes it **here**, so that
     /// the identity comparison, the move of the generation and the drop of
     /// the connections of the identity that is gone happen with it.
-    pub(super) async fn set_credential(&self, auth: Option<TwoFactorAuth>) {
+    ///
+    /// **The generation comes back with the write.** The generation says
+    /// which credential a connection was authenticated under, so a caller
+    /// that has just written one has to carry the generation of *that*
+    /// write: a generation read after the lock is released can be one that a
+    /// later write has already moved, and a connection carrying that one is
+    /// taken for the identity that replaced this one — the pool compares the
+    /// two and finds them equal, and pools a connection that authenticated as
+    /// an identity that is gone.
+    pub(super) async fn set_credential(&self, auth: Option<TwoFactorAuth>) -> u64 {
         let mut slot = self.inner.two_factor.lock().await;
         let changed = identity_changed(slot.as_ref(), auth.as_ref());
         if changed {
@@ -357,6 +366,9 @@ impl IrohConnectionPool {
                 .fetch_add(1, Ordering::AcqRel);
         }
         *slot = auth;
+        // Read under the lock the credential is written under, so the two
+        // cannot come from different moments.
+        let generation = self.inner.credential_generation.load(Ordering::Acquire);
         // Released before the connections are touched: the lock order is
         // `connections` first, and nesting the two is what makes a pool that
         // dials while another task shuts it down deadlock-prone.
@@ -366,6 +378,8 @@ impl IrohConnectionPool {
             // The connections were authenticated as the identity that is gone.
             self.drop_connections().await;
         }
+
+        generation
     }
 
     /// Configure a one-time enrollment token instead of credentials: the next

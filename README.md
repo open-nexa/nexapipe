@@ -1966,6 +1966,11 @@ Both are regular directories of this repository (their git history was preserved
 when they were imported from their former standalone repos), and they ship from
 the same tags as the server.
 
+When a client will not connect — the device identity, an enrollment that is
+still pending, or a Windows service that is still running the previous build —
+[When a client cannot connect](docs/client-troubleshooting.md) says which check
+to run first.
+
 ### First launch on macOS
 
 The desktop bundles in a GitHub release are code-signed and notarized. A

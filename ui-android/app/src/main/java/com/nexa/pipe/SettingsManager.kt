@@ -97,6 +97,18 @@ class SettingsManager internal constructor(
          * the name itself is not a secret.
          */
         const val KEY_DEVICE_ID = "device_id"
+        // The private half of this device's own key: the Ed25519 key every
+        // endpoint of this phone proves itself with when it has no key of its
+        // own.
+        //
+        // One key for the phone, as there is one name for it. The name is what
+        // the server files a credential under, and it does not change when the
+        // server does: a server that is rebuilt or copied keeps the row, while
+        // the endpoint id it answers to changes — and an endpoint id that
+        // changes must not change the key, or the device comes back to a
+        // server that holds its key under its name with a different one, and
+        // is refused as a takeover.
+        const val KEY_DEVICE_KEY = "device_key"
 
         // Language tag of the app UI, e.g. "zh-CN". Empty means "follow the
         // system", which is the default.
@@ -416,18 +428,50 @@ class SettingsManager internal constructor(
     }
 
     /**
-     * The private half of an endpoint's device key, or empty when it has none.
+     * The private half of the device key this endpoint has of its own, or
+     * empty when it has none.
+     *
+     * The endpoint's own key is the one it enrolled with, and the one the
+     * server holds under this device's name. It is read from the file backup
+     * excludes, and it is never written into the endpoint list that is backed
+     * up.
+     *
+     * Not the key the endpoint answers with in general — that is
+     * [deviceKeyFor] — because a caller that wants *this endpoint's* key and
+     * is given the device's one would drop a key the server still holds.
+     */
+    fun deviceKeyForNode(nodeId: String): String =
+        secrets.unseal(secretPrefs.getString(DEVICE_KEY_PREFIX + nodeId, "") ?: "")
+
+    /**
+     * The private half of the device key this endpoint proves itself with.
+     *
+     * The endpoint's own key when it has one, and the device's key when it
+     * does not: a key belongs to the device, not to the endpoint that
+     * happened to enroll first, and the server files it under this device's
+     * *name* — a name that outlives every endpoint it enrolls with. A key per
+     * endpoint would make this phone a different device to every server it
+     * comes back to, and the enrollment would be refused as a takeover.
+     */
+    fun deviceKeyFor(nodeId: String): String {
+        val own = deviceKeyForNode(nodeId)
+        return if (own.isNotBlank()) own else deviceKey()
+    }
+
+    /**
+     * The private half of this device's own key: the one every endpoint of
+     * this phone proves itself with when it has no key of its own.
      *
      * The credential that proves this device to the server, and the only copy
      * there is: the server holds the public half and nobody else holds this
      * one. It is read from the file backup excludes, and it is never written
      * into the endpoint list that is backed up.
      */
-    fun deviceKeyFor(nodeId: String): String =
-        secrets.unseal(secretPrefs.getString(DEVICE_KEY_PREFIX + nodeId, "") ?: "")
+    fun deviceKey(): String =
+        secrets.unseal(secretPrefs.getString(KEY_DEVICE_KEY, "") ?: "")
 
     /**
-     * Stores the private half of an endpoint's device key, sealed.
+     * Keeps the private half of this device's key, sealed.
      *
      * Returns whether it was sealed. A key that could not be sealed is not
      * written at all: this half is the credential, and a copy of it in the
@@ -435,13 +479,37 @@ class SettingsManager internal constructor(
      * no key — the endpoint then enrolls with a TOTP secret instead, which the
      * server can revoke.
      */
-    fun saveDeviceKey(nodeId: String, privateKeyHex: String): Boolean {
+    fun saveDeviceKeyForDevice(privateKeyHex: String): Boolean {
         val sealed = secrets.sealOrNull(privateKeyHex) ?: return false
-        secretPrefs.edit { putString(DEVICE_KEY_PREFIX + nodeId, sealed) }
+        secretPrefs.edit { putString(KEY_DEVICE_KEY, sealed) }
         return true
     }
 
-    /** Forgets an endpoint's device key, which is what a cleared credential does. */
+    /**
+     * Makes [privateKeyHex] this device's key when it does not have one yet.
+     *
+     * The key of an endpoint that enrolled before the device had one of its
+     * own is the key the server holds under this device's name — adopting it
+     * is what keeps the two the same, so that the endpoint this phone enrolls
+     * with next offers a key the server already knows, instead of a new one no
+     * server has ever seen.
+     *
+     * An existing device key is never replaced: the servers holding it are the
+     * ones that would stop recognizing this device.
+     */
+    fun adoptDeviceKeyIfEmpty(privateKeyHex: String): Boolean {
+        val toAdopt = deviceKeyToAdopt(deviceKey(), privateKeyHex)
+            ?: return deviceKey() == privateKeyHex
+        return saveDeviceKeyForDevice(toAdopt)
+    }
+
+    /**
+     * Forgets an endpoint's own device key, which is what a cleared credential
+     * does.
+     *
+     * The device's key is not touched: it belongs to the phone, and the other
+     * endpoints of it answer with it.
+     */
     fun clearDeviceKey(nodeId: String) {
         secretPrefs.edit { remove(DEVICE_KEY_PREFIX + nodeId) }
     }
@@ -697,13 +765,33 @@ class SettingsManager internal constructor(
  * the one file whose whole point is that it holds ciphertext — and the
  * migration that was supposed to take them away was skipped by the very flag
  * that said it had run.
+ *
+ * The device keys are in the list for the same reason: a device key is the
+ * private half of the device's proof of who it is, and there is no second copy
+ * of it anywhere.
  */
 internal fun isCredentialKey(key: String): Boolean =
     key == SettingsManager.KEY_RELAY_AUTH_TOKEN ||
         key == SettingsManager.KEY_2FA_SECRET ||
         key == SettingsManager.KEY_2FA_CLIENT_ID ||
+        key == SettingsManager.KEY_DEVICE_KEY ||
         key.startsWith(SettingsManager.SECRET_PREFIX) ||
-        key.startsWith(SettingsManager.ENROLLMENT_PREFIX)
+        key.startsWith(SettingsManager.ENROLLMENT_PREFIX) ||
+        key.startsWith(SettingsManager.DEVICE_KEY_PREFIX)
+
+/**
+ * The key this device should keep, when an endpoint offers one.
+ *
+ * `null` means there is nothing to write: the device already has a key of its
+ * own, and the servers holding it are the ones that would stop recognizing
+ * this device if it were replaced. A key is the one to keep — the device has
+ * none yet, and this is the key the server holds under this device's name.
+ *
+ * A pure function, so the rule can be checked here rather than by enrolling a
+ * device against a server.
+ */
+internal fun deviceKeyToAdopt(current: String, offered: String): String? =
+    if (current.isNotBlank() || offered.isBlank()) null else offered
 
 /**
  * The app-wide 2FA setting an older version kept.
