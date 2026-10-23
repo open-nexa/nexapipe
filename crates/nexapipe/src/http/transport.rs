@@ -428,6 +428,35 @@ async fn silent_backend() -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
     (port, accepted)
 }
 
+/// A backend that sends the head and then stops, so the body is still on
+/// the wire when the answer is handed over.
+///
+/// The head promises sixteen bytes of body and none of them come. The
+/// connection is held open, so the answer is a body that has not arrived
+/// yet — a backend that is still working on the request.
+async fn stalling_backend() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback listener");
+    let port = listener.local_addr().expect("an address").port();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                // The head, and nothing after it.
+                let _ = stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\n")
+                    .await;
+                // Held open: the body never comes.
+                let _stream = stream;
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            });
+        }
+    });
+
+    port
+}
+
 /// A route table with the given backends, and a retry that tries again.
 fn route_table(backends: Vec<String>, attempts: u32) -> Arc<crate::routes::RoutingTable> {
     let timeouts = crate::config::Timeouts {
@@ -944,6 +973,94 @@ async fn a_backend_stays_busy_until_its_response_is_dropped() {
         pool.outstanding(&backend).await,
         0,
         "the body is gone, so the backend is free again"
+    );
+}
+
+/// A backend stays busy on the tunnel path for as long as its answer is
+/// out there.
+///
+/// The count is what `least_conn` balances on, and an answer whose body has
+/// not been read yet is a request the backend is still working on.
+///
+/// The plaintext path has always held the lease with the body. The tunnel
+/// path dropped it with the head: the backend info was dropped when
+/// `forward` returned and the lease went with it, so the balancer saw an
+/// idle backend while its body was still streaming.
+///
+/// The backend here sends the head and then stops, so the body really is
+/// still on the wire when the answer is handed over.
+#[tokio::test]
+async fn a_backend_stays_busy_until_its_answer_is_dropped_on_the_tunnel_path() {
+    let port = stalling_backend().await;
+    let backend = format!("http://127.0.0.1:{port}");
+    let route = crate::routes::Route::new(
+        "busy-tunnel.test",
+        "/",
+        true,
+        vec![backend.clone()],
+        crate::lb::LoadBalancingStrategy::RoundRobin,
+        crate::config::RouteMode::Http,
+        None,
+    );
+    let config = Arc::new(crate::routes::RoutingTable::new(vec![route]));
+    let pool = config.routes().await[0].backend_pool().clone();
+    let clients =
+        BackendClients::new(std::time::Duration::from_secs(5), None).expect("the clients");
+
+    let ctx = Arc::new(crate::http::server::Context {
+        config: config.clone(),
+        clients: Arc::new(clients),
+        peer: "127.0.0.1:12345".to_string(),
+        acl: None,
+        request_id: "busy-tunnel".to_string(),
+        who: crate::conn::peers::PeerIdentity::default(),
+    });
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("http://busy-tunnel.test/")
+        .header("host", "busy-tunnel.test")
+        .body(())
+        .expect("a request");
+    let (host, port) = crate::routes::host_and_port("busy-tunnel.test");
+    let path = "/";
+    let backend_info = config
+        .get_backend(host, path)
+        .await
+        .backend()
+        .expect("the route has a backend");
+    let body = RequestBody::Whole {
+        bytes: bytes::Bytes::new(),
+        reservation: crate::conn::limits::ByteReservation::take(0).expect("the budget"),
+    };
+
+    let answer = crate::http::server::forward(
+        &ctx,
+        &request,
+        &request.uri().to_string(),
+        &request.method().clone(),
+        Some((host, port)),
+        path,
+        backend_info,
+        &body,
+        std::time::Instant::now(),
+    )
+    .await
+    .expect("the backend answers");
+
+    assert_eq!(
+        pool.outstanding(&backend).await,
+        1,
+        "the answer is still out there, so the backend is still busy with it"
+    );
+
+    let response = answer.into_response();
+    drop(response);
+
+    assert_eq!(
+        pool.outstanding(&backend).await,
+        0,
+        "the answer is gone, so the backend is free again"
     );
 }
 
