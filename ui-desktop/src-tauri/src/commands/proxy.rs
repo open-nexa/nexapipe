@@ -306,24 +306,32 @@ pub(crate) async fn get_proxy_status(use_service: Option<bool>) -> Result<ProxyS
         // A manager with no mode yet is starting up, not running: see `ProxyStatus::starting`.
         Some(Some(mode)) => ProxyStatus::running_with(mode),
         Some(None) => ProxyStatus::starting(),
-        // No manager here, and the service could not be asked. Whether that means "no tunnel" or
-        // "a tunnel this process cannot see" depends on whether the service is even up: a service
-        // that is stopped or not installed cannot own one, so that state is reported as stopped.
-        // Only a running service that fails to answer leaves the question open — and answering it
-        // with "stopped" there is what starts a second tunnel over a live one.
+        // No manager here, and the service could not be asked: whether that is "no tunnel" or "a
+        // tunnel this process cannot see" is decided by the service manager's own state.
         None if use_service => {
-            let service_up = tauri::async_runtime::spawn_blocking(service::platform::service_state)
+            let state = tauri::async_runtime::spawn_blocking(service::platform::service_state)
                 .await
-                .map(|state| state == service::platform::ServiceState::Running)
-                .unwrap_or(false);
-            if service_up {
-                ProxyStatus::unknown()
-            } else {
-                ProxyStatus::stopped()
-            }
+                .unwrap_or(service::platform::ServiceState::NotInstalled);
+            status_for_an_unanswered_service(state)
         }
         None => ProxyStatus::stopped(),
     })
+}
+
+/// The status to report when no manager here answered and the service did not either.
+///
+/// Only a running service can own a tunnel this process cannot see, so only that state leaves
+/// the question open. A service that is stopped or not installed cannot own one — reporting it
+/// as unknown is what told the connect page "status unknown" about a plain stopped proxy, and
+/// answering "stopped" about a *running* service is what starts a second tunnel over a live
+/// one.
+fn status_for_an_unanswered_service(state: service::platform::ServiceState) -> ProxyStatus {
+    match state {
+        service::platform::ServiceState::Running => ProxyStatus::unknown(),
+        service::platform::ServiceState::Stopped | service::platform::ServiceState::NotInstalled => {
+            ProxyStatus::stopped()
+        }
+    }
 }
 
 /// This endpoint's Node ID, as [`credentials::mask`] renders it.
@@ -570,3 +578,29 @@ pub(crate) async fn stale_hijack_cleanup() {
 /// because it is 1.4 seconds of synchronous process output that must not sit on a runtime
 /// worker.
 static STALE_HIJACK_CLEANUP: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::service::platform::ServiceState;
+
+    #[test]
+    fn a_running_service_that_does_not_answer_leaves_the_question_open() {
+        assert_eq!(
+            status_for_an_unanswered_service(ServiceState::Running),
+            ProxyStatus::unknown()
+        );
+    }
+
+    #[test]
+    fn a_service_that_is_not_running_cannot_own_a_tunnel() {
+        assert_eq!(
+            status_for_an_unanswered_service(ServiceState::Stopped),
+            ProxyStatus::stopped()
+        );
+        assert_eq!(
+            status_for_an_unanswered_service(ServiceState::NotInstalled),
+            ProxyStatus::stopped()
+        );
+    }
+}
