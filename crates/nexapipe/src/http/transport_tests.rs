@@ -533,6 +533,18 @@ async fn stalling_backend() -> u16 {
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
+                // The head is read before the answer goes out, for the reason
+                // `read_head` gives: a socket that is closed with the request
+                // still unread in it is closed abortively on Windows — the peer
+                // is told to reset rather than to finish — and a request that
+                // is still going out then fails instead of getting its answer.
+                //
+                // This backend used to skip it, and the race it left was won
+                // almost every time: the answer was written the moment the
+                // connection was accepted, and whether the request had reached
+                // the peer by then was a matter of scheduling. A tokio bump
+                // that moved the scheduling around was enough to lose it.
+                read_head(&mut stream).await;
                 // The head, and nothing after it.
                 let _ = stream
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\n")
