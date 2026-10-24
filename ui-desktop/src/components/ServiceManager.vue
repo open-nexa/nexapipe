@@ -402,9 +402,13 @@ onBeforeUnmount(() => {
         buttons that do the same thing under the same label are one too many. The notice is
         also hidden while its action runs, which is why the upgrade is repeated here for that
         time: without it the only progress indicator would go away with the notice.
+
+        An install keeps this button whatever the drift says: the panel re-reads the state and
+        the version one await apart, so a service that is already running can be called
+        version-unknown for a moment, and this is where the install's spinner lives.
       -->
       <button
-        v-if="!needsUpgrade && busyWith !== 'upgrade'"
+        v-if="(!needsUpgrade || busyWith === 'install') && busyWith !== 'upgrade'"
         class="btn btn-outline"
         :disabled="isLoading"
         @click="installService"
