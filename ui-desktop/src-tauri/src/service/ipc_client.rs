@@ -3,7 +3,8 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufRea
 
 use crate::error::{codes, AppError};
 use crate::service::ipc::{
-    connect, IpcMessage, IpcResponse, IssuedCredentialPayload, StartProxyRequest, IPC_SOCKET_PATH,
+    connect, IpcMessage, IpcResponse, IpcStream, IssuedCredentialPayload, StartProxyRequest,
+    IPC_SOCKET_PATH,
 };
 use crate::status::{
     ActiveFlowPage, EndpointLink, NodeHealthStatus, NodeTrafficStatus, ProxyStatus,
@@ -24,6 +25,15 @@ pub struct IpcClient;
 /// feeds the status indicator.
 const CHALLENGE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a connection attempt to the service may take before it is treated as absent.
+///
+/// A listener that is there accepts in microseconds: the kernel completes a loopback
+/// handshake whether or not the accept loop is polling. What this bounds is the other case
+/// — on Windows a loopback connect to a port nobody listens on was measured at about two
+/// seconds to come back refused, and every command that prefers the service paid it in
+/// full before falling back to process mode.
+const SERVICE_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// The service answered with a message kind that does not match the request. This also covers
 /// "the response was produced by a service build we do not understand", which is why the raw
 /// response is kept as the detail.
@@ -38,9 +48,7 @@ impl IpcClient {
     pub async fn send_message(msg: IpcMessage) -> Result<IpcResponse, AppError> {
         tracing::debug!("Connecting to service on: {}", IPC_SOCKET_PATH);
 
-        let mut stream = connect()
-            .await
-            .map_err(|e| AppError::cause(codes::SERVICE_UNAVAILABLE, e))?;
+        let mut stream = Self::connect_bounded(connect()).await?;
 
         // The service runs elevated and will not answer anything before this.
         // The token is generated and owned by this side, so it — and only it —
@@ -60,6 +68,27 @@ impl IpcClient {
         tracing::debug!("Authenticated, sending message");
         Self::write_message(&mut write_half, &msg).await?;
         Self::read_response(&mut reader).await
+    }
+
+    /// Connects to the service, giving it [`SERVICE_CONNECT_TIMEOUT`].
+    ///
+    /// Split out so the timeout can be driven by a test without a service manager: the
+    /// attempt is whatever future the caller passes in.
+    async fn connect_bounded<F>(attempt: F) -> Result<IpcStream, AppError>
+    where
+        F: std::future::Future<Output = std::io::Result<IpcStream>>,
+    {
+        match tokio::time::timeout(SERVICE_CONNECT_TIMEOUT, attempt).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(e)) => Err(AppError::cause(codes::SERVICE_UNAVAILABLE, e)),
+            Err(_) => Err(AppError::with_detail(
+                codes::SERVICE_UNAVAILABLE,
+                format!(
+                    "nothing accepted a connection on {IPC_SOCKET_PATH} within \
+                     {SERVICE_CONNECT_TIMEOUT:?}; the service is not running"
+                ),
+            )),
+        }
     }
 
     /// The mutual authentication exchange over an already-connected channel.
@@ -511,5 +540,17 @@ mod tests {
             auth_mac(&token, "one-challenge", "caller"),
             auth_mac(&token, "another", "caller")
         );
+    }
+
+    /// A connect attempt nobody answers has to end at [`SERVICE_CONNECT_TIMEOUT`], not at
+    /// whatever the platform's own refusal takes: on Windows that was about two seconds per
+    /// command, paid again by every status poll and again before the start fell back.
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_nobody_answers_is_reported_as_unavailable() {
+        let error = IpcClient::connect_bounded(std::future::pending())
+            .await
+            .expect_err("nothing accepts the connection");
+
+        assert_eq!(error.code, codes::SERVICE_UNAVAILABLE);
     }
 }
