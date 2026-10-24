@@ -20,7 +20,7 @@ const { refreshServiceRunning, serviceRunning } = useProxyStore();
 
 const state = ref<ServiceState>("not_installed");
 const isLoading = ref(false);
-const busyWith = ref<"" | "install" | "upgrade" | "uninstall" | "start" | "stop">("");
+const busyWith = ref<"" | "install" | "upgrade" | "uninstall" | "start" | "stop" | "restart">("");
 const message = ref("");
 const messageType = ref<"success" | "error" | "info">("info");
 
@@ -207,7 +207,7 @@ const installBusyLabel = computed(() =>
  * privileged, so the call can legitimately stay pending until the user answers the prompt.
  */
 async function run(
-  action: "install" | "upgrade" | "uninstall" | "start" | "stop",
+  action: "install" | "upgrade" | "uninstall" | "start" | "stop" | "restart",
   command: string,
   successKey: string,
   fallbackKey: string,
@@ -273,6 +273,10 @@ function startService() {
 
 function stopService() {
   return run("stop", "stop_service", "service.stopped", "error.service.stop_failed");
+}
+
+function restartService() {
+  return run("restart", "restart_service", "service.restarted", "error.service.restart_failed");
 }
 
 onMounted(() => {
@@ -405,6 +409,21 @@ onBeforeUnmount(() => {
           <rect x="6" y="6" width="12" height="12" rx="1"/>
         </svg>
         <span>{{ busyWith === 'stop' ? t("service.stopping") : t("service.stop") }}</span>
+      </button>
+
+      <button
+        class="btn btn-outline"
+        :disabled="isLoading || state !== 'running'"
+        @click="restartService"
+      >
+        <svg v-if="busyWith === 'restart'" class="btn-icon spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+        </svg>
+        <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/>
+          <path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/>
+        </svg>
+        <span>{{ busyWith === 'restart' ? t("service.restarting") : t("service.restart") }}</span>
       </button>
 
       <button

@@ -106,6 +106,15 @@ pub(crate) async fn stop_service() -> Result<(), AppError> {
     run_elevated("stop", service::platform::stop_service).await
 }
 
+/// Restarts the service, asking for administrator rights when needed.
+///
+/// The stop and the start are one operation on every platform, so the user answers one
+/// elevation prompt rather than two.
+#[tauri::command]
+pub(crate) async fn restart_service() -> Result<(), AppError> {
+    run_elevated("restart", service::platform::restart_service).await
+}
+
 /// Whether a service is answering on the IPC port.
 ///
 /// Infallible on purpose: an unreachable service is reported as "not running", which is what the

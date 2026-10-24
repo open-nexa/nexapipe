@@ -159,6 +159,19 @@ pub fn stop_service() -> Result<(), AppError> {
     return stop_elevated();
 }
 
+/// Restarts the service.
+///
+/// One operation rather than a stop followed by a start: on Windows the two run as a single
+/// elevated batch so the user answers one prompt, and on macOS `kickstart -k` exists so that a
+/// restart does not race the job's own `KeepAlive`.
+pub fn restart_service() -> Result<(), AppError> {
+    #[cfg(windows)]
+    return restart();
+
+    #[cfg(not(windows))]
+    return restart_elevated();
+}
+
 pub fn is_service_running() -> bool {
     #[cfg(windows)]
     return is_service_running_windows();
@@ -466,6 +479,15 @@ fn stop_elevated() -> Result<(), AppError> {
     elevate::run_self_elevated(&["--stop"])
 }
 
+#[cfg(not(windows))]
+fn restart_elevated() -> Result<(), AppError> {
+    if elevate::is_privileged() {
+        return dispatch_restart();
+    }
+
+    elevate::run_self_elevated(&["--restart"])
+}
+
 /// Waits for the service process to go away, so that uninstalling it cannot report
 /// success while the machine's DNS still points at the TUN.
 ///
@@ -559,6 +581,21 @@ fn dispatch_stop() -> Result<(), AppError> {
 
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn dispatch_stop() -> Result<(), AppError> {
+    Err(AppError::new(codes::SERVICE_UNSUPPORTED_PLATFORM))
+}
+
+#[cfg(target_os = "linux")]
+fn dispatch_restart() -> Result<(), AppError> {
+    restart_service_linux()
+}
+
+#[cfg(target_os = "macos")]
+fn dispatch_restart() -> Result<(), AppError> {
+    restart_service_macos()
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn dispatch_restart() -> Result<(), AppError> {
     Err(AppError::new(codes::SERVICE_UNSUPPORTED_PLATFORM))
 }
 

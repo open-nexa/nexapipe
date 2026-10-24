@@ -81,6 +81,10 @@ pub fn handle_args(args: &mut Vec<String>) -> bool {
             elevate::report_result(result_file.as_deref(), &platform::stop_service());
             true
         }
+        "--restart" => {
+            elevate::report_result(result_file.as_deref(), &platform::restart_service());
+            true
+        }
         "--status" => {
             println!("Service running: {}", platform::is_service_running());
             true

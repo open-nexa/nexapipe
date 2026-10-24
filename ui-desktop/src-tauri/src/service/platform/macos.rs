@@ -425,3 +425,26 @@ pub fn stop_service_macos() -> Result<(), AppError> {
         ))
     }
 }
+
+/// Replaces the running job with a new instance.
+///
+/// `kickstart -k` is the verb for this: `stop` followed by `start` would race the job's own
+/// `KeepAlive`, which brings the process back between the two commands.
+#[cfg(target_os = "macos")]
+pub fn restart_service_macos() -> Result<(), AppError> {
+    use std::process::Command;
+
+    let output = Command::new("launchctl")
+        .args(["kickstart", "-k", macos_job_target().as_str()])
+        .output()
+        .map_err(|e| AppError::cause(codes::SERVICE_COMMAND_FAILED, e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(AppError::with_detail(
+            codes::SERVICE_RESTART_FAILED,
+            String::from_utf8_lossy(&output.stderr),
+        ))
+    }
+}

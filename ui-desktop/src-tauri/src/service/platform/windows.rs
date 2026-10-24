@@ -566,6 +566,36 @@ pub fn stop() -> Result<(), AppError> {
     .and_then(|()| settle_down(codes::SERVICE_STOP_FAILED))
 }
 
+/// Stops the service and starts it again as one elevated operation.
+///
+/// One batch and one prompt, rather than [`stop`] followed by [`start`]: each of those may
+/// escalate on its own, so a restart written that way can ask for administrator rights twice —
+/// and the user who declines the second prompt is left with a service that is down.
+///
+/// `Escalation::Always` because the unprivileged attempt would fail inside PowerShell, whose
+/// refusal is not the exit code 5 that [`is_access_denied`] reads as one — and a refused
+/// operation that is not recognized as refused never gets a second, elevated try.
+pub fn restart() -> Result<(), AppError> {
+    run(
+        |_| {
+            vec![
+                format!(
+                    "powershell.exe -NoProfile -NonInteractive -Command \"$s = Get-Service -Name {SERVICE_NAME} -ErrorAction Stop; \
+                     if ($s.Status -eq 'Running') {{ $s.Stop() }}; \
+                     $s.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(60)); \
+                     $s.Start(); \
+                     $s.WaitForStatus('Running', [TimeSpan]::FromSeconds(60))\""
+                ),
+                "exit /b %errorlevel%".to_string(),
+            ]
+        },
+        "service restart",
+        Escalation::Always,
+        codes::SERVICE_RESTART_FAILED,
+    )
+    .and_then(|()| settle(ServiceState::Running, codes::SERVICE_RESTART_FAILED))
+}
+
 /// What the service manager says right now.
 pub fn state() -> ServiceState {
     match sc_query().map(|(text, exit_code)| sc_state(&text, exit_code)) {
