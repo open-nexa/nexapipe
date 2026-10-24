@@ -3,9 +3,14 @@ name = 'nexapipe-proto'
 version.workspace = true
 edition = '2024'
 rust-version.workspace = true
-description = 'The wire formats the nexapipe client and server share'
+description = 'The wire formats the nexapipe client and server share: the L4 preface, the UDP framing, the handshake and the secret types'
 license.workspace = true
-publish = false
+readme = 'README.md'
+repository = 'https://github.com/open-nexa/nexapipe'
+homepage = 'https://github.com/open-nexa/nexapipe'
+documentation = 'https://docs.rs/nexapipe-proto'
+keywords = ["iroh", "quic", "protocol", "tunnel", "wire"]
+categories = ["network-programming"]
 
 # No `#[bench]` function lives in this crate, so cargo's default bench target
 # for it is a harness with nothing to run — and it is built and *run* in the

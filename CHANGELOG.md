@@ -55,6 +55,19 @@ and its meaning.
   only moves the leak next door.
   A sink runs on a thread of its own, so one that reaches the network cannot
   hold up the log file, and the log file cannot hold up the sink.
+- **The three crates are publishable.** They were marked `publish = false`, so
+  nothing outside this repository could depend on them — which is a problem for
+  the one thing a library is for. The client is the piece that is meant to be
+  linked into somebody else's application, and it could not be.
+  Each crate now carries what crates.io asks for: a description, the
+  repository, the homepage, the documentation link, keywords, categories, a
+  README of its own, and the licence text in the package. The path
+  dependencies grew a version, because a published crate cannot name a
+  dependency that has none.
+  The licence is a copy per crate, the way `ui-android/` and `ui-desktop/`
+  already do it, rather than a `license-file` pointing at the repository root
+  — which is what keeps the manifest free of the warning cargo gives for
+  naming both.
 
 ## [1.0.0] — 2026-10-24
 

@@ -73,7 +73,7 @@ http-body-util = "0.1"
 tokio-stream = "0.1"
 bytes = "1.12.0"
 futures-util = "0.3.32"
-nexapipe-proto = { path = "crates/nexapipe-proto" }
+nexapipe-proto = { path = "crates/nexapipe-proto", version = "1.0.0" }
 # Wiping credentials from memory when they go out of scope. The RustCrypto
 # crate the tree already pulls in through rustls, used directly so the server
 # and the client can share one wrapper for it — see `nexapipe_client::secret`.

@@ -3,8 +3,14 @@ name = 'nexapipe'
 version.workspace = true
 edition = '2024'
 rust-version.workspace = true
+description = "An iroh/QUIC reverse proxy that forwards HTTP, HTTPS, WebSocket, TCP and UDP to services behind NAT, without terminating TLS"
 license.workspace = true
-publish = false
+readme = 'README.md'
+repository = 'https://github.com/open-nexa/nexapipe'
+homepage = 'https://github.com/open-nexa/nexapipe'
+documentation = 'https://docs.rs/nexapipe'
+keywords = ["iroh", "proxy", "reverse-proxy", "tunnel", "quic"]
+categories = ["network-programming", "web-programming"]
 
 # No `#[bench]` function lives in this crate, so cargo's default bench target
 # for it is a harness with nothing to run — and it is built and *run* in the
@@ -71,7 +77,7 @@ tokio-stream.workspace = true
 flate2 = '1.0'
 bytes.workspace = true
 hex = '0.4'
-nexapipe-client = { path = '../nexapipe-client', features = ['local-proxy'] }
+nexapipe-client = { path = '../nexapipe-client', version = '1.0.0', features = ['local-proxy'] }
 nexapipe-proto.workspace = true
 # 2FA support
 # `zeroize` so the TOTP validator wipes its own copy of the seed when it is
