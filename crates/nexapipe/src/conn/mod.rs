@@ -37,7 +37,10 @@ use limits::Limiters;
 // The two-factor half is a module of its own, and what it holds is still
 // reached through `conn`: the state a connection authenticates against, and
 // the count of the failures against it.
-pub use auth::{AuthState, count_enrollment_failure};
+pub use auth::{
+    AuthContext, AuthOutcome, AuthRequest, AuthState, Authenticator, ConfigAuthenticator,
+    count_enrollment_failure,
+};
 // The writer for the state file. The configuration watcher needs it as well:
 // a reload that resets a client's enrollment counters has to reach the file
 // the next start reads, or the reset is lost on the next restart. It is not

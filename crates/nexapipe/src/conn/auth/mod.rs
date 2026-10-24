@@ -9,11 +9,16 @@
 //! - [`state`] — the credentials the server holds and the counters it counted.
 //! - [`enrollment`] — a client that asks for a credential, and what it gets.
 //! - [`handshake`] — what a client says, and what it proves.
+//! - [`authenticator`] — where a credential is checked, and who decides.
 
+pub(super) mod authenticator;
 pub(super) mod enrollment;
 pub(super) mod handshake;
 pub(super) mod state;
 
+pub use authenticator::{
+    AuthContext, AuthOutcome, AuthRequest, Authenticator, ConfigAuthenticator,
+};
 pub use enrollment::count_enrollment_failure;
 pub use state::AuthState;
 pub(crate) use state::persist_auth_state;
