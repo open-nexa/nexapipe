@@ -215,56 +215,55 @@ enum ScState {
 }
 
 /// The Win32 error `sc.exe query` answers with when the service is not installed.
+///
+/// Read from the process exit code, not from the printed answer: `sc.exe` localizes the word
+/// that introduces a failure — a Chinese Windows says `失败` where an English one says
+/// `FAILED` — so a text match reads a missing service as "could not tell", and the panel then
+/// draws a service that is not there as one that is installed and stopped. The number is the
+/// same on every language.
 #[cfg(any(windows, test))]
-const NOT_INSTALLED: &str = "1060";
+const NOT_INSTALLED: i32 = 1060;
 
 /// The Win32 error `sc.exe query` answers with when the service is marked for deletion.
 ///
 /// `DeleteService` only *marks* a service for deletion: the record stays in the control
 /// manager's database until every handle to it is closed and the service is no longer
 /// running. Until then a query fails with this instead of answering a state, and a service
-/// that is leaving has to read as leaving — not as one that is registered and stopped.
+/// that is leaving has to read as leaving — not as one that is registered and stopped. Also
+/// read from the exit code, for the same reason as [`NOT_INSTALLED`].
 #[cfg(any(windows, test))]
-const MARKED_FOR_DELETE: &str = "1072";
+const MARKED_FOR_DELETE: i32 = 1072;
 
-/// Reads that answer out of what `sc.exe query` prints.
+/// Reads that answer out of what `sc.exe query` printed and the code it exited with.
 ///
-/// A failure only counts when `sc.exe` reported it as one: the same four digits appear in the
-/// `PID` line of a perfectly healthy service, and reading that as "absent" would let an install
-/// replace a service that is still up.
-#[cfg(any(windows, test))]
-fn sc_state(query_output: &str) -> ScState {
-    if failure_with(query_output, NOT_INSTALLED) {
-        return ScState::Absent;
-    }
-
-    // Checked before the state line, because a query that failed this way has no state line
-    // at all: it is the answer of a record that is on its way out, not a state.
-    if failure_with(query_output, MARKED_FOR_DELETE) {
-        return ScState::Deleting;
-    }
-
-    match query_output
-        .lines()
-        .find(|line| line.trim_start().starts_with("STATE"))
-    {
-        // Pending is checked first, because `STOP_PENDING` is neither stopped nor running.
-        Some(line) if line.contains("PENDING") => ScState::Pending,
-        Some(line) if line.contains("RUNNING") => ScState::Running,
-        Some(line) if line.contains("STOPPED") => ScState::Stopped,
-        _ => ScState::Unknown,
-    }
-}
-
-/// Whether `sc.exe` answered with `code` as the failure it reported.
+/// The exit code decides whether the command answered at all: `sc.exe` exits with the Win32
+/// error as its code, so `1060` and `1072` are recognised without reading a word of output
+/// that the system may have translated. Only a successful query (`0`) has a state line to
+/// read — and that line is not localized: `STATE` and `RUNNING` stay English on every
+/// Windows language.
 ///
-/// The code has to be on the line that carries `FAILED`: `sc.exe` puts the error there, and
-/// the same digits turn up elsewhere in an answer that is not a failure at all.
+/// The number is not looked for in the text: the same four digits appear in the `PID` line of
+/// a perfectly healthy service, and reading that as "absent" would let an install replace a
+/// service that is still up.
 #[cfg(any(windows, test))]
-fn failure_with(query_output: &str, code: &str) -> bool {
-    query_output
-        .lines()
-        .any(|line| line.contains("FAILED") && line.contains(code))
+fn sc_state(query_output: &str, exit_code: Option<i32>) -> ScState {
+    match exit_code {
+        Some(0) => match query_output
+            .lines()
+            .find(|line| line.trim_start().starts_with("STATE"))
+        {
+            // Pending is checked first, because `STOP_PENDING` is neither stopped nor running.
+            Some(line) if line.contains("PENDING") => ScState::Pending,
+            Some(line) if line.contains("RUNNING") => ScState::Running,
+            Some(line) if line.contains("STOPPED") => ScState::Stopped,
+            _ => ScState::Unknown,
+        },
+        Some(NOT_INSTALLED) => ScState::Absent,
+        Some(MARKED_FOR_DELETE) => ScState::Deleting,
+        // Another failure (access denied, for instance), or a process that never reported a
+        // code: neither says anything about the service, so nothing is assumed.
+        Some(_) | None => ScState::Unknown,
+    }
 }
 
 // ==========================================================================
@@ -569,7 +568,8 @@ mod tests {
         installing_account_from_args, linux_activation_args, linux_service_exec,
         linux_unit_content, macos_install_commands, macos_job_target, macos_plist_content,
         per_user_service_candidates, pick_service_binary, sc_state, scm_service_binary,
-        system_service_binary, system_service_dir, ScState, SERVICE_BINARY_NAME, SERVICE_NAME,
+        system_service_binary, system_service_dir, ScState, MARKED_FOR_DELETE, NOT_INSTALLED,
+        SERVICE_BINARY_NAME, SERVICE_NAME,
     };
     // The copy's path only exists where the install makes one — Windows keeps its own,
     // under Program Files.
@@ -846,10 +846,10 @@ SERVICE_NAME: nexa-service
     /// makes it the one that races whatever the new build does at startup.
     #[test]
     fn a_pending_stop_is_not_a_finished_one() {
-        assert_eq!(sc_state(query_stop_pending()), ScState::Pending);
+        assert_eq!(sc_state(query_stop_pending(), Some(0)), ScState::Pending);
 
         assert_ne!(
-            sc_state(query_stop_pending()),
+            sc_state(query_stop_pending(), Some(0)),
             ScState::Stopped,
             "a stop that is still in progress must not read as one that finished"
         );
@@ -862,11 +862,17 @@ SERVICE_NAME: nexa-service
     /// read as absent, and an install that believes the service is gone does not stop it first.
     #[test]
     fn a_process_id_is_not_a_missing_service() {
-        assert_eq!(sc_state(query_running()), ScState::Running);
+        // The same digits in the text of a service that is up are not a failure.
+        assert_eq!(
+            sc_state(query_running(), Some(0)),
+            ScState::Running,
+            "the PID line carries 1060 and says nothing about whether the service exists"
+        );
 
         assert_eq!(
             sc_state(
-                "[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\n\nThe specified service does not exist as an installed service.\n"
+                "[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\n\nThe specified service does not exist as an installed service.\n",
+                Some(NOT_INSTALLED)
             ),
             ScState::Absent
         );
@@ -881,10 +887,13 @@ SERVICE_NAME: nexa-service
     /// to uninstall one that was already leaving.
     #[test]
     fn a_service_marked_for_deletion_is_not_a_stopped_one() {
-        assert_eq!(sc_state(query_marked_for_delete()), ScState::Deleting);
+        assert_eq!(
+            sc_state(query_marked_for_delete(), Some(MARKED_FOR_DELETE)),
+            ScState::Deleting
+        );
 
         assert_ne!(
-            sc_state(query_marked_for_delete()),
+            sc_state(query_marked_for_delete(), Some(MARKED_FOR_DELETE)),
             ScState::Stopped,
             "a service that is leaving must not read as one that is registered and stopped"
         );
@@ -899,7 +908,33 @@ SERVICE_NAME: nexa-service
     fn the_marked_for_deletion_failure_is_read_as_one() {
         assert_eq!(
             sc_state(
-                "[SC] EnumQueryServicesStatus:OpenService FAILED 1072:\n\nThe specified service has been marked for deletion.\n"
+                "[SC] EnumQueryServicesStatus:OpenService FAILED 1072:\n\nThe specified service has been marked for deletion.\n",
+                Some(MARKED_FOR_DELETE)
+            ),
+            ScState::Deleting
+        );
+    }
+
+    /// The words around the code are translated; the code itself is not.
+    ///
+    /// A Chinese Windows answers a missing service with `失败 1060` rather than `FAILED
+    /// 1060`, and reading the words instead of the exit code made the panel draw that
+    /// service as installed and stopped — with a Start button that could only fail with
+    /// 1060. The exit code is the part that survives every language.
+    #[test]
+    fn a_localized_failure_is_read_by_its_code() {
+        assert_eq!(
+            sc_state(
+                "[SC] EnumQueryServicesStatus:OpenService 失败 1060:\n\n指定的服务未安装。\n",
+                Some(NOT_INSTALLED)
+            ),
+            ScState::Absent
+        );
+
+        assert_eq!(
+            sc_state(
+                "[SC] EnumQueryServicesStatus:OpenService 失败 1072:\n\n指定的服务已标记为删除。\n",
+                Some(MARKED_FOR_DELETE)
             ),
             ScState::Deleting
         );
@@ -914,7 +949,8 @@ SERVICE_NAME: nexa-service
     fn an_exit_code_is_not_a_deletion() {
         assert_eq!(
             sc_state(
-                "SERVICE_NAME: nexa-service\n        STATE              : 1  STOPPED\n        WIN32_EXIT_CODE    : 1072  (0x430)\n"
+                "SERVICE_NAME: nexa-service\n        STATE              : 1  STOPPED\n        WIN32_EXIT_CODE    : 1072  (0x430)\n",
+                Some(0)
             ),
             ScState::Stopped
         );
@@ -935,20 +971,30 @@ The specified service has been marked for deletion.
     fn every_state_the_control_manager_reports_is_read() {
         assert_eq!(
             sc_state(
-                "SERVICE_NAME: nexa-service\n        STATE              : 1  STOPPED\n        WIN32_EXIT_CODE    : 0  (0x0)\n"
+                "SERVICE_NAME: nexa-service\n        STATE              : 1  STOPPED\n        WIN32_EXIT_CODE    : 0  (0x0)\n",
+                Some(0)
             ),
             ScState::Stopped
         );
         assert_eq!(
             sc_state(
-                "SERVICE_NAME: nexa-service\n        STATE              : 2  START_PENDING\n                                (NOT_STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)\n"
+                "SERVICE_NAME: nexa-service\n        STATE              : 2  START_PENDING\n                                (NOT_STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)\n",
+                Some(0)
             ),
             ScState::Pending
         );
         assert_eq!(
-            sc_state("[SC] OpenSCManager FAILED 5:\n\nAccess is denied.\n"),
+            sc_state(
+                "[SC] OpenSCManager FAILED 5:\n\nAccess is denied.\n",
+                Some(5)
+            ),
             ScState::Unknown,
             "a query that never reached a service answers no state, which is not 'stopped'"
+        );
+        assert_eq!(
+            sc_state("", None),
+            ScState::Unknown,
+            "a query that never ran says nothing about the service"
         );
     }
 
