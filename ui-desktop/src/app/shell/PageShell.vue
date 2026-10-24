@@ -47,31 +47,38 @@ withDefaults(
   background: var(--bg-app);
 }
 
+/*
+ * The scroll area itself is unpadded on purpose.
+ *
+ * A sticky child is pinned to the scrollport's content edge, so padding here stays on the
+ * scrolling plane: scrolled content shows through the strip above the pinned row. That is the
+ * gap the config tabs used to sit below. The page padding lives on the content instead, and the
+ * scrollport's edge is the same edge the row pins to.
+ */
 .page-shell__body {
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
   overflow-x: hidden;
-  padding: var(--layout-page-pad-y) var(--layout-page-pad-x);
 }
 
-.page-shell__body.full {
-  padding: 0;
-}
-
+/* `border-box` sizing, so the extra width is exactly the padding and the content column stays at
+   `--layout-content-max-w`. */
 .page-shell__content {
   display: flex;
   flex-direction: column;
   gap: var(--space-5);
   width: 100%;
-  max-width: var(--layout-content-max-w);
+  max-width: calc(var(--layout-content-max-w) + 2 * var(--layout-page-pad-x));
   margin: 0 auto;
+  padding: var(--layout-page-pad-y) var(--layout-page-pad-x);
   min-height: 0;
 }
 
 .page-shell__body.full .page-shell__content {
   max-width: none;
   gap: 0;
+  padding: 0;
   height: 100%;
 }
 </style>
