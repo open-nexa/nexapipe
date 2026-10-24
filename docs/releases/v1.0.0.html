@@ -515,6 +515,8 @@ grep nexapipe-1.0.0-aarch64-apple-darwin.tar.gz SHA256SUMS.txt | shasum -a 256 -
       client spell a host pattern the same way.</li>
     <li>Desktop: the credentials move out of <code>localStorage</code> into an encrypted store whose
       master key the OS keychain holds.</li>
+    <li>Desktop: the service is replaced during the upgrade, and a failure rolls the install back
+      instead of leaving a new app running an old service.</li>
   </ul>
 
   <h3 class="subhead">Fixed</h3>
@@ -582,6 +584,16 @@ This build does not know that key: remove it, or fix its spelling.</pre>
       into an encrypted file whose master key the OS keychain holds. The migration is automatic
       &mdash; a payload written before it is read once and its secrets are written into the encrypted
       store. Nothing to do by hand.</li>
+    <li><strong>Desktop: the service is replaced during the upgrade.</strong> It runs a copy of
+      the app's own binary from a root-owned directory, and an upgrade used to leave the service
+      running the build it was started with &mdash; launchd and systemd read a job definition once,
+      and the path the service runs from does not change. So the app was new and the service was
+      old, the two did not speak the same protocol, and the panel showed a service that was
+      <em>running</em> with every button greyed out. The upgrade now puts the new binary in place:
+      a service you had stopped stays stopped, the account it serves is unchanged, and if it cannot
+      be done the installer puts the machine back the way it found it and exits with a non-zero
+      code rather than reporting success over a half-upgraded machine. A service left behind by an
+      upgrade is reported as drift now, with the install button offered for it.</li>
     <li>New, and off until asked for: starting with the system, coming back after a reboot, and a
       device key instead of a secret.</li>
   </ul>
