@@ -498,29 +498,14 @@ pub fn uninstall() -> Result<(), AppError> {
     })
 }
 
-/// Removes the system-wide copy of the service binary, and the directory it
-/// is in.
+/// Removes the system-wide copy of the service binary, and the directory it is in.
 ///
-/// The entry is gone by the time this runs, so nothing holds the file open.
-/// The directory is only removed when it is empty: anything else in it
-/// belongs to somebody else, and leaving it behind is harmless.
+/// The entry is gone by the time this runs, so nothing holds the file open. The directory is
+/// only removed when it is empty: anything else in it belongs to somebody else, and leaving it
+/// behind is harmless.
 fn remove_system_copy(dir: &Path, binary: &Path) -> Result<(), AppError> {
-    if !binary.exists() {
-        return Ok(());
-    }
-
     run(
-        |_| {
-            vec![
-                format!("del /f /q \"{}\"", binary.display()),
-                // The file is still there when the delete did not work, and a
-                // file the control manager could be pointed at is worth
-                // reporting rather than leaving behind.
-                format!("if exist \"{}\" exit /b 1", binary.display()),
-                format!("if exist \"{}\" rmdir \"{}\"", dir.display(), dir.display()),
-                "exit /b 0".to_string(),
-            ]
-        },
+        |_| remove_copy_batch(dir, binary),
         "service uninstall (remove the system copy)",
         // The copy is under Program Files, so the delete is usually refused
         // for an ordinary user — and it is refused *then*, not before: the
@@ -529,6 +514,29 @@ fn remove_system_copy(dir: &Path, binary: &Path) -> Result<(), AppError> {
         Escalation::OnAccessDenied,
         codes::SERVICE_UNINSTALL_FAILED,
     )
+}
+
+/// The batch that takes the system-wide copy off the disk.
+///
+/// Split out of [`remove_system_copy`] so the refusal it reports can be read without a service
+/// manager. `del` prints a *localized* message when the copy under Program Files is not the
+/// caller's to delete, and exits 1 — which [`is_access_denied`] does not read as a refusal, so
+/// an uninstall that had already removed the entry failed at this last step instead of asking
+/// for elevation. Exit code 5 is the language-independent form of that refusal.
+///
+/// The directory is attempted whenever it exists, not only when the file survived: an empty
+/// directory left behind by an earlier uninstall is still ours to remove. Its `rmdir` is
+/// allowed to fail — a directory somebody else keeps a file in is not ours to delete — and the
+/// final `exit /b 0` keeps that from failing the uninstall.
+fn remove_copy_batch(dir: &Path, binary: &Path) -> Vec<String> {
+    vec![
+        format!("del /f /q \"{}\"", binary.display()),
+        // The delete reports a refusal and keeps going; this is what turns it into the one
+        // code the escalation knows.
+        format!("if exist \"{}\" exit /b 5", binary.display()),
+        format!("if exist \"{}\" rmdir \"{}\"", dir.display(), dir.display()),
+        "exit /b 0".to_string(),
+    ]
 }
 
 pub fn start() -> Result<(), AppError> {
@@ -1282,6 +1290,47 @@ mod tests {
         assert!(
             ordinary.contains("ServiceOwner"),
             "a service that is installed for an account records it:\n{ordinary}"
+        );
+    }
+
+    /// A copy that cannot be deleted has to report the refusal in the one language the
+    /// escalation reads: the exit code.
+    ///
+    /// `del` prints a localized message on a refused delete and exits 1, which
+    /// [`is_access_denied`] does not recognize — the uninstall had already removed the entry
+    /// by then, so it reported a failure on a machine with no service left and a binary still
+    /// under Program Files. Exit code 5 asks for the second, elevated run instead.
+    #[test]
+    fn a_copy_that_cannot_be_deleted_asks_for_elevation() {
+        let script = remove_copy_batch(
+            Path::new(r"C:\Program Files\Nexa\Service"),
+            Path::new(r"C:\Program Files\Nexa\Service\nexa-service.exe"),
+        );
+
+        assert!(
+            script.contains(
+                &r#"if exist "C:\Program Files\Nexa\Service\nexa-service.exe" exit /b 5"#
+                    .to_string()
+            ),
+            "a file that is still there has to ask for elevation by exit code: {script:?}"
+        );
+        assert!(
+            !script
+                .iter()
+                .any(|line| line.contains("Access is denied") || line.contains("exit /b 1")),
+            "a localized message or exit code 1 is not what the escalation reads: {script:?}"
+        );
+        assert!(
+            script.contains(
+                &r#"if exist "C:\Program Files\Nexa\Service" rmdir "C:\Program Files\Nexa\Service""#
+                    .to_string()
+            ),
+            "the directory is attempted even when the file was already gone: {script:?}"
+        );
+        assert_eq!(
+            script.last().map(String::as_str),
+            Some("exit /b 0"),
+            "a directory that is not empty must not fail the uninstall: {script:?}"
         );
     }
 }
