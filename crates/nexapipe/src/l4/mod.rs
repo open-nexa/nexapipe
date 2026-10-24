@@ -40,14 +40,15 @@
 mod sniff;
 
 use crate::auth::ClientAcl;
+use crate::conn::limits::{ByteBudget, ByteReservation};
 use crate::conn::peers::PeerIdentity;
 use crate::l4::sniff::{FlowSniffer, Side, SniffReader};
 use crate::metrics;
 use crate::routes::{BackendLookup, RoutingTable};
 use crate::stream_util::{DuplexIroh, copy_both_ways_until, read_more_by};
 use nexapipe_proto::{
-    Frame, L4Proto, MAX_PREFACE_LEN, PREFACE_MAGIC, Preface, ProtoError, Status, decode_frame,
-    encode_frame, payload_fits_datagram,
+    FRAME_HEADER_LEN, Frame, L4Proto, MAX_PREFACE_LEN, MAX_UDP_PAYLOAD, PREFACE_MAGIC, Preface,
+    ProtoError, Status, decode_frame, encode_frame, payload_fits_datagram,
 };
 use std::io;
 use std::net::SocketAddr;
@@ -72,6 +73,47 @@ const PREFACE_TIMEOUT: Duration = Duration::from_secs(10);
 /// client gets an explicit [`Status::TooManyFlows`] and can fail the flow it is opening
 /// instead of hanging.
 pub const DEFAULT_MAX_FLOWS_PER_CONNECTION: usize = 256;
+
+/// The buffer a UDP flow receives a datagram into.
+///
+/// A datagram over IPv4 carries at most [`MAX_UDP_PAYLOAD`] bytes, and the buffer
+/// has to hold one of them whole.
+const UDP_RECV_BUFFER_BYTES: usize = 64 * 1024;
+
+/// The buffer a UDP flow reads the client's bytes into.
+const UDP_SEND_BUFFER_BYTES: usize = 4 * 1024;
+
+/// The buffer a UDP flow frames a datagram in, at its largest.
+///
+/// A length prefix and a payload a datagram can carry. The buffer is allocated
+/// at this size rather than grown into it, so that what the flow holds is what
+/// the reservation pays for.
+const UDP_FRAME_BUFFER_BYTES: usize = FRAME_HEADER_LEN + MAX_UDP_PAYLOAD;
+
+/// The frame in flight: the bytes of a datagram that has not arrived whole yet.
+///
+/// The length prefix, the largest payload the prefix can announce, and one
+/// read's worth of overshoot — a read can carry the end of a frame and the
+/// beginning of the next one, and the frame in flight has to have room for
+/// both.
+const UDP_PENDING_BUFFER_BYTES: usize =
+    FRAME_HEADER_LEN + u16::MAX as usize + UDP_SEND_BUFFER_BYTES;
+
+/// What one UDP flow holds, and what the process is charged for it.
+///
+/// Four buffers, one flow each, and none of them small. The TCP path charges
+/// its copy buffers to the same budget — the ceiling in
+/// `[limits] max_body_bytes` says the per-stream copy buffers are charged
+/// there too — so this one does too: a peer that opened many UDP flows paid
+/// for them in memory the operator's ceiling never knew about, which made the
+/// ceiling they configured not the ceiling they got.
+///
+/// Taken before the first of the four is allocated, so a flow that cannot pay
+/// does not run at all.
+const UDP_FLOW_BUFFER_BYTES: usize = UDP_RECV_BUFFER_BYTES
+    + UDP_SEND_BUFFER_BYTES
+    + UDP_FRAME_BUFFER_BYTES
+    + UDP_PENDING_BUFFER_BYTES;
 
 /// True when `first_byte` means "this stream is an L4 tunnel".
 pub fn is_l4_stream(first_byte: u8) -> bool {
@@ -363,7 +405,15 @@ where
         L4Proto::Udp => {
             let idle = route.idle_timeout.unwrap_or(deadlines.l4_idle);
             let flow_timeout = route.flow_timeout.unwrap_or(deadlines.l4_flow);
-            serve_udp(stream, &route.backend, leftover, idle, flow_timeout).await
+            serve_udp(
+                stream,
+                &route.backend,
+                leftover,
+                idle,
+                flow_timeout,
+                crate::conn::limits::body_budget(),
+            )
+            .await
         }
     };
 
@@ -502,6 +552,7 @@ async fn serve_udp<S>(
     leftover: Vec<u8>,
     idle: Duration,
     flow_timeout: Duration,
+    budget: &Arc<ByteBudget>,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -521,11 +572,66 @@ where
 
     // The socket has to be bound to the target's address family, or `connect` fails on
     // every backend that is not IPv4.
-    let bind_addr = if target.is_ipv4() {
-        "0.0.0.0:0"
+    let bind_addr = udp_bind_addr(&target);
+
+    serve_udp_flow(
+        stream,
+        target,
+        &bind_addr,
+        leftover,
+        idle,
+        flow_timeout,
+        budget,
+    )
+    .await
+}
+
+/// The address a UDP flow's socket is bound to.
+///
+/// The wildcard address of the target's family, and nothing else: the socket
+/// is a client socket, so it binds to a port the kernel picks and sends from
+/// wherever it happens to be.
+fn udp_bind_addr(target: &SocketAddr) -> String {
+    if target.is_ipv4() {
+        "0.0.0.0:0".to_string()
     } else {
-        "[::]:0"
+        "[::]:0".to_string()
+    }
+}
+
+/// The flow itself, once the target and the address to bind it to are known.
+///
+/// The bind address is a parameter rather than derived here, because the bind
+/// is the one step of the flow that can fail for reasons of its own — a host
+/// with IPv6 disabled, an exhausted descriptor table — and a step that cannot
+/// be reached cannot be tested.
+async fn serve_udp_flow<S>(
+    mut stream: S,
+    target: SocketAddr,
+    bind_addr: &str,
+    leftover: Vec<u8>,
+    idle: Duration,
+    flow_timeout: Duration,
+    budget: &Arc<ByteBudget>,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // The buffers this flow holds are paid for before the first of them
+    // exists. A flow that cannot afford them does not run: the budget exists
+    // to refuse, not to warn, and a flow refused here never takes a socket
+    // either.
+    //
+    // Held in a named binding rather than dropped at once: a `_` would give
+    // the bytes back while the buffers they pay for are still alive.
+    let _reservation = match ByteReservation::take_buffers(budget, UDP_FLOW_BUFFER_BYTES) {
+        Ok(reservation) => reservation,
+        Err(e) => {
+            let _ = write_status(&mut stream, Status::BackendFailed).await;
+            return Err(e);
+        }
     };
+
     let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
 
     // A connected UDP socket drops datagrams from anybody else, which keeps an
@@ -547,10 +653,15 @@ where
     // can be finished rather than reset. Each block gets its own `Arc` clone.
     let socket_up = socket.clone();
     let socket_down = socket.clone();
-    let mut pending = leftover;
+    // The frame in flight, in a buffer of the size the reservation pays for.
+    // Allocated once rather than grown into: a frame is decoded and drained
+    // as soon as it is complete, so what is left between two reads is at most
+    // one incomplete frame, and the buffer never has to grow past that.
+    let mut pending = Vec::with_capacity(UDP_PENDING_BUFFER_BYTES);
+    pending.extend_from_slice(&leftover);
 
     let client_to_backend = async {
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; UDP_SEND_BUFFER_BYTES];
         // A cursor into `pending`, compacted once per read rather than after
         // every frame: draining moves every byte behind a frame down, so a
         // segment carrying N datagrams cost N memmoves over the whole tail.
@@ -598,7 +709,20 @@ where
 
             match tokio::time::timeout(idle, reader.read(&mut buf)).await {
                 Ok(Ok(0)) => return,
-                Ok(Ok(n)) => pending.extend_from_slice(&buf[..n]),
+                Ok(Ok(n)) => {
+                    // The buffer the frame in flight is held in is paid for by
+                    // the reservation, and it has room for one frame and the
+                    // read that completes it. A client that sends more than
+                    // that without the frame ever being complete is not
+                    // speaking the protocol.
+                    if pending.len() + n > UDP_PENDING_BUFFER_BYTES {
+                        tracing::debug!(
+                            "L4 UDP: the client sent more than a frame without completing it"
+                        );
+                        return;
+                    }
+                    pending.extend_from_slice(&buf[..n]);
+                }
                 Ok(Err(e)) => {
                     tracing::debug!("L4 UDP: client read failed: {}", e);
                     return;
@@ -612,8 +736,8 @@ where
     };
 
     let backend_to_client = async {
-        let mut buf = vec![0u8; 65_536];
-        let mut frame = Vec::with_capacity(2048);
+        let mut buf = vec![0u8; UDP_RECV_BUFFER_BYTES];
+        let mut frame = Vec::with_capacity(UDP_FRAME_BUFFER_BYTES);
         loop {
             let n = match tokio::time::timeout(idle, socket_down.recv(&mut buf)).await {
                 Ok(Ok(n)) => n,
