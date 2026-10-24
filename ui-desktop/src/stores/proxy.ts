@@ -326,7 +326,10 @@ async function refresh(): Promise<boolean> {
       void queueTrayStatus();
     }
     if (result.running) {
-      await refreshNodeId();
+      // Not awaited: the Node ID is a display value, and a caller that only needs to know
+      // whether the proxy is up — `waitForStart` above all — should not wait another backend
+      // round trip for it. The guard inside drops an answer the next run has outlived.
+      void refreshNodeId();
     } else {
       // Cleared only when there is something to clear: a fresh `[]` is a new
       // array, and every one of them invalidated the link badges.
@@ -351,12 +354,16 @@ async function refresh(): Promise<boolean> {
  * link at all — a failure here must never become a red error over an otherwise healthy proxy.
  */
 async function refreshEndpointLinks(): Promise<void> {
+  const asked = session;
   try {
-    endpointLinks.value = await invoke<EndpointLink[]>('get_endpoint_links', {
+    const links = await invoke<EndpointLink[]>('get_endpoint_links', {
       useService: config.useService,
     });
+    if (asked !== session) return;
+    endpointLinks.value = links;
   } catch (error) {
     console.debug('[proxy] endpoint links unavailable:', error);
+    if (asked !== session) return;
     endpointLinks.value = [];
   }
 }
@@ -468,12 +475,16 @@ function trafficFor(node: NodeConfig): NodeTraffic | null {
 }
 
 async function refreshNodeId(): Promise<void> {
+  const asked = session;
   try {
-    nodeId.value = await invoke<string>('get_node_id_display', {
+    const id = await invoke<string>('get_node_id_display', {
       useService: config.useService,
     });
+    if (asked !== session) return;
+    nodeId.value = id;
   } catch (error) {
     // Not running, or the node has not published an ID yet — both are normal, not reportable.
+    if (asked !== session) return;
     nodeId.value = '';
     console.debug('[proxy] node id unavailable:', error);
   }
@@ -595,11 +606,14 @@ async function start(): Promise<void> {
     await waitForStart();
     // A fresh session means fresh paths, and fresh counters: read them now instead of waiting out
     // the poll, which otherwise leaves the link badges empty for the first few seconds after every
-    // start.
+    // start. Not awaited: the start is over the moment the status says it is, and these only fill
+    // the dashboard — awaiting them here is what kept the button spinning after it had already
+    // turned into "stop". All three are infallible, and each drops an answer the next run has
+    // outlived.
     if (status.value.running) {
-      await refreshEndpointLinks();
-      await refreshNodeHealth();
-      await refreshNodeTraffic();
+      void refreshEndpointLinks();
+      void refreshNodeHealth();
+      void refreshNodeTraffic();
     }
 
     if (!status.value.running) {
