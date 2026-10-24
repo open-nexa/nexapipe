@@ -210,6 +210,7 @@
     "upgrade": "Upgrade Service",
     "upgraded": "The service was upgraded and restarted.",
     "reinstalled": "The service was reinstalled and restarted.",
+    "notSettled": "The action did not take effect: the service did not reach the expected state. Check it and try again.",
     "versionMismatch": "The installed service is {service} while this app is {app}. Anything the service does not know how to answer stays empty until it is upgraded.",
     "versionUnknown": "The installed service is older than this app ({app}) and cannot say which build it is. Anything it does not know how to answer stays empty until it is upgraded.",
     "installedVersionMismatch": "The installed service is {service} while this app is {app}. Reinstall the service to replace it with this build.",

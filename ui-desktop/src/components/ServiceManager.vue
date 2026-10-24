@@ -226,10 +226,9 @@ async function run(
   busyWith.value = action;
 
   let succeeded = false;
+  let settled = true;
   try {
     await invoke<void>(command);
-    message.value = t(successKey);
-    messageType.value = "success";
     succeeded = true;
   } catch (e) {
     message.value = t(errorKey(e, fallbackKey));
@@ -242,7 +241,8 @@ async function run(
       // the manager already said "running" or "stopped" while the IPC was still catching up, so
       // a version read that failed in that window was paired with a stale "running". Each action
       // names the pair it is heading towards, and both answers are read only once it is reached.
-      await settleService(
+      // A target that is never reached is reported below rather than counted as success.
+      settled = await settleService(
         action === "stop" ? "quiet" : action === "uninstall" ? "absent" : "answering",
       );
     } else {
@@ -253,6 +253,12 @@ async function run(
     // uninstall that was refused, still leaves something behind to show. The versions are read
     // after the service facts above, because the banner compares them against `serviceRunning`.
     await refresh();
+    // Said after the settle: a command whose effect never showed up is not a success, even
+    // though the service manager accepted it.
+    if (succeeded) {
+      message.value = settled ? t(successKey) : t("service.notSettled");
+      messageType.value = settled ? "success" : "error";
+    }
     isLoading.value = false;
     busyWith.value = "";
     // Only a success is on a timer. A failure waits for the next action to replace it.

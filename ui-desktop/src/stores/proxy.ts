@@ -775,11 +775,14 @@ function serviceReached(
  *
  * Bounded: a service that genuinely fails to come up must still leave a panel that says so,
  * so after the deadline the state as found is what gets shown — and if the two answers still
- * disagree then, that is a real signal rather than a transition. A failed action does not call
- * this at all: its error is already on screen, and waiting would only delay the state it left.
+ * disagree then, that is a real signal rather than a transition. The answer says whether the
+ * target was actually reached, so a caller does not report success for a command whose effect
+ * never showed up. A failed action does not call this at all: its error is already on screen,
+ * and waiting would only delay the state it left.
  */
-async function settleService(target: ServiceTarget): Promise<void> {
+async function settleService(target: ServiceTarget): Promise<boolean> {
   const deadline = Date.now() + SERVICE_SETTLE_TIMEOUT_MS;
+  let reached = false;
   while (Date.now() < deadline) {
     const [answering, state] = await Promise.all([
       // A full IPC exchange, not a bare connect: "answering" means the service can answer
@@ -789,10 +792,14 @@ async function settleService(target: ServiceTarget): Promise<void> {
         () => 'not_installed' as const,
       ),
     ]);
-    if (serviceReached(state, answering, target)) break;
+    if (serviceReached(state, answering, target)) {
+      reached = true;
+      break;
+    }
     await sleep(250);
   }
   await refreshServiceRunning();
+  return reached;
 }
 
 /**

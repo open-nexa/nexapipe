@@ -210,6 +210,7 @@
     "upgrade": "升级服务",
     "upgraded": "服务已升级并重启。",
     "reinstalled": "服务已重装并重启。",
+    "notSettled": "操作未生效：服务未达到预期状态，请检查后重试。",
     "versionMismatch": "已安装的服务是 {service}，而本应用是 {app}。服务不会回答的请求在升级前都只会是空的。",
     "versionUnknown": "已安装的服务比本应用（{app}）更旧，无法说明自己的版本。升级前，它不会回答的请求都只会是空的。",
     "installedVersionMismatch": "已安装的服务是 {service}，而本应用是 {app}。重装服务即可把它换成本机这个版本。",

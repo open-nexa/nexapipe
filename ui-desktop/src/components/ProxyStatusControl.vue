@@ -192,8 +192,11 @@ async function installServiceForTun(): Promise<void> {
     await invoke<void>('install_service');
     // The service manager calls the service running before it binds the IPC listener, so a read
     // taken now could draw the build just installed as drift for a moment. See the store.
-    await settleService('answering');
-    toast.success(t('service.installed'));
+    if (await settleService('answering')) {
+      toast.success(t('service.installed'));
+    } else {
+      toast.fromKey('service.notSettled');
+    }
   } catch (error) {
     toast.error(error, 'error.service.install_failed');
   } finally {
@@ -218,8 +221,11 @@ async function startServiceForTun(): Promise<void> {
   serviceBusy.value = true;
   try {
     await invoke<void>('start_service');
-    await settleService('answering');
-    toast.success(t('service.started'));
+    if (await settleService('answering')) {
+      toast.success(t('service.started'));
+    } else {
+      toast.fromKey('service.notSettled');
+    }
   } catch (error) {
     toast.error(error, 'error.service.start_failed');
   } finally {
