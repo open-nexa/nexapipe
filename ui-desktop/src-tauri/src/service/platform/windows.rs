@@ -525,9 +525,11 @@ fn remove_system_copy(dir: &Path, binary: &Path) -> Result<(), AppError> {
 /// for elevation. Exit code 5 is the language-independent form of that refusal.
 ///
 /// The directory is attempted whenever it exists, not only when the file survived: an empty
-/// directory left behind by an earlier uninstall is still ours to remove. Its `rmdir` is
-/// allowed to fail — a directory somebody else keeps a file in is not ours to delete — and the
-/// final `exit /b 0` keeps that from failing the uninstall.
+/// directory left behind by an earlier uninstall is still ours to remove. A failed `rmdir` is
+/// ignored when something else is still inside it — that directory is somebody else's, and not
+/// a reason to elevate. An *empty* directory that survived is the refusal, and is reported with
+/// the same language-independent exit code 5 the delete uses; without that, an uninstall whose
+/// binary was already gone reported success with the directory still under Program Files.
 fn remove_copy_batch(dir: &Path, binary: &Path) -> Vec<String> {
     vec![
         format!("del /f /q \"{}\"", binary.display()),
@@ -535,6 +537,10 @@ fn remove_copy_batch(dir: &Path, binary: &Path) -> Vec<String> {
         // code the escalation knows.
         format!("if exist \"{}\" exit /b 5", binary.display()),
         format!("if exist \"{}\" rmdir \"{}\"", dir.display(), dir.display()),
+        // Not empty: somebody else's files keep it there, so the refusal is not ours to undo.
+        format!("if exist \"{}\\*\" exit /b 0", dir.display()),
+        // Empty and still there: removing it was refused.
+        format!("if exist \"{}\" exit /b 5", dir.display()),
         "exit /b 0".to_string(),
     ]
 }
@@ -1326,6 +1332,14 @@ mod tests {
                     .to_string()
             ),
             "the directory is attempted even when the file was already gone: {script:?}"
+        );
+        assert!(
+            script.contains(&r#"if exist "C:\Program Files\Nexa\Service\*" exit /b 0"#.to_string()),
+            "a directory somebody else keeps files in must not fail the uninstall: {script:?}"
+        );
+        assert!(
+            script.contains(&r#"if exist "C:\Program Files\Nexa\Service" exit /b 5"#.to_string()),
+            "an empty directory that survived the rmdir has to ask for elevation: {script:?}"
         );
         assert_eq!(
             script.last().map(String::as_str),
