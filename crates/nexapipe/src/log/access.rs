@@ -240,7 +240,7 @@ impl FlowDetail {
     /// The line replaces the values in a sniffed request target, and a record
     /// that carried the raw one would put the leak in the place the redaction
     /// was meant to close. The same expressions are used here as there, so the
-    /// two agree — which is the whole point of [`redact_query`] living in one
+    /// two agree — which is the whole point of the redaction living in one
     /// place.
     pub fn redacted(&self) -> Self {
         match self {
