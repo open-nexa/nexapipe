@@ -16,7 +16,7 @@ const { t } = useI18n();
 // something is *answering* on the IPC port. A registered service is up as far as the OS is
 // concerned well before it listens, and a service that never answers anything cannot be read as
 // one that is out of date.
-const { refreshServiceRunning, serviceRunning } = useProxyStore();
+const { refreshServiceRunning, settleService, serviceRunning } = useProxyStore();
 
 const state = ref<ServiceState>("not_installed");
 const isLoading = ref(false);
@@ -126,6 +126,9 @@ const versionMismatch = computed(
 const versionUnknown = computed(
   () =>
     appVersion.value !== "" &&
+    // The manager still has to say running: a service that has stopped and left a version read
+    // that failed is down, which is not the same reading as an outdated one.
+    state.value === "running" &&
     serviceRunning.value &&
     serviceVersion.value === null,
 );
@@ -160,12 +163,18 @@ const serviceUnreachable = computed(
 );
 
 /// Any drift state warrants the banner; the wording is what tells them apart.
+///
+/// Not while an action is in flight: its settle re-reads the two service facts at different
+/// moments than this panel re-reads its own, and drawing them in between is what showed a
+/// healthy stop as a service that does not answer. A genuine drift is still on screen the
+/// moment the action is over, because by then every reading has been taken again.
 const needsUpgrade = computed(
   () =>
-    versionMismatch.value ||
-    versionUnknown.value ||
-    installedVersionMismatch.value ||
-    serviceUnreachable.value,
+    !isLoading.value &&
+    (versionMismatch.value ||
+      versionUnknown.value ||
+      installedVersionMismatch.value ||
+      serviceUnreachable.value),
 );
 
 const needsUpgradeMessage = computed(() => {
@@ -196,12 +205,6 @@ const installLabel = computed(() =>
   state.value === "not_installed" ? t("service.install") : t("service.reinstall"),
 );
 
-/// The busy label follows the same split, so pressing the button does not rename the action
-/// halfway through.
-const installBusyLabel = computed(() =>
-  state.value === "not_installed" ? t("service.installing") : t("service.reinstalling"),
-);
-
 /**
  * Every one of these elevates through UAC / sudo / polkit when the process is not already
  * privileged, so the call can legitimately stay pending until the user answers the prompt.
@@ -222,20 +225,34 @@ async function run(
   isLoading.value = true;
   busyWith.value = action;
 
+  let succeeded = false;
   try {
     await invoke<void>(command);
     message.value = t(successKey);
     messageType.value = "success";
+    succeeded = true;
   } catch (e) {
     message.value = t(errorKey(e, fallbackKey));
     messageType.value = "error";
     console.error(`[service] ${action} failed:`, errorDetail(e) || e);
   } finally {
-    // The state is re-read even after a failure: an install that could not start the service, or
-    // an uninstall that was refused, still leaves something behind to show.
+    if (succeeded) {
+      // The action is over when the service manager accepted it, not when the service speaks
+      // again. Reading right here is what drew a healthy restart or stop as drift for a moment:
+      // the manager already said "running" or "stopped" while the IPC was still catching up, so
+      // a version read that failed in that window was paired with a stale "running". Each action
+      // names the pair it is heading towards, and both answers are read only once it is reached.
+      await settleService(
+        action === "stop" ? "quiet" : action === "uninstall" ? "absent" : "answering",
+      );
+    } else {
+      // Nothing settled: whatever the failed action left behind is the state to show.
+      await refreshServiceRunning();
+    }
+    // Re-read even after a failure: an install that could not start the service, or an
+    // uninstall that was refused, still leaves something behind to show. The versions are read
+    // after the service facts above, because the banner compares them against `serviceRunning`.
     await refresh();
-    // And so is every other surface that depends on the service existing — see the import note.
-    void refreshServiceRunning();
     isLoading.value = false;
     busyWith.value = "";
     // Only a success is on a timer. A failure waits for the next action to replace it.
@@ -289,7 +306,11 @@ onMounted(() => {
     .catch((e) => console.debug("[service] app version unavailable:", e));
 
   refresh();
-  poll = window.setInterval(refresh, POLL_INTERVAL_MS);
+  poll = window.setInterval(() => {
+    // An action in flight owns the state read: a poll landing mid-transition would see one
+    // answer changed and the other not, which is the drift the settle exists to avoid.
+    if (!isLoading.value) void refresh();
+  }, POLL_INTERVAL_MS);
 });
 
 onBeforeUnmount(() => {
@@ -336,7 +357,7 @@ onBeforeUnmount(() => {
           <svg v-if="busyWith === 'upgrade'" class="btn-icon spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="10"/>
           </svg>
-          <span>{{ busyWith === 'upgrade' ? t("service.upgrading") : t("service.upgrade") }}</span>
+          <span>{{ t("service.upgrade") }}</span>
         </button>
       </div>
     </div>
@@ -358,6 +379,11 @@ onBeforeUnmount(() => {
       <span>{{ message }}</span>
     </div>
 
+    <!--
+      The spinner reports the work; the labels do not change. A busy label a few characters
+      longer than its idle one widened the row while it ran, which pushed the last button onto
+      a line of its own for the duration of the action.
+    -->
     <div class="service-actions">
       <!--
         Hidden while the notice above is up: that one carries the same action, and two
@@ -380,7 +406,7 @@ onBeforeUnmount(() => {
           <path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/>
           <path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/>
         </svg>
-        <span>{{ busyWith === 'install' ? installBusyLabel : installLabel }}</span>
+        <span>{{ installLabel }}</span>
       </button>
 
       <button
@@ -394,7 +420,7 @@ onBeforeUnmount(() => {
         <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <polygon points="5 3 19 12 5 21 5 3"/>
         </svg>
-        <span>{{ busyWith === 'start' ? t("service.starting") : t("service.start") }}</span>
+        <span>{{ t("service.start") }}</span>
       </button>
 
       <button
@@ -408,7 +434,7 @@ onBeforeUnmount(() => {
         <svg v-else viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <rect x="6" y="6" width="12" height="12" rx="1"/>
         </svg>
-        <span>{{ busyWith === 'stop' ? t("service.stopping") : t("service.stop") }}</span>
+        <span>{{ t("service.stop") }}</span>
       </button>
 
       <button
@@ -423,7 +449,7 @@ onBeforeUnmount(() => {
           <path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/>
           <path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/>
         </svg>
-        <span>{{ busyWith === 'restart' ? t("service.restarting") : t("service.restart") }}</span>
+        <span>{{ t("service.restart") }}</span>
       </button>
 
       <button
@@ -438,7 +464,7 @@ onBeforeUnmount(() => {
           <line x1="18" y1="6" x2="6" y2="18"/>
           <line x1="6" y1="6" x2="18" y2="18"/>
         </svg>
-        <span>{{ busyWith === 'uninstall' ? t("service.uninstalling") : t("service.uninstall") }}</span>
+        <span>{{ t("service.uninstall") }}</span>
       </button>
     </div>
 

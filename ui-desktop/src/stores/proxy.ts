@@ -90,7 +90,9 @@ const serviceState = ref<'not_installed' | 'stopped' | 'running'>('not_installed
  * The service is registered with the service manager.
  *
  * Installed and answering are different facts: the install button disappears as soon as the
- * unit exists, while TUN stays gated on the IPC connection actually being usable.
+ * unit exists, while TUN stays gated on the IPC connection actually being usable. A registered
+ * service that is merely stopped still offers a control of its own — starting it — which is
+ * neither installing it again nor reinstalling it.
  */
 const serviceInstalled = computed(() => serviceState.value !== 'not_installed');
 
@@ -730,6 +732,70 @@ async function refreshServiceRunning(): Promise<void> {
 }
 
 /**
+ * How long a service action may take before the panel stops waiting for it to show up.
+ *
+ * Covers a start that is still binding its IPC listener and an install that has to move a copy
+ * under Program Files first. Past this the panel reads what is there, so a service that really
+ * is in a one-sided state still says so.
+ */
+const SERVICE_SETTLE_TIMEOUT_MS = 10_000;
+
+/**
+ * The state a service action is heading towards, as the two answers this app can get would
+ * describe it: "answering" is registered and answering, "quiet" is registered and not, and
+ * "absent" is not registered at all.
+ */
+type ServiceTarget = 'answering' | 'quiet' | 'absent';
+
+function serviceReached(
+  state: 'not_installed' | 'stopped' | 'running',
+  answering: boolean,
+  target: ServiceTarget,
+): boolean {
+  switch (target) {
+    case 'answering':
+      return state === 'running' && answering;
+    case 'quiet':
+      return state !== 'running' && !answering;
+    case 'absent':
+      return state === 'not_installed' && !answering;
+  }
+}
+
+/**
+ * Waits until both service answers agree with the action that just finished, then re-reads
+ * them once.
+ *
+ * A successful action is not over when the command returns: the service manager accepts it
+ * first, and the process it accepted may still be on its way up (or down). Reading in that
+ * window pairs a fresh answer with a stale one — "running" from the manager and no version
+ * from the IPC — and every surface draws that as a service that is out of date. Which pair is
+ * the settled one depends on the action, so the caller names the target rather than a single
+ * boolean.
+ *
+ * Bounded: a service that genuinely fails to come up must still leave a panel that says so,
+ * so after the deadline the state as found is what gets shown — and if the two answers still
+ * disagree then, that is a real signal rather than a transition. A failed action does not call
+ * this at all: its error is already on screen, and waiting would only delay the state it left.
+ */
+async function settleService(target: ServiceTarget): Promise<void> {
+  const deadline = Date.now() + SERVICE_SETTLE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    const [answering, state] = await Promise.all([
+      // A full IPC exchange, not a bare connect: "answering" means the service can answer
+      // requests, which is what the version read below needs.
+      invoke<boolean>('is_service_running').catch(() => false),
+      invoke<'not_installed' | 'stopped' | 'running'>('get_service_status').catch(
+        () => 'not_installed' as const,
+      ),
+    ]);
+    if (serviceReached(state, answering, target)) break;
+    await sleep(250);
+  }
+  await refreshServiceRunning();
+}
+
+/**
  * Sets the forwarding mode. Refuses to persist TUN while the service is not installed — the
  * toggle is disabled in that state, and a persisted request that cannot be honoured is worse
  * than none.
@@ -741,15 +807,17 @@ async function refreshServiceRunning(): Promise<void> {
  */
 function setUseTun(enabled: boolean): void {
   if (enabled && !serviceRunning.value) {
-    // Two different refusals: a service that is not there at all, and one that is there
-    // but running a build this app cannot talk to. The second has a way out — a reinstall
-    // — and telling somebody to "install it first" about a service that is already
-    // installed sends them looking for the wrong thing.
-    toast.warning(
-      serviceStale.value
-        ? translate('connect.tunServiceStale')
-        : translate('connect.tunRequiresService'),
-    );
+    // Three different refusals, because they have three different ways out: install a service
+    // that is not there, start one that is installed and down, reinstall one that is there but
+    // running a build this app cannot talk to. Telling somebody to "install it first" about a
+    // service that is already installed sends them looking for the wrong thing.
+    if (serviceStale.value) {
+      toast.warning(translate('connect.tunServiceStale'));
+    } else if (serviceState.value === 'stopped') {
+      toast.warning(translate('connect.tunServiceStopped'));
+    } else {
+      toast.warning(translate('connect.tunRequiresService'));
+    }
     return;
   }
 
@@ -880,6 +948,8 @@ export function useProxyStore() {
     busy,
     startupError,
     serviceRunning,
+    /** What the service manager says: not registered, registered and down, registered and up. */
+    serviceState,
     serviceInstalled,
     /** The service manager says the service is running and nothing answers it — a drift. */
     serviceStale,
@@ -906,6 +976,8 @@ export function useProxyStore() {
     refreshNodeId,
     revealNodeId,
     refreshServiceRunning,
+    /** Settles after a service action before reading, so a transition is not drawn as drift. */
+    settleService,
     setUseTun,
     linkKindFor,
     rttFor,
@@ -980,22 +1052,25 @@ async function autoConnectIfWanted(): Promise<void> {
 }
 
 /**
- * Whether the service says the tunnel is down.
+ * Whether the service itself says the tunnel is down.
  *
- * Asked of the service rather than read from the status above, because that
- * read falls back to the desktop process when the service cannot be reached —
- * and a fallback that answers "stopped" about a service it never reached is
- * exactly the guess this must not make.
+ * Asked of the service rather than read from the status above: in service mode a
+ * start is handed to the service, and a fallback answer is not a statement that
+ * the service can take one. The fallback now reports "stopped" for a service
+ * that is down, but starting in that state would run the tunnel here instead of
+ * in the service — so the service has to be answering before its "stopped"
+ * counts.
  *
  * `false` covers "the service is not answering", which is the honest answer
  * here: nothing is known, so nothing is started.
  */
 async function serviceReportsStopped(): Promise<boolean> {
   try {
+    if (!(await invoke<boolean>('is_service_running'))) return false;
     const result = await invoke<ProxyStatus>('get_proxy_status', { useService: true });
-    // "Stopped" is a statement the service made. Running, starting and unknown are not
-    // statements that it is stopped, and a question that is open must not be answered with
-    // "stopped": that answer is what starts a second tunnel over a live one.
+    // Running, starting and unknown are not statements that it is stopped, and a question that
+    // is open must not be answered with "stopped": that answer is what starts a second tunnel
+    // over a live one.
     return result.mode === 'stopped';
   } catch (error) {
     console.error('[proxy] the service did not report its status:', error);
