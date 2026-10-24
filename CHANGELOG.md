@@ -17,6 +17,45 @@ in [§0 of the roadmap](docs/ROADMAP.md#0-the-v100-decision-2026-10-20).
 Nothing that shipped in 0.6.1 changes: every configuration key keeps its name
 and its meaning.
 
+## [Unreleased]
+
+### Added
+
+- **Where a credential is checked is now a seam, and the built-in check is the
+  one that reads the configuration.** Which credentials exist is the core's
+  business — a shared secret, a TOTP seed, an Ed25519 key — but *what checks
+  them* is a decision, and a deployment that keeps its credentials in an
+  identity provider rather than in `config.toml` had no way to say so.
+  `Authenticator` is that decision written down as a trait: the handshake calls
+  through it, the built-in implementation reads the client table in the
+  configuration, and another one is handed to `AuthState::with_authenticator`
+  or to `ProxyOptions`.
+  The implementation owns the **whole attempt** — the verification, the counters
+  it moves and the peer registration — because those three have to happen in one
+  critical section, and splitting them reopens races the code spent a long time
+  closing. The logic moved into the default implementation unchanged: the same
+  lock, the same order, the same refusals, the same counters, and the existing
+  test suite passes with not one assertion changed.
+  The trait is called **without the auth lock held**, so an implementation that
+  has to reach an identity provider does that reach before it takes the lock,
+  and takes the lock only to record what it found.
+- **The access log is a record as well as a line.** The line is a fixed set of
+  columns, written to a file and read by a script that splits it on spaces —
+  the right shape for a log, and the wrong one for an audit trail. A deployment
+  that has to hand its records to a SIEM, or keep them in a database, needs
+  the facts rather than the rendering of them.
+  `AccessRecord` is those facts as values and `AccessSink` is what takes one:
+  a deployment registers its own, and the core neither knows nor cares where
+  the records end up.
+  The **identity and the flow's own facts are values** rather than the text the
+  line spells them out as — which is the part a SIEM asks for and the part the
+  line could not give.
+  The redaction is the same on both sides: the query values are gone from the
+  record as they are from the file, because redacting one and not the other
+  only moves the leak next door.
+  A sink runs on a thread of its own, so one that reaches the network cannot
+  hold up the log file, and the log file cannot hold up the sink.
+
 ## [1.0.0] — 2026-10-24
 
 Thirty-nine things land in this release: the device credential can be a **key**

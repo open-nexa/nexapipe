@@ -472,3 +472,121 @@ fn parses_rotation_names() {
     assert_eq!(Rotation::parse("daily"), Rotation::Daily);
     assert_eq!(Rotation::parse("something else"), Rotation::Daily);
 }
+
+/// A sink that keeps the records of one request and drops the rest.
+///
+/// The sink registry is process-wide and the tests run in parallel, so a sink
+/// that took every record would be handed another test's record first.
+struct OneRequestSink {
+    request_id: String,
+    tx: Mutex<std::sync::mpsc::Sender<AccessRecord>>,
+}
+
+impl AccessSink for OneRequestSink {
+    fn emit(&self, record: &AccessRecord) {
+        if record.request_id == self.request_id {
+            let _ = self
+                .tx
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .send(record.clone());
+        }
+    }
+}
+
+/// A sink a deployment registered receives the record, not the line.
+///
+/// The record is the same facts the line is made of — with the identity as a
+/// value rather than as the text the line spells it out as — and the query
+/// string is redacted on both sides, so a record cannot become the place a
+/// leak moved to.
+#[test]
+fn a_registered_sink_receives_the_record() {
+    const REQUEST_ID: &str = "the-sink-test-request";
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    add_access_sink(Arc::new(OneRequestSink {
+        request_id: REQUEST_ID.to_string(),
+        tx: Mutex::new(tx),
+    }));
+
+    let identity = PeerIdentity {
+        client_id: Some("client-001".to_string()),
+        device: Some("laptop".to_string()),
+    };
+    log_access(
+        REQUEST_ID,
+        "203.0.113.9",
+        "GET",
+        "/api/v1/items?token=secret&page=2",
+        200,
+        12,
+        34,
+        Some(&identity),
+    );
+
+    let record = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the record to arrive");
+
+    assert_eq!(record.request_id, REQUEST_ID);
+    assert_eq!(record.remote_addr, "203.0.113.9");
+    assert_eq!(record.method, "GET");
+    assert_eq!(record.status, 200);
+    assert_eq!(record.duration_ms, 12);
+    assert_eq!(record.bytes_sent, 34);
+    // The query values are gone, in the record as in the line.
+    assert_eq!(record.uri, "/api/v1/items?token=<redacted>&page=<redacted>");
+
+    // The identity is a value, not the text the line spells it out as.
+    let who = record.identity.expect("the identity");
+    assert_eq!(who.client_id.as_deref(), Some("client-001"));
+    assert_eq!(who.device.as_deref(), Some("laptop"));
+}
+
+/// A flow's own facts reach the record as values, and the target in them is
+/// redacted the way the line's is.
+///
+/// The target is the client's own bytes, and a query value is where tokens
+/// travel: a record that carried the raw target would be a second copy of the
+/// thing the redaction exists to keep out of the file.
+#[test]
+fn a_flows_facts_reach_the_record_redacted() {
+    const REQUEST_ID: &str = "the-sink-test-flow";
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    add_access_sink(Arc::new(OneRequestSink {
+        request_id: REQUEST_ID.to_string(),
+        tx: Mutex::new(tx),
+    }));
+
+    log_access_flow(
+        REQUEST_ID,
+        "203.0.113.9",
+        "http",
+        "internal.example.com",
+        0,
+        7,
+        0,
+        None,
+        Some(&FlowDetail::Http {
+            method: "GET".to_string(),
+            target: "/api/v1/items?token=secret".to_string(),
+            version: "HTTP/1.1".to_string(),
+            status: Some(200),
+        }),
+    );
+
+    let record = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the record to arrive");
+
+    let detail = record.detail.expect("the flow's own facts");
+    match detail {
+        FlowDetail::Http { target, status, .. } => {
+            assert_eq!(target, "/api/v1/items?token=<redacted>");
+            assert_eq!(status, Some(200));
+        }
+        other => panic!("the detail is not the http one: {other:?}"),
+    }
+}
