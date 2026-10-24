@@ -664,7 +664,9 @@ This build does not know that key: remove it, or fix its spelling.</pre>
       var arm = /ARM|aarch64/i.test(ua);
       return {
         title: "Download for Windows",
-        sub: arm ? "Windows on ARM detected." : "Windows installer, signed for the updater.",
+        sub: arm
+          ? "Windows on ARM detected. The updater signature is on it; the OS one is not — see the note above."
+          : "Windows installer. The updater signature is on it; the OS one is not — see the note above.",
         links: [
           { href: BASE + (arm ? "nexa-1.0.0-windows-aarch64-setup.exe" : "nexa-1.0.0-windows-x86_64-setup.exe"), label: "Desktop app" },
           { href: BASE + (arm ? "nexapipe-1.0.0-aarch64-pc-windows-msvc.zip" : "nexapipe-1.0.0-x86_64-pc-windows-msvc.zip"), label: "Server archive", secondary: true }
