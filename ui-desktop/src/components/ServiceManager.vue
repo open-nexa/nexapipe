@@ -189,11 +189,17 @@ const needsUpgradeMessage = computed(() => {
 /// What the install button says: putting a service on the machine, or replacing the one that
 /// is on it.
 ///
-/// The same command either way — an install re-points the service at this build and restarts
-/// it — and the second is the only way out of a service that is running a build this app
-/// cannot talk to.
+/// Replacing it is a *reinstall*: a service with drift gets the banner above, and that banner
+/// carries the upgrade action itself, so a visible install button means the panel found no
+/// drift to report. Calling the same command an upgrade there would claim one was available.
 const installLabel = computed(() =>
-  state.value === "not_installed" ? t("service.install") : t("service.upgrade"),
+  state.value === "not_installed" ? t("service.install") : t("service.reinstall"),
+);
+
+/// The busy label follows the same split, so pressing the button does not rename the action
+/// halfway through.
+const installBusyLabel = computed(() =>
+  state.value === "not_installed" ? t("service.installing") : t("service.reinstalling"),
 );
 
 /**
@@ -247,7 +253,7 @@ function installService() {
   // restarts it. What the panel says afterwards depends on what it found — a service that
   // was not there, or one that is being replaced.
   const successKey =
-    state.value === "not_installed" ? "service.installed" : "service.upgraded";
+    state.value === "not_installed" ? "service.installed" : "service.reinstalled";
   return run("install", "install_service", successKey, "error.service.install_failed");
 }
 
@@ -370,7 +376,7 @@ onBeforeUnmount(() => {
           <path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/>
           <path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/>
         </svg>
-        <span>{{ busyWith === 'install' ? t("service.installing") : installLabel }}</span>
+        <span>{{ busyWith === 'install' ? installBusyLabel : installLabel }}</span>
       </button>
 
       <button
