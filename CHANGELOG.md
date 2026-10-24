@@ -10,16 +10,16 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
-**The next release is v1.0.0.** The v0.7.0 release planned for this cycle was
-cancelled after a review of the project against comparable products; the scope
-that replaced it, and the items that were deliberately dropped from it, are
-recorded in [§0 of the roadmap](docs/ROADMAP.md#0-the-v100-decision-2026-10-20).
+**v1.0.0 is out.** The v0.7.0 release planned for this cycle was cancelled
+after a review of the project against comparable products; the scope that
+replaced it, and the items that were deliberately dropped from it, are recorded
+in [§0 of the roadmap](docs/ROADMAP.md#0-the-v100-decision-2026-10-20).
 Nothing that shipped in 0.6.1 changes: every configuration key keeps its name
 and its meaning.
 
-## [Unreleased]
+## [1.0.0] — 2026-10-24
 
-Thirty-seven things land in this cycle so far: the device credential can be a **key**
+Thirty-nine things land in this release: the device credential can be a **key**
 instead of a shared secret, every phase of a proxied exchange now runs under a
 deadline the operator can see and raise, backend handling no longer stops at
 plain HTTP/1.1 with no second chance — the hop can be encrypted, retried and
@@ -35,8 +35,10 @@ the third-party boundary
 is two settings now rather than one, the Android app can bring the tunnel back
 after a restart, the Android client picks its address block instead of
 hard-coding one, the server's runtime state lives in a file of its own beside
-the configuration instead of inside it, the desktop says what it does to the
-machine's DNS instead of deciding for itself, the access log says what a
+the configuration instead of inside it, the container image runs as a user
+instead of as root, the desktop says what it does to the machine's DNS instead
+of deciding for itself, the desktop's credentials live in an encrypted store
+the OS keychain holds instead of in the browser's `localStorage`, the access log says what a
 tunnelled flow was instead of only what the tunnel did with it, an app that
 is not written in Rust can configure a client through the UniFFI surface, the
 paths that carry the traffic can be measured instead of assumed, the first

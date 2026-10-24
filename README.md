@@ -39,7 +39,7 @@ NexaPipe is a Rust workspace with four parts:
 [Client library](#using-the-client-library) · [Apps](#client-apps) ·
 [Development](#development) · [Contributing](CONTRIBUTING.md) ·
 [Roadmap](docs/ROADMAP.md) · [Changelog](CHANGELOG.md) ·
-[v0.6.1 notes](https://open-nexa.github.io/nexapipe/v0.6.1.html)
+[v1.0.0 notes](https://open-nexa.github.io/nexapipe/v1.0.0.html)
 
 ---
 
@@ -290,7 +290,7 @@ docker compose up -d
 ```
 
 Pinning a version instead of following it: replace `:latest` with a tag such as
-`:0.6.1` in both lines, or set `image:` in a `docker-compose.override.yml` so
+`:1.0.0` in both lines, or set `image:` in a `docker-compose.override.yml` so
 you are not editing a tracked file. `latest` only ever follows releases; a
 pre-release tag never takes it.
 
