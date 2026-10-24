@@ -297,17 +297,31 @@ pub(crate) async fn get_proxy_status(use_service: Option<bool>) -> Result<ProxyS
         return Ok(status);
     }
 
-    let proxy_manager = PROXY_MANAGER.read().await;
-    Ok(match proxy_manager.as_ref() {
+    let local_mode = {
+        let proxy_manager = PROXY_MANAGER.read().await;
+        proxy_manager.as_ref().map(|manager| manager.get_mode())
+    };
+
+    Ok(match local_mode {
         // A manager with no mode yet is starting up, not running: see `ProxyStatus::starting`.
-        Some(manager) => match manager.get_mode() {
-            Some(mode) => ProxyStatus::running_with(mode),
-            None => ProxyStatus::starting(),
-        },
-        // No manager here, and the service could not be asked: the tunnel may be the service's,
-        // and this process cannot say. "Stopped" would be a guess, and the guess is what starts a
-        // second tunnel over a live one — so the state is reported as unknown instead.
-        None if use_service => ProxyStatus::unknown(),
+        Some(Some(mode)) => ProxyStatus::running_with(mode),
+        Some(None) => ProxyStatus::starting(),
+        // No manager here, and the service could not be asked. Whether that means "no tunnel" or
+        // "a tunnel this process cannot see" depends on whether the service is even up: a service
+        // that is stopped or not installed cannot own one, so that state is reported as stopped.
+        // Only a running service that fails to answer leaves the question open — and answering it
+        // with "stopped" there is what starts a second tunnel over a live one.
+        None if use_service => {
+            let service_up = tauri::async_runtime::spawn_blocking(service::platform::service_state)
+                .await
+                .map(|state| state == service::platform::ServiceState::Running)
+                .unwrap_or(false);
+            if service_up {
+                ProxyStatus::unknown()
+            } else {
+                ProxyStatus::stopped()
+            }
+        }
         None => ProxyStatus::stopped(),
     })
 }
