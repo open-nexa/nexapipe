@@ -251,6 +251,27 @@
   <h2 id="downloads">Downloads</h2>
   <p class="hint">Client app first, then the server. Nothing needs an account, and nothing is gated.</p>
 
+  <div class="warn">
+    <strong>The macOS and Windows desktop bundles are published unsigned.</strong>
+    <ul>
+      <li><code>macos</code> &mdash; the <code>.dmg</code> and the <code>.app</code> inside it carry no
+        Developer ID signature and are not notarized. macOS Gatekeeper refuses them until the user
+        allows them by hand.</li>
+      <li><code>windows</code> &mdash; the NSIS installer (<code>-setup.exe</code>) carries no
+        Authenticode signature. Windows SmartScreen refuses it until the user allows it by hand.</li>
+    </ul>
+    <p>A code signature costs money &mdash; the Apple Developer Program is $99 a year and a Windows
+      certificate is bought per year on top of that &mdash; and this project has no revenue, so the
+      first release ships the artifacts without one. Everything else is signed: the Android APK
+      carries the release keystore, the server archives carry a checksum, and the container image is
+      signed with the release key and carries a provenance attestation.</p>
+    <p>On macOS the refusal is the strict one: the app does not open until the user chooses
+      &ldquo;Open Anyway&rdquo; in the dialog, which is a click in System Settings &rarr; Privacy
+      &amp; Security. The Tauri updater&rsquo;s own signature is separate from the operating
+      system&rsquo;s and is present either way, so an update installs the same way as the first
+      install does.</p>
+  </div>
+
   <h3 class="subhead">Desktop &amp; mobile app &mdash; nexa</h3>
   <div class="dl-wrap">
     <table class="dl">
