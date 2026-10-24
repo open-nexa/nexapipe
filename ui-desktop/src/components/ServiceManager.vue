@@ -393,10 +393,12 @@ onBeforeUnmount(() => {
     <div class="service-actions">
       <!--
         Hidden while the notice above is up: that one carries the same action, and two
-        buttons that do the same thing under the same label are one too many.
+        buttons that do the same thing under the same label are one too many. The notice is
+        also hidden while its action runs, which is why the upgrade is repeated here for that
+        time: without it the only progress indicator would go away with the notice.
       -->
       <button
-        v-if="!needsUpgrade"
+        v-if="!needsUpgrade && busyWith !== 'upgrade'"
         class="btn btn-outline"
         :disabled="isLoading"
         @click="installService"
@@ -413,6 +415,16 @@ onBeforeUnmount(() => {
           <path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/>
         </svg>
         <span>{{ installLabel }}</span>
+      </button>
+      <button
+        v-else-if="busyWith === 'upgrade'"
+        class="btn btn-outline"
+        disabled
+      >
+        <svg class="btn-icon spinner" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+        </svg>
+        <span>{{ t("service.upgrade") }}</span>
       </button>
 
       <button
