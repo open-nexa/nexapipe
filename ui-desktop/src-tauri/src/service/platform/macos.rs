@@ -343,40 +343,59 @@ pub fn uninstall_service_macos() -> Result<(), AppError> {
 
 #[cfg(target_os = "macos")]
 pub fn is_service_running_macos() -> bool {
+    service_answer_macos() == Some(true)
+}
+
+/// What `launchctl print` answered, when the command ran at all.
+///
+/// A failed `print` is an answer — launchd could not find the job in the system domain, so it is
+/// not running — while a command that could not be spawned is not: the job may well be up, and
+/// `None` keeps the proxy status open rather than claiming it is down.
+#[cfg(target_os = "macos")]
+fn service_answer_macos() -> Option<bool> {
     use std::process::Command;
 
     // The daemon lives in the *system* domain, but a plain `launchctl list <label>` from a user
     // session queries the user's GUI domain and answers "Could not find service" (exit 1) even
     // while the daemon is running — which had the service panel show "stopped" forever.
     // `launchctl print system/<label>` is readable without root and names the state outright.
-    let Ok(output) = Command::new("launchctl")
+    let output = Command::new("launchctl")
         .args(["print", &macos_job_target()])
         .output()
-    else {
-        return false;
-    };
-    output.status.success()
-        && String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.trim() == "state = running")
+        .ok()?;
+    Some(
+        output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.trim() == "state = running"),
+    )
 }
 
 /// The plist is the registration: no file means the service was never installed.
 #[cfg(target_os = "macos")]
 pub fn state_macos() -> ServiceState {
+    // A command that could not be run is drawn as stopped, the way the panel always has.
+    known_state_macos().unwrap_or(ServiceState::Stopped)
+}
+
+/// The job's state, when the running query gave an answer.
+#[cfg(target_os = "macos")]
+pub fn known_state_macos() -> Option<ServiceState> {
     use std::path::Path;
 
     let plist =
         Path::new("/Library/LaunchDaemons").join(format!("com.nexa.{}.plist", SERVICE_NAME));
     if !plist.exists() {
-        return ServiceState::NotInstalled;
+        return Some(ServiceState::NotInstalled);
     }
 
-    if is_service_running_macos() {
-        ServiceState::Running
-    } else {
-        ServiceState::Stopped
-    }
+    service_answer_macos().map(|running| {
+        if running {
+            ServiceState::Running
+        } else {
+            ServiceState::Stopped
+        }
+    })
 }
 
 #[cfg(target_os = "macos")]

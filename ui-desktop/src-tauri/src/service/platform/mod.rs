@@ -79,6 +79,28 @@ pub fn service_state() -> ServiceState {
     return ServiceState::NotInstalled;
 }
 
+/// The service manager's answer, when this machine could read one.
+///
+/// [`service_state`] folds "not running" and "could not be asked" into `NotInstalled`, which is
+/// what the panel's action choices need: a service that cannot be read is drawn as not installed
+/// so an install is offered instead of controls for a service whose existence is in doubt. A
+/// proxy-status fallback cannot make that substitution — a running service whose manager refused
+/// to answer may still own the tunnel this process cannot see — so it asks this question instead,
+/// and `None` leaves the proxy status open rather than claiming nothing is running.
+pub fn known_service_state() -> Option<ServiceState> {
+    #[cfg(windows)]
+    return known_state();
+
+    #[cfg(target_os = "linux")]
+    return known_state_linux();
+
+    #[cfg(target_os = "macos")]
+    return known_state_macos();
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    return Some(ServiceState::NotInstalled);
+}
+
 #[cfg(not(windows))]
 use crate::error::codes;
 // The elevation channel is Unix's, but the argument that names the account the
@@ -277,6 +299,39 @@ fn sc_state(query_output: &str, exit_code: Option<i32>) -> ScState {
         // code: neither says anything about the service, so nothing is assumed.
         Some(_) | None => ScState::Unknown,
     }
+}
+
+/// The batch that takes the system-wide copy of the service binary off the disk.
+///
+/// Lives here rather than in the Windows half so that the refusal it reports can be read by
+/// `cargo test --lib` on every platform: the batch has no dependency on `sc.exe` or the service
+/// manager, only on the way `cmd.exe` reports a refused delete.
+///
+/// `del` prints a *localized* message when the copy under Program Files is not the caller's to
+/// delete, and exits 1 — which `is_access_denied` in the Windows half does not read as a
+/// refusal, so an uninstall that had already removed the entry failed at this last step instead
+/// of asking for elevation. Exit code 5 is the language-independent form of that refusal.
+///
+/// The directory is attempted whenever it exists, not only when the file survived: an empty
+/// directory left behind by an earlier uninstall is still ours to remove. A failed `rmdir` is
+/// ignored when something else is still inside it — that directory is somebody else's, and not a
+/// reason to elevate. An *empty* directory that survived is the refusal, and is reported with the
+/// same language-independent exit code 5 the delete uses; without that, an uninstall whose binary
+/// was already gone reported success with the directory still under Program Files.
+#[cfg(any(windows, test))]
+fn remove_copy_batch(dir: &Path, binary: &Path) -> Vec<String> {
+    vec![
+        format!("del /f /q \"{}\"", binary.display()),
+        // The delete reports a refusal and keeps going; this is what turns it into the one
+        // code the escalation knows.
+        format!("if exist \"{}\" exit /b 5", binary.display()),
+        format!("if exist \"{}\" rmdir \"{}\"", dir.display(), dir.display()),
+        // Not empty: somebody else's files keep it there, so the refusal is not ours to undo.
+        format!("if exist \"{}\\*\" exit /b 0", dir.display()),
+        // Empty and still there: removing it was refused.
+        format!("if exist \"{}\" exit /b 5", dir.display()),
+        "exit /b 0".to_string(),
+    ]
 }
 
 // ==========================================================================
@@ -604,9 +659,9 @@ mod tests {
     use super::{
         installing_account_from_args, linux_activation_args, linux_service_exec,
         linux_unit_content, macos_install_commands, macos_job_target, macos_plist_content,
-        per_user_service_candidates, pick_service_binary, sc_state, scm_service_binary,
-        system_service_binary, system_service_dir, ScState, MARKED_FOR_DELETE, NOT_INSTALLED,
-        SERVICE_BINARY_NAME, SERVICE_NAME,
+        per_user_service_candidates, pick_service_binary, remove_copy_batch, sc_state,
+        scm_service_binary, system_service_binary, system_service_dir, ScState, MARKED_FOR_DELETE,
+        NOT_INSTALLED, SERVICE_BINARY_NAME, SERVICE_NAME,
     };
     // The copy's path only exists where the install makes one — Windows keeps its own,
     // under Program Files.
@@ -1032,6 +1087,55 @@ The specified service has been marked for deletion.
             sc_state("", None),
             ScState::Unknown,
             "a query that never ran says nothing about the service"
+        );
+    }
+
+    /// Removing the system-wide copy asks for elevation only when the refusal is ours to undo.
+    ///
+    /// The batch is the last step of an uninstall and runs under `Escalation::OnAccessDenied`;
+    /// the only thing that triggers the second, elevated try is the code it exits with. A
+    /// localized `del` message or exit code 1 is not read as a refusal, so the delete and an
+    /// empty directory that survived it both report 5. A directory somebody else keeps files in
+    /// is left alone instead.
+    #[test]
+    fn a_copy_that_cannot_be_deleted_asks_for_elevation() {
+        let script = remove_copy_batch(
+            Path::new(r"C:\Program Files\Nexa\Service"),
+            Path::new(r"C:\Program Files\Nexa\Service\nexa-service.exe"),
+        );
+
+        assert!(
+            script.contains(
+                &r#"if exist "C:\Program Files\Nexa\Service\nexa-service.exe" exit /b 5"#
+                    .to_string()
+            ),
+            "a file that is still there has to ask for elevation by exit code: {script:?}"
+        );
+        assert!(
+            !script
+                .iter()
+                .any(|line| line.contains("Access is denied") || line.contains("exit /b 1")),
+            "a localized message or exit code 1 is not what the escalation reads: {script:?}"
+        );
+        assert!(
+            script.contains(
+                &r#"if exist "C:\Program Files\Nexa\Service" rmdir "C:\Program Files\Nexa\Service""#
+                    .to_string()
+            ),
+            "the directory is attempted even when the file was already gone: {script:?}"
+        );
+        assert!(
+            script.contains(&r#"if exist "C:\Program Files\Nexa\Service\*" exit /b 0"#.to_string()),
+            "a directory somebody else keeps files in must not fail the uninstall: {script:?}"
+        );
+        assert!(
+            script.contains(&r#"if exist "C:\Program Files\Nexa\Service" exit /b 5"#.to_string()),
+            "an empty directory that survived the rmdir has to ask for elevation: {script:?}"
+        );
+        assert_eq!(
+            script.last().map(String::as_str),
+            Some("exit /b 0"),
+            "a directory that is not empty must not fail the uninstall: {script:?}"
         );
     }
 

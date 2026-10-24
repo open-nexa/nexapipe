@@ -11,9 +11,9 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use super::{
-    per_user_service_candidates, pick_service_binary, sc_state, scm_service_binary,
-    system_service_binary, system_service_dir, ScState, ServiceState, MARKED_FOR_DELETE,
-    NOT_INSTALLED, SERVICE_DISPLAY_NAME, SERVICE_NAME,
+    per_user_service_candidates, pick_service_binary, remove_copy_batch, sc_state,
+    scm_service_binary, system_service_binary, system_service_dir, ScState, ServiceState,
+    MARKED_FOR_DELETE, NOT_INSTALLED, SERVICE_DISPLAY_NAME, SERVICE_NAME,
 };
 use crate::error::{codes, AppError};
 use crate::service::platform::account::AccountId;
@@ -498,29 +498,14 @@ pub fn uninstall() -> Result<(), AppError> {
     })
 }
 
-/// Removes the system-wide copy of the service binary, and the directory it
-/// is in.
+/// Removes the system-wide copy of the service binary, and the directory it is in.
 ///
-/// The entry is gone by the time this runs, so nothing holds the file open.
-/// The directory is only removed when it is empty: anything else in it
-/// belongs to somebody else, and leaving it behind is harmless.
+/// The entry is gone by the time this runs, so nothing holds the file open. The directory is
+/// only removed when it is empty: anything else in it belongs to somebody else, and leaving it
+/// behind is harmless.
 fn remove_system_copy(dir: &Path, binary: &Path) -> Result<(), AppError> {
-    if !binary.exists() {
-        return Ok(());
-    }
-
     run(
-        |_| {
-            vec![
-                format!("del /f /q \"{}\"", binary.display()),
-                // The file is still there when the delete did not work, and a
-                // file the control manager could be pointed at is worth
-                // reporting rather than leaving behind.
-                format!("if exist \"{}\" exit /b 1", binary.display()),
-                format!("if exist \"{}\" rmdir \"{}\"", dir.display(), dir.display()),
-                "exit /b 0".to_string(),
-            ]
-        },
+        |_| remove_copy_batch(dir, binary),
         "service uninstall (remove the system copy)",
         // The copy is under Program Files, so the delete is usually refused
         // for an ordinary user — and it is refused *then*, not before: the
@@ -598,20 +583,29 @@ pub fn restart() -> Result<(), AppError> {
 
 /// What the service manager says right now.
 pub fn state() -> ServiceState {
+    // "Could not tell" is drawn like "not installed" so that the panel offers an install
+    // instead of controls for a service whose existence is in doubt. Callers that must not
+    // make that substitution — the proxy status, whose tunnel can outlive the answer — ask
+    // [`known_state`] instead.
+    known_state().unwrap_or(ServiceState::NotInstalled)
+}
+
+/// What the control manager says, when it gave an answer this can read.
+///
+/// `sc.exe` not running, refusing, timing out, answering something that is not a state, or
+/// reporting a state the parser does not recognise (`PAUSED`, for instance) all leave the
+/// service's existence and liveness unknown: none of them is evidence that nothing is running.
+pub fn known_state() -> Option<ServiceState> {
     match sc_query().map(|(text, exit_code)| sc_state(&text, exit_code)) {
-        Some(ScState::Running) => ServiceState::Running,
-        // Nothing this can call installed: `sc.exe` could not be run, answered something that
-        // is not a state, or has no such service. "Could not tell" is drawn like "not
-        // installed" so that the panel offers an install instead of controls for a service
-        // whose existence is in doubt. A service marked for deletion counts as gone: the
-        // control manager refuses every operation on it, so there is nothing left to start,
-        // stop or uninstall.
-        Some(ScState::Absent) | Some(ScState::Deleting) | Some(ScState::Unknown) | None => {
-            ServiceState::NotInstalled
-        }
+        Some(ScState::Running) => Some(ServiceState::Running),
+        // Nothing this can call installed: the control manager says the service is not there,
+        // or is on its way out — the control manager refuses every operation on the latter, so
+        // there is nothing left to start, stop or uninstall.
+        Some(ScState::Absent) | Some(ScState::Deleting) => Some(ServiceState::NotInstalled),
         // Pending included: a service coming up is not answering yet, and one going down has
         // already stopped answering — both are "not running" to every control keyed off this.
-        _ => ServiceState::Stopped,
+        Some(ScState::Stopped) | Some(ScState::Pending) => Some(ServiceState::Stopped),
+        Some(ScState::Unknown) | None => None,
     }
 }
 

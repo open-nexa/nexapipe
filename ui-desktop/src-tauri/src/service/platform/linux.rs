@@ -233,30 +233,54 @@ pub fn uninstall_service_linux() -> Result<(), AppError> {
 
 #[cfg(target_os = "linux")]
 pub fn is_service_running_linux() -> bool {
+    service_answer_linux() == Some(true)
+}
+
+/// What `systemctl is-active` answered, when the command ran and printed a state it knows.
+///
+/// A command that could not be spawned, or that printed something this does not recognise, is
+/// not an answer: the unit may well be running, and reading that as "stopped" is the guess the
+/// proxy status must not make when the service's IPC does not answer either.
+#[cfg(target_os = "linux")]
+fn service_answer_linux() -> Option<bool> {
     use std::process::Command;
 
-    Command::new("systemctl")
+    let output = Command::new("systemctl")
         .args(["is-active", SERVICE_NAME])
         .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "active")
-        .unwrap_or(false)
+        .ok()?;
+    match String::from_utf8_lossy(&output.stdout).trim() {
+        "active" => Some(true),
+        "inactive" | "failed" | "activating" | "deactivating" | "reloading" | "refreshing"
+        | "unknown" => Some(false),
+        _ => None,
+    }
 }
 
 /// The unit file is the registration: no file means the service was never installed.
 #[cfg(target_os = "linux")]
 pub fn state_linux() -> ServiceState {
+    // An answer that could not be read is drawn as stopped, the way the panel always has.
+    known_state_linux().unwrap_or(ServiceState::Stopped)
+}
+
+/// The unit's state, when the running query gave an answer.
+#[cfg(target_os = "linux")]
+pub fn known_state_linux() -> Option<ServiceState> {
     use std::path::Path;
 
     let unit = Path::new("/etc/systemd/system").join(format!("{}.service", SERVICE_NAME));
     if !unit.exists() {
-        return ServiceState::NotInstalled;
+        return Some(ServiceState::NotInstalled);
     }
 
-    if is_service_running_linux() {
-        ServiceState::Running
-    } else {
-        ServiceState::Stopped
-    }
+    service_answer_linux().map(|running| {
+        if running {
+            ServiceState::Running
+        } else {
+            ServiceState::Stopped
+        }
+    })
 }
 
 #[cfg(target_os = "linux")]

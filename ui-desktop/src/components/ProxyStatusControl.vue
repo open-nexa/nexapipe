@@ -8,9 +8,10 @@
  * every node's link kind are re-read on a timer, so a service that dies, or a path iroh promotes
  * from relay to direct, shows up on its own (§3.3).
  *
- * The switch is an explicit request, never a probe: TUN is gated on the service being installed,
- * and when it cannot be honoured the backend fails with `proxy.tun_unavailable` instead of
- * quietly forwarding traffic another way (docs/ui-refactor-plan.md §5.12).
+ * The switch is an explicit request, never a probe: TUN is gated on the service answering, and
+ * when it cannot be honoured the backend fails with `proxy.tun_unavailable` instead of
+ * quietly forwarding traffic another way (docs/ui-refactor-plan.md §5.12). A service that is
+ * missing, stopped or out of date offers the one action that fixes it beside the switch.
  */
 import { computed, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
@@ -38,6 +39,7 @@ const {
   busy,
   startupError,
   serviceRunning,
+  serviceState,
   serviceInstalled,
   serviceStale,
   endpointLinks,
@@ -47,14 +49,14 @@ const {
   rate,
   start,
   stop,
-  refreshServiceRunning,
+  settleService,
   revealNodeId,
   setUseTun,
 } = useProxyStore();
 
 const { ensureUnlocked } = useCredentialGate();
 
-const installing = ref(false);
+const serviceBusy = ref(false);
 
 const modeLabel = computed(() => {
   if (status.value.running) return t(`mode.${status.value.mode}`);
@@ -91,13 +93,42 @@ const linkInfo = computed(() => {
   return { label: 'Mixed', icon: 'link-relay', tone: 'mixed' };
 });
 
+/**
+ * Why the TUN switch cannot be turned on yet, which is a different sentence for each of the
+ * three states a service can be in: not there, there and down, there and up but running a
+ * build this app cannot talk to. Saying "install the service first" about one that is already
+ * installed — let alone one that is installed and simply stopped — sends the user looking for
+ * the wrong thing.
+ */
 const tunHint = computed(() => {
-  // A service that is registered but not answering this app is not a service that is
-  // missing: it is one running a build this app cannot talk to, and the way out is a
-  // reinstall. Saying "install the service first" about one that is already installed
-  // sends the user looking for the wrong thing.
+  if (serviceRunning.value) return t('connect.tunHint');
   if (serviceStale.value) return t('connect.tunServiceStale');
-  return serviceRunning.value ? t('connect.tunHint') : t('connect.tunRequiresService');
+  if (serviceState.value === 'stopped') return t('connect.tunServiceStopped');
+  return t('connect.tunRequiresService');
+});
+
+/**
+ * The one service action the switch needs, or null when there is nothing left to do.
+ *
+ * A missing service is installed, a stopped one is started, and one that is up but not
+ * answering is reinstalled. Anything else — a service that answers — needs no button beside
+ * the switch at all.
+ */
+const serviceAction = computed<'install' | 'start' | 'upgrade' | null>(() => {
+  if (serviceRunning.value) return null;
+  if (serviceStale.value) return 'upgrade';
+  return serviceInstalled.value ? 'start' : 'install';
+});
+
+const serviceActionLabel = computed(() => {
+  switch (serviceAction.value) {
+    case 'install':
+      return t('service.install');
+    case 'start':
+      return t('service.startService');
+    default:
+      return t('service.upgrade');
+  }
 });
 
 /**
@@ -107,9 +138,8 @@ const tunHint = computed(() => {
  */
 async function setTun(enabled: boolean): Promise<void> {
   if (enabled && !serviceRunning.value) {
-    toast.warning(
-      serviceStale.value ? t('connect.tunServiceStale') : t('connect.tunRequiresService'),
-    );
+    // The same sentence the switch is showing underneath it: one of the three refusals.
+    toast.warning(tunHint.value);
     return;
   }
 
@@ -157,15 +187,62 @@ async function installServiceForTun(): Promise<void> {
   });
   if (!ok) return;
 
-  installing.value = true;
+  serviceBusy.value = true;
   try {
     await invoke<void>('install_service');
-    await refreshServiceRunning();
-    toast.success(t('service.installed'));
+    // The service manager calls the service running before it binds the IPC listener, so a read
+    // taken now could draw the build just installed as drift for a moment. See the store.
+    if (await settleService('answering')) {
+      toast.success(t('service.installed'));
+    } else {
+      toast.fromKey('service.notSettled');
+    }
   } catch (error) {
     toast.error(error, 'error.service.install_failed');
   } finally {
-    installing.value = false;
+    serviceBusy.value = false;
+  }
+}
+
+/**
+ * Starting a service that is installed and stopped.
+ *
+ * Neither an install nor a reinstall: the unit is there and sound, it is simply down, and
+ * starting it is the only thing between the switch and TUN mode. It asks first for the same
+ * reason the other two do — starting a service elevates.
+ */
+async function startServiceForTun(): Promise<void> {
+  const ok = await confirm({
+    title: t('connect.tunStartTitle'),
+    message: t('connect.tunStartMessage'),
+  });
+  if (!ok) return;
+
+  serviceBusy.value = true;
+  try {
+    await invoke<void>('start_service');
+    if (await settleService('answering')) {
+      toast.success(t('service.started'));
+    } else {
+      toast.fromKey('service.notSettled');
+    }
+  } catch (error) {
+    toast.error(error, 'error.service.start_failed');
+  } finally {
+    serviceBusy.value = false;
+  }
+}
+
+/** Runs whichever action the switch is waiting for; `null` is the state that needs none. */
+function runServiceAction(): void {
+  switch (serviceAction.value) {
+    case 'install':
+    case 'upgrade':
+      void installServiceForTun();
+      return;
+    case 'start':
+      void startServiceForTun();
+      return;
   }
 }
 
@@ -285,13 +362,13 @@ async function copyNodeId(): Promise<void> {
       </div>
 
       <AppButton
-        v-if="!serviceInstalled || serviceStale"
+        v-if="serviceAction"
         size="sm"
         tone="ghost"
-        :loading="installing"
-        @click="installServiceForTun"
+        :loading="serviceBusy"
+        @click="runServiceAction"
       >
-        {{ serviceStale ? t('service.upgrade') : t('service.install') }}
+        {{ serviceActionLabel }}
       </AppButton>
 
       <AppToggle v-model="tunModel" :disabled="!serviceRunning" :label="t('connect.tunToggle')" />
