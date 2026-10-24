@@ -632,7 +632,20 @@ where
         }
     };
 
-    let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+    // The bind is the one step of the flow that can fail for reasons that
+    // have nothing to do with the backend: an exhausted descriptor table, a
+    // host with IPv6 disabled. It is answered like the other failures are —
+    // one status byte, so the client can tell a backend it could not reach
+    // from a server that closed the tunnel without answering.
+    let socket = Arc::new(match UdpSocket::bind(bind_addr).await {
+        Ok(socket) => socket,
+        Err(e) => {
+            let _ = write_status(&mut stream, Status::BackendFailed).await;
+            return Err(anyhow::anyhow!(
+                "failed to bind the UDP socket on {bind_addr}: {e}"
+            ));
+        }
+    });
 
     // A connected UDP socket drops datagrams from anybody else, which keeps an
     // off-path attacker from injecting replies into the tunnel.
