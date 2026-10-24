@@ -91,19 +91,19 @@ const SERVICE_ARGUMENT: &str = "--service";
 /// Not a failure: running is the state the command asked for. Reported as it is, the exit
 /// code turns a successful install into `service.install_failed` carrying
 /// "StartService failed 1056" — an install that worked, described as one that did not.
-const ALREADY_RUNNING: &str = "1056";
+const ALREADY_RUNNING: i32 = 1056;
 
 /// `sc stop` on a service that is not started (or not installed).
 ///
 /// Same shape: the state asked for is already the state, so refusing to call it a success
 /// only stops a perfectly good stop from ever being reported as done.
-const NOT_STARTED: &str = "1062";
+const NOT_STARTED: i32 = 1062;
 
 /// Accepts a nonzero exit code from the previous command as success.
 ///
 /// `errorlevel` is compared literally rather than with `if errorlevel N` because that form
 /// means "N or higher" and would swallow real failures with larger codes.
-fn tolerate(code: &str) -> String {
+fn tolerate(code: i32) -> String {
     format!("if %errorlevel%=={code} exit /b 0")
 }
 
@@ -568,12 +568,17 @@ pub fn stop() -> Result<(), AppError> {
 
 /// What the service manager says right now.
 pub fn state() -> ServiceState {
-    match sc_query().map(|text| sc_state(&text)) {
+    match sc_query().map(|(text, exit_code)| sc_state(&text, exit_code)) {
         Some(ScState::Running) => ServiceState::Running,
-        // `sc.exe` itself could not be run, so there is nothing to report as installed. A
-        // service that is marked for deletion counts as gone: the control manager refuses
-        // every operation on it, so there is nothing left to start, stop or uninstall.
-        Some(ScState::Absent) | Some(ScState::Deleting) | None => ServiceState::NotInstalled,
+        // Nothing this can call installed: `sc.exe` could not be run, answered something that
+        // is not a state, or has no such service. "Could not tell" is drawn like "not
+        // installed" so that the panel offers an install instead of controls for a service
+        // whose existence is in doubt. A service marked for deletion counts as gone: the
+        // control manager refuses every operation on it, so there is nothing left to start,
+        // stop or uninstall.
+        Some(ScState::Absent) | Some(ScState::Deleting) | Some(ScState::Unknown) | None => {
+            ServiceState::NotInstalled
+        }
         // Pending included: a service coming up is not answering yet, and one going down has
         // already stopped answering — both are "not running" to every control keyed off this.
         _ => ServiceState::Stopped,
@@ -589,7 +594,7 @@ pub fn state() -> ServiceState {
 /// A query that could not be run at all is not evidence of absence — the service may well be
 /// there, and an install that believes the service is gone replaces one that is still up.
 fn service_exists() -> bool {
-    match sc_query().map(|text| sc_state(&text)) {
+    match sc_query().map(|(text, exit_code)| sc_state(&text, exit_code)) {
         Some(ScState::Absent) | Some(ScState::Deleting) => false,
         Some(_) | None => true,
     }
@@ -607,7 +612,7 @@ fn service_exists() -> bool {
 fn settle_down(failure: &str) -> Result<(), AppError> {
     let deadline = Instant::now() + SETTLE_TIMEOUT;
     loop {
-        match sc_query().map(|text| sc_state(&text)) {
+        match sc_query().map(|(text, exit_code)| sc_state(&text, exit_code)) {
             // A record that is marked for deletion is down as well: nothing is running, and
             // the control manager has already been told to remove it.
             Some(ScState::Stopped | ScState::Absent | ScState::Deleting) => return Ok(()),
@@ -624,7 +629,7 @@ fn settle_down(failure: &str) -> Result<(), AppError> {
                 format!(
                     "the service was still up after {}s\n{}",
                     SETTLE_TIMEOUT.as_secs(),
-                    sc_query().unwrap_or_default()
+                    sc_query().map(|(text, _)| text).unwrap_or_default()
                 ),
             ));
         }
@@ -647,7 +652,7 @@ fn wait_for_deletable_record() -> Result<(), AppError> {
     let deadline = Instant::now() + DELETE_RECORD_TIMEOUT;
 
     loop {
-        match sc_query().map(|text| sc_state(&text)) {
+        match sc_query().map(|(text, exit_code)| sc_state(&text, exit_code)) {
             // Not there at all, or there and usable: there is nothing to wait for.
             Some(ScState::Absent)
             | Some(ScState::Running | ScState::Stopped | ScState::Pending) => return Ok(()),
@@ -668,7 +673,7 @@ fn wait_for_deletable_record() -> Result<(), AppError> {
                 format!(
                     "the previous service was still marked for deletion after {}s\n{}",
                     DELETE_RECORD_TIMEOUT.as_secs(),
-                    sc_query().unwrap_or_default()
+                    sc_query().map(|(text, _)| text).unwrap_or_default()
                 ),
             ));
         }
@@ -707,7 +712,7 @@ fn settle(expected: ServiceState, failure: &str) -> Result<(), AppError> {
                         ServiceState::NotInstalled => "missing",
                     },
                     SETTLE_TIMEOUT.as_secs(),
-                    sc_query().unwrap_or_default()
+                    sc_query().map(|(text, _)| text).unwrap_or_default()
                 ),
             ));
         }
@@ -1022,7 +1027,12 @@ fn verify_present() -> Result<(), AppError> {
 
     match sc_query() {
         // Not there, or already on its way out: the install did not leave a service behind.
-        Some(text) if matches!(sc_state(&text), ScState::Absent | ScState::Deleting) => {
+        Some((text, exit_code))
+            if matches!(
+                sc_state(&text, exit_code),
+                ScState::Absent | ScState::Deleting
+            ) =>
+        {
             Err(AppError::with_detail(codes::SERVICE_INSTALL_FAILED, text))
         }
         Some(_) => Ok(()),
@@ -1043,7 +1053,7 @@ fn verify_absent() -> Result<(), AppError> {
     let deadline = Instant::now() + DELETE_RECORD_TIMEOUT;
 
     loop {
-        match sc_query().map(|text| sc_state(&text)) {
+        match sc_query().map(|(text, exit_code)| sc_state(&text, exit_code)) {
             Some(ScState::Absent) | Some(ScState::Deleting) => return Ok(()),
             // `sc.exe` could not be run at all, so there is nothing to wait out.
             Some(ScState::Unknown) | None => {
@@ -1061,7 +1071,7 @@ fn verify_absent() -> Result<(), AppError> {
                 format!(
                     "the service was still registered after {}s\n{}",
                     DELETE_RECORD_TIMEOUT.as_secs(),
-                    sc_query().unwrap_or_default()
+                    sc_query().map(|(text, _)| text).unwrap_or_default()
                 ),
             ));
         }
@@ -1070,14 +1080,19 @@ fn verify_absent() -> Result<(), AppError> {
     }
 }
 
-fn sc_query() -> Option<String> {
+/// Asks the service manager about this service: its answer, and the code it exited with.
+///
+/// The code goes along because it is the part of the answer that is not localized — see
+/// [`sc_state`]. `None` is "the question could not be asked at all", which is not the same
+/// as an answer saying the service is missing.
+fn sc_query() -> Option<(String, Option<i32>)> {
     let output = run_with_timeout(
         Command::new("sc.exe").args(["query", SERVICE_NAME]),
         "service query",
         COMMAND_TIMEOUT,
     )
     .ok()?;
-    Some(detail_of(&output))
+    Some((detail_of(&output), output.status.code()))
 }
 
 fn temp_path(extension: &str) -> PathBuf {
