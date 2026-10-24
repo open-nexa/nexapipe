@@ -34,6 +34,7 @@ export const ERROR_CODES = [
   'service.uninstall_failed',
   'service.start_failed',
   'service.stop_failed',
+  'service.restart_failed',
   'service.definition_failed',
   'service.unsupported_platform',
   'service.exe_path',

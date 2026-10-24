@@ -52,6 +52,7 @@
     "allow-parse-invite",
     "allow-put-credential",
     "allow-quit-guard-ready",
+    "allow-restart-service",
     "allow-reveal-credential",
     "allow-reveal-node-id",
     "allow-set-auto-start",

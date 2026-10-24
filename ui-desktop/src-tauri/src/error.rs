@@ -71,6 +71,7 @@ pub mod codes {
     pub const SERVICE_UNINSTALL_FAILED: &str = "service.uninstall_failed";
     pub const SERVICE_START_FAILED: &str = "service.start_failed";
     pub const SERVICE_STOP_FAILED: &str = "service.stop_failed";
+    pub const SERVICE_RESTART_FAILED: &str = "service.restart_failed";
     /// Writing the unit file / plist, or reloading the service manager, failed.
     pub const SERVICE_DEFINITION_FAILED: &str = "service.definition_failed";
     /// Service management is not implemented for this platform.
