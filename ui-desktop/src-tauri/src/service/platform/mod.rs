@@ -258,13 +258,17 @@ fn sc_state(query_output: &str) -> ScState {
 
 /// Whether `sc.exe` answered with `code` as the failure it reported.
 ///
-/// The code has to be on the line that carries `FAILED`: `sc.exe` puts the error there, and
-/// the same digits turn up elsewhere in an answer that is not a failure at all.
+/// The code has to be on an error line — the ones `sc.exe` prefixes with `[SC]`. The word
+/// itself is not the marker: `sc.exe` localizes `FAILED` (a Simplified Chinese host prints
+/// `失败`), while the prefix and the code stay as they are. Keying on the word made every
+/// failed query read as "no answer" on such a host, so an install could not take the name of
+/// the registration an upgrade had just removed. Matching the code anywhere is no better:
+/// the same digits turn up in the `WIN32_EXIT_CODE` of a service that stopped badly.
 #[cfg(any(windows, test))]
 fn failure_with(query_output: &str, code: &str) -> bool {
     query_output
         .lines()
-        .any(|line| line.contains("FAILED") && line.contains(code))
+        .any(|line| line.trim_start().starts_with("[SC]") && line.contains(code))
 }
 
 // ==========================================================================
@@ -917,6 +921,25 @@ SERVICE_NAME: nexa-service
                 "SERVICE_NAME: nexa-service\n        STATE              : 1  STOPPED\n        WIN32_EXIT_CODE    : 1072  (0x430)\n"
             ),
             ScState::Stopped
+        );
+    }
+
+    /// The same failure, spelled by a Windows that does not speak English.
+    ///
+    /// `sc.exe` localizes the word `FAILED` but not the `[SC]` prefix or the code. On a
+    /// Simplified Chinese host the absence of a service therefore read as "no answer", and an
+    /// install that had just removed the old registration could not put a new one in its place.
+    #[test]
+    fn a_localized_failure_is_still_a_failure() {
+        assert_eq!(
+            sc_state("[SC] EnumQueryServicesStatus:OpenService 失败 1060:\n\n指定的服务未安装。\n"),
+            ScState::Absent
+        );
+        assert_eq!(
+            sc_state(
+                "[SC] EnumQueryServicesStatus:OpenService 失败 1072:\n\n指定的服务标记为删除。\n"
+            ),
+            ScState::Deleting
         );
     }
 
