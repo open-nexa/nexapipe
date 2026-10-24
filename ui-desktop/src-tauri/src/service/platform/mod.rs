@@ -79,6 +79,28 @@ pub fn service_state() -> ServiceState {
     return ServiceState::NotInstalled;
 }
 
+/// The service manager's answer, when this machine could read one.
+///
+/// [`service_state`] folds "not running" and "could not be asked" into `NotInstalled`, which is
+/// what the panel's action choices need: a service that cannot be read is drawn as not installed
+/// so an install is offered instead of controls for a service whose existence is in doubt. A
+/// proxy-status fallback cannot make that substitution — a running service whose manager refused
+/// to answer may still own the tunnel this process cannot see — so it asks this question instead,
+/// and `None` leaves the proxy status open rather than claiming nothing is running.
+pub fn known_service_state() -> Option<ServiceState> {
+    #[cfg(windows)]
+    return known_state();
+
+    #[cfg(target_os = "linux")]
+    return known_state_linux();
+
+    #[cfg(target_os = "macos")]
+    return known_state_macos();
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    return Some(ServiceState::NotInstalled);
+}
+
 #[cfg(not(windows))]
 use crate::error::codes;
 // The elevation channel is Unix's, but the argument that names the account the

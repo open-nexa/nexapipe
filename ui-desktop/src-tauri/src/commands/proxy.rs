@@ -13,6 +13,7 @@ use crate::proxy::{
 };
 use crate::service;
 use crate::service::ipc::{NodeInput, StartProxyRequest};
+use crate::service::platform::ServiceState;
 use crate::service::IpcClient;
 use crate::status::{
     ActiveFlowPage, EndpointLink, NodeHealthStatus, NodeTrafficStatus, ProxyStatus, FLOW_PAGE_LIMIT,
@@ -307,11 +308,12 @@ pub(crate) async fn get_proxy_status(use_service: Option<bool>) -> Result<ProxyS
         Some(Some(mode)) => ProxyStatus::running_with(mode),
         Some(None) => ProxyStatus::starting(),
         // No manager here, and the service could not be asked: whether that is "no tunnel" or "a
-        // tunnel this process cannot see" is decided by the service manager's own state.
+        // tunnel this process cannot see" is decided by what the service manager can say about
+        // itself. A manager that cannot answer either leaves the question open.
         None if use_service => {
-            let state = tauri::async_runtime::spawn_blocking(service::platform::service_state)
+            let state = tauri::async_runtime::spawn_blocking(service::platform::known_service_state)
                 .await
-                .unwrap_or(service::platform::ServiceState::NotInstalled);
+                .unwrap_or(None);
             status_for_an_unanswered_service(state)
         }
         None => ProxyStatus::stopped(),
@@ -320,17 +322,16 @@ pub(crate) async fn get_proxy_status(use_service: Option<bool>) -> Result<ProxyS
 
 /// The status to report when no manager here answered and the service did not either.
 ///
-/// Only a running service can own a tunnel this process cannot see, so only that state leaves
-/// the question open. A service that is stopped or not installed cannot own one — reporting it
-/// as unknown is what told the connect page "status unknown" about a plain stopped proxy, and
-/// answering "stopped" about a *running* service is what starts a second tunnel over a live
-/// one.
-fn status_for_an_unanswered_service(state: service::platform::ServiceState) -> ProxyStatus {
+/// `state` is the service manager's own reading, when it gave one that could be read. Only a
+/// positive `Stopped` or `NotInstalled` rules out a tunnel: a running service may own one this
+/// process cannot see, and so may a service whose manager was refused, timed out, or answered
+/// something the parser does not know. Both leave the question open, which is what `unknown`
+/// means; answering `stopped` for the first was what once started a second tunnel over a live
+/// one, and for the second it would be a statement nothing supports.
+fn status_for_an_unanswered_service(state: Option<ServiceState>) -> ProxyStatus {
     match state {
-        service::platform::ServiceState::Running => ProxyStatus::unknown(),
-        service::platform::ServiceState::Stopped | service::platform::ServiceState::NotInstalled => {
-            ProxyStatus::stopped()
-        }
+        Some(ServiceState::Stopped | ServiceState::NotInstalled) => ProxyStatus::stopped(),
+        Some(ServiceState::Running) | None => ProxyStatus::unknown(),
     }
 }
 
@@ -587,7 +588,7 @@ mod tests {
     #[test]
     fn a_running_service_that_does_not_answer_leaves_the_question_open() {
         assert_eq!(
-            status_for_an_unanswered_service(ServiceState::Running),
+            status_for_an_unanswered_service(Some(ServiceState::Running)),
             ProxyStatus::unknown()
         );
     }
@@ -595,12 +596,22 @@ mod tests {
     #[test]
     fn a_service_that_is_not_running_cannot_own_a_tunnel() {
         assert_eq!(
-            status_for_an_unanswered_service(ServiceState::Stopped),
+            status_for_an_unanswered_service(Some(ServiceState::Stopped)),
             ProxyStatus::stopped()
         );
         assert_eq!(
-            status_for_an_unanswered_service(ServiceState::NotInstalled),
+            status_for_an_unanswered_service(Some(ServiceState::NotInstalled)),
             ProxyStatus::stopped()
+        );
+    }
+
+    /// A manager that refused, timed out or answered something unreadable says nothing about
+    /// whether a tunnel is up — and "nothing is running" is a claim it did not make.
+    #[test]
+    fn a_service_the_manager_could_not_describe_leaves_the_question_open() {
+        assert_eq!(
+            status_for_an_unanswered_service(None),
+            ProxyStatus::unknown()
         );
     }
 }
