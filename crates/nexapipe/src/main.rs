@@ -578,6 +578,10 @@ async fn run_server_mode(
             metrics: metrics_config,
             backends: proxy_config.backends.clone(),
             limits: proxy_config.limits,
+            // The credentials in the configuration file are what this build
+            // checks. A build that keeps its credentials somewhere else hands
+            // its own authenticator in here instead.
+            authenticator: None,
         },
     )
     .await

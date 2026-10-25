@@ -7,6 +7,8 @@
 use crate::auth::AuthConfig;
 use crate::config_watcher::save_auth_state;
 
+use super::authenticator::{Authenticator, ConfigAuthenticator};
+
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -39,11 +41,41 @@ pub struct AuthState {
     /// enrollment could be sampled by a reload that then read the file before
     /// the write, and the stale snapshot would look current.
     enroll_epoch: Arc<std::sync::atomic::AtomicU64>,
+    /// How a credential is checked.
+    ///
+    /// The built-in one reads the credentials in the configuration. A
+    /// deployment that keeps its credentials somewhere else hands its own
+    /// implementation to [`AuthState::with_authenticator`] instead.
+    ///
+    /// It lives here rather than being passed down the connection path because
+    /// it is a property of the deployment, not of a connection: every
+    /// connection authenticates the same way, and a build that changed its mind
+    /// halfway through would be a build in which two connections disagree about
+    /// who is allowed in.
+    authenticator: Arc<dyn Authenticator>,
 }
 
 impl AuthState {
     /// Wraps a freshly loaded config together with the file it came from.
+    ///
+    /// The credentials in the configuration are what this checks.
     pub fn new(config: AuthConfig, path: impl Into<String>) -> Self {
+        Self::with_authenticator(config, path, Arc::new(ConfigAuthenticator))
+    }
+
+    /// Wraps a freshly loaded config, and the authenticator that checks the
+    /// credentials against it.
+    ///
+    /// The built-in authenticator reads the configuration's own client table.
+    /// Another one is for a deployment that keeps its credentials elsewhere —
+    /// an identity provider, a directory — and it is given the same
+    /// configuration to move its counters in, so that the lockout accounting
+    /// and the step memory stay where every other build keeps them.
+    pub fn with_authenticator(
+        config: AuthConfig,
+        path: impl Into<String>,
+        authenticator: Arc<dyn Authenticator>,
+    ) -> Self {
         let path = path.into();
         let state_path = crate::auth::state::path_for(&path)
             .to_string_lossy()
@@ -53,7 +85,13 @@ impl AuthState {
             path,
             state_path,
             enroll_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            authenticator,
         }
+    }
+
+    /// The authenticator every connection on this instance is checked by.
+    pub fn authenticator(&self) -> &Arc<dyn Authenticator> {
+        &self.authenticator
     }
 
     /// How many enrollments have been applied to the live config so far.

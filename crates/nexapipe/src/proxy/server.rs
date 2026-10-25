@@ -53,6 +53,20 @@ pub struct ProxyOptions {
     pub backends: BackendsConfig,
     /// The ceilings the whole process runs under. Absent means the defaults.
     pub limits: LimitsConfig,
+    /// How a connection's credential is checked.
+    ///
+    /// `None` means the built-in authenticator: the credentials in
+    /// `config.toml`, checked by the server itself. A build that keeps its
+    /// credentials somewhere else — an identity provider, a directory — hands
+    /// its own implementation here instead, and nothing else about the server
+    /// changes: the wire format, the handshake and the counters stay where they
+    /// are.
+    ///
+    /// The choice is made once, at startup, and every connection on the
+    /// instance is checked the same way. Two connections on one server that
+    /// disagreed about who is allowed in would be a server with two answers to
+    /// the same question.
+    pub authenticator: Option<Arc<dyn conn::Authenticator>>,
 }
 
 pub async fn run_proxy(
@@ -71,6 +85,7 @@ pub async fn run_proxy(
         metrics: metrics_config,
         backends,
         limits: limits_config,
+        authenticator,
     } = options;
 
     // The ceilings the process runs under, resolved once and here: they are
@@ -140,10 +155,14 @@ pub async fn run_proxy(
     // so until the file says otherwise this behaves like the no-2FA case:
     // `conn::handle_connection` reads `enabled` per connection and skips the
     // handshake while it is false.
-    let auth_state = Some(conn::AuthState::new(
-        auth_config.unwrap_or_default(),
-        config_path,
-    ));
+    let auth_state = Some(match authenticator {
+        Some(authenticator) => conn::AuthState::with_authenticator(
+            auth_config.unwrap_or_default(),
+            config_path,
+            authenticator,
+        ),
+        None => conn::AuthState::new(auth_config.unwrap_or_default(), config_path),
+    });
 
     // The watcher needs three things to apply a reload: it rebuilds the routes,
     // restarts whatever health checks the new routes need, swaps in the

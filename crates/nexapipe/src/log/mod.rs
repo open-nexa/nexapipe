@@ -18,6 +18,7 @@
 //! - this one — the layers the program installs, and the settings they read.
 
 mod access;
+mod record;
 mod sink;
 
 #[cfg(test)]
@@ -41,6 +42,7 @@ use access::{ACCESS_TARGET, init_access_logger, set_redact_query};
 
 pub(crate) use access::record_request_on_span;
 pub use access::{FlowDetail, log_access, log_access_flow, next_request_id};
+pub use record::{AccessRecord, AccessSink, add_access_sink};
 pub use sink::{FileSink, SinkWriter};
 
 #[cfg(test)]

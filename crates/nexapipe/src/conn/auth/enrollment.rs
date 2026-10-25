@@ -214,7 +214,7 @@ impl PeerRegistration {
     /// Puts the connection in the registry and hands back what keeps it there
     /// and what tells it to stop.
     pub(super) fn register(
-        self,
+        &self,
         identity: PeerIdentity,
     ) -> (PeerGuard, tokio::sync::watch::Receiver<bool>) {
         let (revoked_tx, revoked_rx) = tokio::sync::watch::channel(false);

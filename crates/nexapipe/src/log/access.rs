@@ -16,6 +16,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::conn::peers::PeerIdentity;
 
+use super::record;
 use super::sink::FileSink;
 
 #[cfg(test)]
@@ -231,6 +232,32 @@ pub enum FlowDetail {
         version: String,
         status: Option<u16>,
     },
+}
+
+impl FlowDetail {
+    /// A copy with the redaction the line gets.
+    ///
+    /// The line replaces the values in a sniffed request target, and a record
+    /// that carried the raw one would put the leak in the place the redaction
+    /// was meant to close. The same expressions are used here as there, so the
+    /// two agree — which is the whole point of the redaction living in one
+    /// place.
+    pub fn redacted(&self) -> Self {
+        match self {
+            FlowDetail::Tls { sni } => FlowDetail::Tls { sni: sni.clone() },
+            FlowDetail::Http {
+                method,
+                target,
+                version,
+                status,
+            } => FlowDetail::Http {
+                method: sanitize(method),
+                target: redact_query(&sanitize(target)),
+                version: sanitize(version),
+                status: *status,
+            },
+        }
+    }
 }
 
 /// Builds one access line.
@@ -480,7 +507,32 @@ fn write_access_line(
     // And after that: what the flow said about itself. It goes at the very
     // end for the same reason the id does — a new field must not move a
     // column that a script already knows where to find.
+    //
+    // The facts themselves are kept as well, for the record below: the line
+    // spells them out as text, and a sink wants them as values.
+    let flow_detail = detail.map(FlowDetail::redacted);
     let detail = detail.map(flow_detail_suffix).unwrap_or_default();
+
+    // The record: the same facts, structured rather than rendered. Built only
+    // when a sink wants it, so that a deployment with no sink pays nothing for
+    // it.
+    //
+    // The identity and the detail are the two things the line spells out as
+    // text, and they are the two a sink most wants as values: who made the
+    // request, and what the flow said about itself.
+    if record::has_sinks() {
+        record::dispatch(record::AccessRecord {
+            request_id: request_id.to_string(),
+            remote_addr: remote_addr.to_string(),
+            method: method.to_string(),
+            uri: uri.clone(),
+            status,
+            duration_ms,
+            bytes_sent,
+            identity: who.cloned(),
+            detail: flow_detail,
+        });
+    }
 
     if let Some(target) = target {
         let line = access_line(

@@ -1,10 +1,6 @@
 //! The handshake: what a client says, and what it proves.
 
-use crate::auth::{
-    AuthError, AuthMessage, ClientAcl, StepVerdict, TotpValidator, Verified,
-    is_presentable_client_id, is_presentable_device_id,
-};
-use crate::conn::peers::PeerIdentity;
+use crate::auth::{AuthMessage, ClientAcl, is_presentable_client_id, is_presentable_device_id};
 
 use nexapipe_proto::auth::Format;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -12,8 +8,9 @@ use zeroize::Zeroizing;
 
 use iroh::endpoint::Connection;
 
+use super::authenticator::{AuthContext, AuthRequest};
 use super::enrollment::{AuthFailure, AuthenticatedPeer, PeerRegistration, enroll_client};
-use super::state::{AuthState, persist_auth_state};
+use super::state::AuthState;
 
 /// How long the server holds a connection open after refusing it, so the
 /// AUTH_FAILED it just wrote can reach the client.
@@ -270,243 +267,38 @@ pub(in crate::conn) async fn perform_authentication(
         ));
     }
 
-    // Step 4: Verify the response and account for the result under one write
-    // lock. The signature binds the response to this connection's challenge and
-    // the timestamp keeps it fresh; only then does the TOTP code decide.
+    // Step 4: Verify the response and account for the result.
     //
-    // Verify and record have to share the lock. Split across a read and a write
-    // lock, two connections from the same client could both read "not locked
-    // out" before either had recorded anything, and the counters would under-
-    // count. The lock is held across an HMAC and a TOTP check, both of which
-    // are microseconds, so serialising handshakes costs nothing a client can
-    // notice.
-    let mut cfg = auth.config().write().await;
-
-    // Drop a lockout that has run out before deciding anything, so an expired
-    // one does not read as live and its stale counter does not push the client
-    // straight back over the threshold.
-    if let Some(client) = cfg.clients.get_mut(&client_id) {
-        client.refresh_lockout();
-    }
-
-    let outcome = TotpValidator::new(&cfg).verify_response(
-        &client_id,
-        resp_device_id.as_deref(),
-        &nonce,
-        resp_timestamp,
-        &signature,
-        &totp_code,
-    );
-
-    // Only a wrong TOTP code counts toward the lockout: a skewed clock or a
-    // mismatched signature is a refusal, not a failed attempt, and counting
-    // those would let whoever replays a captured response lock its rightful
-    // owner out.
+    // The signature binds the response to this connection's challenge and the
+    // timestamp keeps it fresh; only then does the TOTP code decide.
     //
-    // Every branch below ends up sending one AUTH_FAILED whose reason is a
-    // single fixed string. A distinct message for "locked out" or "no such
-    // client" would make the reason an oracle: anyone could walk a client's
-    // counter up to the lockout and, from the change in the reply, learn that
-    // the id they guessed exists. The real reason goes to the log instead.
-    let mut verified_acl = ClientAcl::unrestricted();
-    // Whether the counters changed and the state file has to be written. The
-    // write itself happens after the lock is released.
-    let mut state_dirty = false;
-    let is_valid = match outcome {
-        Ok(Verified::Accepted { step }) => {
-            // **The step check**, under the same lock that verified the code.
-            //
-            // A code is inside the acceptance window for the whole of its
-            // step, so "this code is current" and "this code has already been
-            // used" are different questions, and only the step tells them
-            // apart. RFC 6238 §5.2 asks the verifier to refuse the second
-            // use of a step it has already accepted.
-            //
-            // The check and the record are one operation: a caller that
-            // checked and then recorded could let two connections through
-            // between the two, and the whole point is that the second one does
-            // not get in.
-            let step_verdict = match step {
-                Some(step) => cfg.accept_step(&client_id, resp_device_id.as_deref(), step),
-                // No code, so no step: a key device's signature covers the
-                // challenge issued for this connection, and there is nothing
-                // for a second use to replay.
-                None => StepVerdict::Accepted { moved: false },
-            };
-            let (step_moved, step_refused) = match step_verdict {
-                StepVerdict::Refused => (false, true),
-                StepVerdict::Accepted { moved } => (moved, false),
-            };
-            if step_refused {
-                // **Not counted.** A code that has already been used is not a
-                // guess at the credential, and counting it would let whoever
-                // holds one code lock the device's owner out — over a
-                // credential the owner did nothing wrong.
-                tracing::warn!(
-                    "2FA: client '{}' from {} sent a code that has already been used; refused \
-                     without counting it as an attempt",
-                    client_id,
-                    peer
-                );
-                false
-            } else {
-                // Which device this was, if it named one, recorded under the same
-                // lock that verified it. This is the stamp `client list` reads to
-                // say whether a device is still in use: without it every named
-                // device reports "never used" forever, and the one question the
-                // device table exists to answer — which of these can be revoked
-                // without disconnecting a live one — has nothing to go on.
-                let device_stamp_moved = match resp_device_id.as_deref() {
-                    Some(name) => cfg
-                        .clients
-                        .get_mut(&client_id)
-                        .is_some_and(|client| client.record_device_success(name)),
-                    None => false,
-                };
-                // Clear the counters only when there is something to clear, so a
-                // healthy client does not turn every connection into a disk write.
-                // A named device that moved its stamp is worth one: `unix_now` is
-                // whole seconds, so a device reconnecting inside the same second
-                // is not.
-                // The step's memory is worth a write too: it is the thing that
-                // refuses the second use of a code, and a server that forgot it
-                // over a restart would accept one.
-                let dirty = step_moved
-                    || device_stamp_moved
-                    || cfg
-                        .clients
-                        .get(&client_id)
-                        .is_some_and(|c| c.failed_attempts != 0 || c.locked_until.is_some());
-                if dirty {
-                    if let Some(client) = cfg.clients.get_mut(&client_id) {
-                        client.record_success();
-                    }
-                    // The write happens after the lock is released; see
-                    // `persist_auth_state`.
-                    state_dirty = true;
-                }
-                // Snapshot the host authorization while the same lock that verified
-                // the credentials still holds: the entry cannot vanish between the
-                // two reads, and a connection keeps the ACL it authenticated with
-                // even if a reload changes it right after.
-                if let Some(client) = cfg.clients.get(&client_id) {
-                    verified_acl = client.acl();
-                }
-                true
-            }
-        }
-        Ok(Verified::WrongCode) => {
-            let max_attempts = cfg.max_attempts;
-            let lockout_duration = cfg.lockout_duration;
-            if let Some(client) = cfg.clients.get_mut(&client_id) {
-                client.record_failure(max_attempts, lockout_duration);
-            }
-            // The write happens after the lock is released; see
-            // `persist_auth_state`.
-            state_dirty = true;
-            false
-        }
-        Err(e) => {
-            match &e {
-                AuthError::ClientNotFound => {
-                    tracing::warn!("2FA: unknown client '{}' from {}", client_id, peer);
-                }
-                AuthError::UnknownDevice => {
-                    // Printable ASCII, because the name was checked before it
-                    // was used for anything — and it is the one thing about
-                    // this refusal an operator can act on.
-                    tracing::warn!(
-                        "2FA: client '{}' from {} names device {:?}, which has no credential: \
-                         either it never enrolled or its entry was dropped",
-                        client_id,
-                        peer,
-                        resp_device_id.as_deref()
-                    );
-                }
-                AuthError::InvalidSecret | AuthError::TotpCreationFailed => {
-                    tracing::error!(
-                        "2FA: client '{}' cannot be validated, the server's auth config is broken: {}",
-                        client_id,
-                        e
-                    );
-                }
-                AuthError::LockedOut => {
-                    tracing::warn!("2FA: client '{}' from {} is locked out", client_id, peer);
-                }
-                AuthError::WrongSignature => {
-                    // Not counted, and worth saying why: a key cannot be
-                    // guessed, so there is nothing for the counter to protect
-                    // on this path — counting it would only let a peer that
-                    // knows the client id and the device name deny the
-                    // device's owner service.
-                    tracing::warn!(
-                        "2FA: response from {} for '{}' carries a signature that does not match \
-                         the challenge",
-                        peer,
-                        client_id
-                    );
-                }
-                AuthError::MalformedSignature => {
-                    // Not counted, and worth saying why: the peer sent noise
-                    // rather than a wrong credential, so this is not an
-                    // attempt at the device.
-                    tracing::warn!(
-                        "2FA: response from {} for '{}' carries a signature that is not a \
-                         signature",
-                        peer,
-                        client_id
-                    );
-                }
-                AuthError::UnnamedDeviceNotAllowed => {
-                    // The one refusal that is a configuration the operator can
-                    // change, so it is the one that says which knob.
-                    tracing::warn!(
-                        "2FA: client '{}' from {} names no device, and this client answers only \
-                         to named ones: set unnamed_device_allowed = true under \
-                         [auth.clients.{}] to let it use the client's own secret",
-                        client_id,
-                        peer,
-                        client_id
-                    );
-                }
-                _ => {
-                    tracing::warn!(
-                        "2FA: response from {} for '{}' rejected: {}",
-                        peer,
-                        client_id,
-                        e
-                    );
-                }
-            }
-            false
-        }
+    // The whole attempt belongs to the authenticator — the verification, the
+    // counters it moves and the peer registration — because those three have
+    // to happen in one critical section, and splitting them reopens races this
+    // code spent a long time closing. See `authenticator` for the contract.
+    let request = AuthRequest {
+        client_id: &client_id,
+        device_id: resp_device_id.as_deref(),
+        nonce: &nonce,
+        timestamp: resp_timestamp,
+        signature: &signature,
+        code: &totp_code,
     };
-    // Registered here, while the write lock is still held, for the reason given
-    // on `PeerRegistration`: a reload takes this same lock and closes the
-    // connections whose credential it just dropped, so the entry has to be in
-    // the registry before the lock is released or that pass misses it. Nothing
-    // is registered on a refusal — a peer that was turned away was never
-    // connected, and listing it would answer "who is connected" with peers
-    // that were not.
-    let registered = is_valid.then(|| {
-        registration.register(PeerIdentity {
-            client_id: Some(client_id.clone()),
-            device: resp_device_id.clone(),
-        })
-    });
+    let context = AuthContext {
+        state: auth,
+        peer,
+        register: &|identity| registration.register(identity),
+    };
+    let outcome = auth.authenticator().authenticate(request, context).await;
 
-    drop(cfg);
-
-    // The state file is written with the auth lock released. The counters it
-    // carries are read at write time, so they are the ones as of now.
-    if state_dirty && let Err(e) = persist_auth_state(auth).await {
-        tracing::warn!(
-            "2FA: failed to persist the auth counters for '{}' to {}: {}",
-            client_id,
-            auth.state_path(),
-            e
-        );
-    }
+    // The reason the attempt was refused goes to the log, inside the
+    // authenticator that refused it: that is where the knowledge of *why* is.
+    // What the client is told is one fixed string for every refusal, so that
+    // the reply is not an oracle.
+    let (is_valid, verified_acl, registered) = match outcome {
+        Ok(outcome) => (true, outcome.acl, outcome.registered),
+        Err(_) => (false, ClientAcl::unrestricted(), None),
+    };
 
     // One fixed string for every refusal, logged apart but sent identically: see
     // the note above the match.
