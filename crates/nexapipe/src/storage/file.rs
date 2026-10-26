@@ -425,10 +425,25 @@ impl FileStorage {
     }
 
     /// The admin token, when there is one.
+    ///
+    /// A token that is **there and cannot be used** is an error, not an
+    /// absence: a file with the wrong mode, an empty one, one that cannot be
+    /// read. The difference matters to the caller, which would otherwise read
+    /// the error as "there is no token yet" and try to make one — and be told
+    /// that it cannot, which says nothing about the file that is already
+    /// there and is the thing that is wrong.
     pub fn admin_token(&self) -> anyhow::Result<Option<SecretString>> {
-        Ok(crate::admin::token::load_existing(
-            &self.config_path.to_string_lossy(),
-        ))
+        if !self.token_path.exists() {
+            return Ok(None);
+        }
+        crate::admin::token::load(&self.token_path.to_string_lossy())
+            .map(Some)
+            .map_err(|reason| {
+                anyhow::anyhow!(
+                    "the admin token at {} is unusable: {reason}",
+                    self.token_path.display()
+                )
+            })
     }
 
     /// Writes the admin token, refusing to replace one that is already there.
@@ -624,7 +639,8 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| anyhow::anyhow!("the storage task did not run: {e}"))?
 }
 
-/// Reads the config file into a document, with the text it was read from/// wiped when it goes out of scope.
+/// Reads the config file into a document, with the text it was read from
+/// wiped when it goes out of scope.
 ///
 /// The file can hold the 2FA seeds in the clear, so its text is a copy of a
 /// credential: it is read into a buffer that is zeroed as soon as the

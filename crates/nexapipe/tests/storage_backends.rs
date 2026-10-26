@@ -27,10 +27,12 @@ fn store(dir: &tempfile::TempDir) -> Arc<dyn Storage> {
 fn seed(dir: &tempfile::TempDir) -> String {
     let path = dir.path().join("config.toml");
     let text = "\
+# The operator's own note, above the section they wrote.
 [auth]
 enabled = true
 
 [auth.clients.client-001]
+# The seed this client was enrolled with.
 secret = \"JBSWY3DPEHPK3PXP\"
 ";
     std::fs::write(&path, text).expect("the configuration is written");
@@ -396,6 +398,14 @@ async fn a_write_leaves_the_operators_comments_alone() {
         .expect("the secret is written");
 
     let text = std::fs::read_to_string(&path).expect("the configuration is read");
+    assert!(
+        text.contains("# The operator's own note, above the section they wrote."),
+        "the comment above the section survived: {text}"
+    );
+    assert!(
+        text.contains("# The seed this client was enrolled with."),
+        "and the comment inside the client's own section did too: {text}"
+    );
     assert!(text.contains("[auth]"), "the section is still there");
     assert!(
         text.contains("JBSWY3DPEHPK3PXP"),

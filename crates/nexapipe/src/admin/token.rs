@@ -141,7 +141,11 @@ pub fn load_existing(config_path: &str) -> Option<SecretString> {
 }
 
 /// Reads an existing token file.
-fn load(path: &str) -> Result<SecretString, String> {
+///
+/// The reason comes back with it: a token file that is empty, or that another
+/// account can read, is a file an operator has to fix, and the fix is named
+/// in the reason.
+pub(crate) fn load(path: &str) -> Result<SecretString, String> {
     // A credential, so the same check that gates a key file gates this: a
     // token any account can read is not a token.
     check_credential_file_permissions(path).map_err(|e| e.to_string())?;
