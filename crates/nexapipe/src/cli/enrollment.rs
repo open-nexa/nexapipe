@@ -3,7 +3,8 @@
 
 use crate::Cli;
 
-use nexapipe::config::{ClientSecretWrite, ProxyConfig};
+use nexapipe::config::ClientSecretWrite;
+use nexapipe::storage::Storage;
 use nexapipe_proto::secret::SecretString;
 
 use super::config::{load_auth_config, toml_key};
@@ -12,11 +13,11 @@ use super::qr::render_qr;
 /// Prints everything needed to enroll a client in 2FA: the credentials, the
 /// standard `otpauth://` URI and a QR code carrying that URI, which the NexaPipe
 /// app and any third party authenticator app can import.
-pub(crate) fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
+pub(crate) async fn print_2fa_enrollment(cli: &Cli, storage: &dyn Storage) -> anyhow::Result<()> {
     use nexapipe::auth::OtpAuthUri;
     use nexapipe::auth::otpauth::DEFAULT_ISSUER;
 
-    let (auth_config, config_loaded) = load_auth_config(&cli.config);
+    let (auth_config, config_loaded) = load_auth_config(storage).await;
 
     // The QR code has to carry the secret the server will accept, so a client
     // that is already configured keeps the one it has: running --generate-2fa
@@ -38,7 +39,7 @@ pub(crate) fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
                 "client \"{}\" has no [auth.clients.{}] section in {}",
                 client_id,
                 toml_key(&client_id),
-                cli.config
+                storage.describe()
             )
         })?;
         (client_id, client.secret.clone(), false)
@@ -112,14 +113,17 @@ pub(crate) fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
     if generated {
         save_generated_secret(
             cli,
+            storage,
             &client_id,
             uri.secret.expose_secret(),
             auth_config.enabled,
-        );
+        )
+        .await;
     } else if cli.generate_2fa.is_some() {
         println!(
             "Client \"{}\" already has a secret in {}, so that is the one above:",
-            uri.client_id, cli.config
+            uri.client_id,
+            storage.describe()
         );
         println!("issuing a new one would enroll the app with credentials the server");
         println!("rejects. Pass --force to rotate it instead — the secret in the config");
@@ -128,7 +132,7 @@ pub(crate) fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
     } else {
         println!(
             "This secret already comes from {}, so the server needs no change.",
-            cli.config
+            storage.describe()
         );
         println!("Scanning the code above imports it into another app or device.");
     }
@@ -142,13 +146,21 @@ pub(crate) fn print_2fa_enrollment(cli: &Cli) -> anyhow::Result<()> {
 ///
 /// Failing is not fatal: the secret is on screen either way, the file may not
 /// exist yet or may not be writable, and the snippet can still be typed in.
-pub(super) fn save_generated_secret(cli: &Cli, client_id: &str, secret: &str, auth_enabled: bool) {
-    let outcome = ProxyConfig::write_client_secret(&cli.config, client_id, secret, cli.force);
+pub(super) async fn save_generated_secret(
+    cli: &Cli,
+    storage: &dyn Storage,
+    client_id: &str,
+    secret: &str,
+    auth_enabled: bool,
+) {
+    let outcome = storage
+        .write_client_secret(client_id, &SecretString::new(secret.to_string()), cli.force)
+        .await;
     let written = match outcome {
         Ok(ClientSecretWrite::Added) => {
             println!(
                 "Wrote the secret to {} as [auth.clients.{}].",
-                cli.config,
+                storage.describe(),
                 toml_key(client_id)
             );
             true
@@ -157,7 +169,7 @@ pub(super) fn save_generated_secret(cli: &Cli, client_id: &str, secret: &str, au
             println!(
                 "Replaced the secret of [auth.clients.{}] in {}: every device enrolled",
                 toml_key(client_id),
-                cli.config
+                storage.describe()
             );
             println!("with the old one has to scan again.");
             true
@@ -178,7 +190,7 @@ pub(super) fn save_generated_secret(cli: &Cli, client_id: &str, secret: &str, au
         eprintln!(
             "warning: [auth] enabled is not true in {}, so the server will not ask for this \
              secret; add enabled = true under [auth]",
-            cli.config
+            storage.describe()
         );
     }
     println!("The 2FA settings are read once at startup, so restart the server to pick");

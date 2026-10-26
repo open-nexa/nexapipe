@@ -49,8 +49,10 @@
 //! backend is chosen at run time.
 
 pub mod file;
+pub mod open;
 
 pub use file::FileStorage;
+pub use open::{choose, open};
 
 use crate::auth::state::RuntimeState;
 use crate::config::ClientSecretWrite;
@@ -67,6 +69,10 @@ use std::time::SystemTime;
 pub enum StorageKind {
     /// The configuration, the counters and the token as files beside each other.
     Toml,
+    /// The same three, in a SQLite database.
+    Sqlite,
+    /// The same three, in a PostgreSQL database.
+    Postgres,
 }
 
 impl StorageKind {
@@ -74,7 +80,34 @@ impl StorageKind {
     pub fn name(self) -> &'static str {
         match self {
             StorageKind::Toml => "toml",
+            StorageKind::Sqlite => "sqlite",
+            StorageKind::Postgres => "postgres",
         }
+    }
+
+    /// The spelling an operator writes on the command line or in the
+    /// environment.
+    ///
+    /// Refused rather than guessed: a store that is not the one the operator
+    /// asked for is a store that keeps the configuration somewhere they are not
+    /// looking.
+    pub fn parse(value: &str) -> anyhow::Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "toml" | "file" => Ok(StorageKind::Toml),
+            "sqlite" => Ok(StorageKind::Sqlite),
+            "postgres" | "postgresql" | "pg" => Ok(StorageKind::Postgres),
+            other => anyhow::bail!(
+                "{other:?} is not a storage backend; expected \"toml\", \"sqlite\" or \"postgres\""
+            ),
+        }
+    }
+}
+
+impl std::str::FromStr for StorageKind {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
     }
 }
 

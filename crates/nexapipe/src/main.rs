@@ -2,10 +2,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use nexapipe::config::{
     AdminConfig, EndpointIdentity, IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig,
 };
-use nexapipe::proxy::{ProxyOptions, run_local_proxy, run_proxy};
+use nexapipe::proxy::{Proxy, ProxyOptions, run_local_proxy};
 use nexapipe::routes::RoutingTable;
 use nexapipe::shutdown::{ShutdownSignal, wait_for_shutdown_signal};
-use nexapipe::storage::{FileStorage, Storage};
+use nexapipe::storage::{Storage, StorageKind};
 use nexapipe_proto::secret::SecretString;
 use std::sync::Arc;
 
@@ -53,6 +53,33 @@ enum QrFormat {
     None,
 }
 
+/// Which store the configuration is kept in.
+///
+/// The choice is the command line's, and the environment's when the command
+/// line does not make it: a deployment that cannot change how the binary is
+/// started — a compose file, a systemd unit — says it in the environment
+/// instead.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum StorageChoice {
+    /// A TOML file: the configuration, the counters and the token beside each
+    /// other.
+    Toml,
+    /// A SQLite database.
+    Sqlite,
+    /// A PostgreSQL database.
+    Postgres,
+}
+
+impl From<StorageChoice> for StorageKind {
+    fn from(choice: StorageChoice) -> Self {
+        match choice {
+            StorageChoice::Toml => StorageKind::Toml,
+            StorageChoice::Sqlite => StorageKind::Sqlite,
+            StorageChoice::Postgres => StorageKind::Postgres,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Cli {
@@ -70,6 +97,23 @@ struct Cli {
     // path they like.
     #[arg(short, long, default_value_t = compute_default_config(), global = true)]
     config: String,
+
+    /// Where the configuration is kept: a TOML file, a SQLite database or a
+    /// PostgreSQL one.
+    ///
+    /// The default is the file, and it is the default for the same reason it
+    /// always was: a deployment that says nothing about where its
+    /// configuration lives is a deployment with a `config.toml` next to it.
+    #[arg(long, value_enum, global = true)]
+    storage: Option<StorageChoice>,
+
+    /// The database the configuration is kept in: a connection string for
+    /// PostgreSQL, a file path for SQLite.
+    ///
+    /// `NEXAPIPE_STORAGE_URL` says the same thing when the command line
+    /// cannot.
+    #[arg(long, value_name = "URL", global = true)]
+    storage_url: Option<String>,
 
     #[arg(long, help = "Run in client local proxy mode")]
     local_proxy: bool,
@@ -276,12 +320,30 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    // The store the operator asked for. Opened per command rather than once
+    // here, because a command that never touches the configuration — asking
+    // for a key to paste, say — should not open a database to do it.
+    let open_store = || -> anyhow::Result<Arc<dyn Storage>> {
+        nexapipe::storage::choose(
+            cli.storage.map(Into::into),
+            cli.storage_url.clone(),
+            &cli.config,
+        )
+    };
+
     // `status` is handled before anything that loads the config for a *start*:
     // it is the only command that runs against another process, and it has to
     // work while that process holds the config. It reads the same file, read
     // only, for the address and the token.
     if let Some(Commands::Status { json }) = &cli.command {
-        if let Err(e) = nexapipe::status::status(&cli.config, *json).await {
+        let store = match open_store() {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = nexapipe::status::status(store.as_ref(), *json).await {
             eprintln!("Error: {e:#}");
             std::process::exit(1);
         }
@@ -313,7 +375,14 @@ async fn main() {
 
     // Handle --generate-2fa / --show-2fa
     if cli.generate_2fa.is_some() || cli.show_2fa.is_some() {
-        if let Err(e) = cli::print_2fa_enrollment(&cli) {
+        let store = match open_store() {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = cli::print_2fa_enrollment(&cli, store.as_ref()).await {
             eprintln!("Error: {e:#}");
             std::process::exit(1);
         }
@@ -322,7 +391,14 @@ async fn main() {
 
     // Handle --generate-invite
     if cli.generate_invite.is_some() {
-        if let Err(e) = cli::print_endpoint_invite(&cli) {
+        let store = match open_store() {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
+        };
+        if let Err(e) = cli::print_endpoint_invite(&cli, store.as_ref()).await {
             eprintln!("Error: {e:#}");
             std::process::exit(1);
         }
@@ -334,22 +410,33 @@ async fn main() {
     // below because it does not start a proxy: a `revoke` has to work while one
     // is running, and it takes the same lock the server does.
     if let Some(Commands::Client { action }) = &cli.command {
+        let store = match open_store() {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
+        };
         let outcome = match action {
-            ClientAction::List { json } => cli::list_clients(&cli, *json),
+            ClientAction::List { json } => cli::list_clients(store.as_ref(), *json).await,
             ClientAction::Add {
                 client_id,
                 device,
                 public_key,
                 force,
-            } => cli::add_client(
-                &cli,
-                client_id,
-                device.as_deref(),
-                public_key.as_deref(),
-                *force,
-            ),
+            } => {
+                cli::add_client(
+                    &cli,
+                    store.as_ref(),
+                    client_id,
+                    device.as_deref(),
+                    public_key.as_deref(),
+                    *force,
+                )
+                .await
+            }
             ClientAction::Revoke { client_id, device } => {
-                cli::revoke_client(&cli, client_id, device.as_deref())
+                cli::revoke_client(store.as_ref(), client_id, device.as_deref()).await
             }
         };
         if let Err(e) = outcome {
@@ -362,7 +449,13 @@ async fn main() {
     // Where the configuration is kept. A file today; a database tomorrow, and
     // the difference is one line here rather than a path threaded through the
     // whole server.
-    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(&cli.config));
+    let storage: Arc<dyn Storage> = match open_store() {
+        Ok(storage) => storage,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
+    };
 
     // A first start with no config file gets a minimal one written for it,
     // rather than a refusal to start with nothing to act on. Server mode only:
@@ -565,11 +658,12 @@ async fn run_server_mode(
         }
     };
 
-    if let Err(e) = run_proxy(
-        route_config,
-        storage,
-        shutdown_signal.clone(),
-        ProxyOptions {
+    // The proxy, assembled: the store it keeps its configuration in, the
+    // routing table it serves, and the rest of the configuration.
+    let proxy = match Proxy::builder()
+        .routes(route_config)
+        .storage(storage)
+        .options(ProxyOptions {
             server: server_config,
             iroh: iroh_config,
             auth: auth_config,
@@ -579,14 +673,22 @@ async fn run_server_mode(
             metrics: metrics_config,
             backends: proxy_config.backends.clone(),
             limits: proxy_config.limits,
-            // The credentials in the configuration file are what this build
-            // checks. A build that keeps its credentials somewhere else hands
-            // its own authenticator in here instead.
+            // The credentials in the configuration are what this build checks.
+            // A build that keeps its credentials somewhere else hands its own
+            // authenticator in here instead.
             authenticator: None,
-        },
-    )
-    .await
+        })
+        .shutdown_signal(shutdown_signal.clone())
+        .build()
     {
+        Ok(proxy) => proxy,
+        Err(e) => {
+            tracing::error!("{}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = proxy.run().await {
         // The alternate form prints the whole chain, so the cause reaches the
         // log and not only the outermost context — an operator who wrote
         // `discovery = "off"` has to see which value was wrong, not just that

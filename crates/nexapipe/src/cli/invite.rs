@@ -6,6 +6,7 @@ use crate::Cli;
 use iroh::SecretKey;
 use nexapipe::auth::AuthConfig;
 use nexapipe::config::ProxyConfig;
+use nexapipe::storage::Storage;
 use nexapipe_client::relay::RelayModeSpec;
 use nexapipe_proto::secret::SecretString;
 
@@ -20,13 +21,13 @@ use super::qr::render_qr;
 /// key the server starts with, so the printed code stays valid across restarts;
 /// without it the endpoint ID would change on every start and the code would be
 /// worthless, so the flag is required instead of silently printing a throwaway.
-pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
+pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> anyhow::Result<()> {
     use nexapipe_client::auth::TotpAlgorithm;
     use nexapipe_client::provisioning::{
         EndpointInvite, EndpointTarget, InviteEnrollment, InviteTotp, RECOMMENDED_URI_LIMIT,
     };
 
-    let (proxy_config, auth_config, config_loaded) = load_config_pair(&cli.config);
+    let (proxy_config, auth_config, config_loaded) = load_config_pair(storage).await;
 
     let target = match &cli.endpoint_id {
         Some(id) => EndpointTarget::node_id_target(id)?,
@@ -43,13 +44,16 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
                     anyhow::anyhow!(
                         "no endpoint identity in {}: set [iroh] secret_key \
                          (see `nexapipe --generate-secret`) or pass --endpoint-id",
-                        cli.config
+                        storage.describe()
                     )
                 })?;
             let public: iroh::PublicKey = secret_key
                 .parse::<SecretKey>()
                 .map_err(|e| {
-                    anyhow::anyhow!("[iroh] secret_key in {} is invalid ({e})", cli.config)
+                    anyhow::anyhow!(
+                        "[iroh] secret_key in {} is invalid ({e})",
+                        storage.describe()
+                    )
                 })?
                 .public();
             EndpointTarget::node_id_target(&public.to_string())?
@@ -114,7 +118,9 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
         let (secret, created) = match auth_config.clients.get(client_id) {
             Some(client) => (client.secret.clone(), false),
             None if cli.create_client => (
-                SecretString::new(create_client_for_invite(cli, client_id, &auth_config)?),
+                SecretString::new(
+                    create_client_for_invite(storage, client_id, &auth_config).await?,
+                ),
                 true,
             ),
             None => {
@@ -131,7 +137,7 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
                      pass --create-client to make one now, or run --generate-2fa {} first",
                     client_id,
                     toml_key(client_id),
-                    cli.config,
+                    storage.describe(),
                     known,
                     client_id
                 )
@@ -166,13 +172,16 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
             // and generating a second one is how a link that went astray is
             // revoked — the old token is replaced, not added to.
             let token = nexapipe::auth::generate_enrollment_token();
-            ProxyConfig::write_pending_enrollment(&cli.config, client_id, &token).map_err(|e| {
-                anyhow::anyhow!(
-                    "could not record the enrollment token in {} ({e}); without it the \
+            storage
+                .write_pending_enrollment(client_id, &SecretString::new(token.clone()))
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "could not record the enrollment token in {} ({e}); without it the \
                      invite would be refused on first connect",
-                    cli.config
-                )
-            })?;
+                        storage.describe()
+                    )
+                })?;
             let enrollment = InviteEnrollment::new(client_id, &token)?;
             enrolled_client = Some(client_id.to_string());
             // Whether the token was asked for or is the default for a client
@@ -238,7 +247,7 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
     if !config_loaded {
         println!(
             "              ({} was not read, built-in defaults used)",
-            cli.config
+            storage.describe()
         );
     }
     println!();
@@ -254,13 +263,13 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
         eprintln!(
             "warning: [auth] enabled is false in {}, so the server never runs the 2FA \
              handshake and the enrollment token in this invite can never be exchanged",
-            cli.config
+            storage.describe()
         );
     } else if two_factor_enabled && !auth_config.enabled {
         eprintln!(
             "warning: [auth] enabled is false in {}, so the server will not ask for \
              these credentials even though the invite configures the app to send them",
-            cli.config
+            storage.describe()
         );
     }
     if invite.domains.is_empty() {
@@ -312,7 +321,7 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
                 "warning: the one-time enrollment form was not used for this client because \
                  [auth] enabled is false in {}, so the server never runs the 2FA handshake and \
                  an enrollment token could never be exchanged",
-                cli.config
+                storage.describe()
             );
         }
     }
@@ -382,24 +391,27 @@ pub(crate) fn print_endpoint_invite(cli: &Cli) -> anyhow::Result<()> {
 /// riding on the file; an invite with `--create-client` is a promise that the
 /// server will recognise the client, so a secret that never reached the disk
 /// would produce a link that is refused on first connect.
-fn create_client_for_invite(
-    cli: &Cli,
+async fn create_client_for_invite(
+    storage: &dyn Storage,
     client_id: &str,
     auth_config: &AuthConfig,
 ) -> anyhow::Result<String> {
     let secret = nexapipe::auth::TotpValidator::generate_secret();
-    ProxyConfig::write_client_secret(&cli.config, client_id, &secret, false).map_err(|e| {
-        anyhow::anyhow!(
-            "could not create client \"{client_id}\" in {} ({e}); without the section there \
-             is nothing for the invite to authenticate against",
-            cli.config
-        )
-    })?;
+    storage
+        .write_client_secret(client_id, &SecretString::new(secret.clone()), false)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "could not create client \"{client_id}\" in {} ({e}); without the section there \
+                 is nothing for the invite to authenticate against",
+                storage.describe()
+            )
+        })?;
 
     println!(
         "Created [auth.clients.{}] in {} with a newly generated secret.",
         toml_key(client_id),
-        cli.config
+        storage.describe()
     );
     // Same warning `--generate-2fa` prints: the secret on disk is worthless
     // until the server is allowed to ask for it.
@@ -407,7 +419,7 @@ fn create_client_for_invite(
         eprintln!(
             "warning: [auth] enabled is not true in {}, so the server will not ask for this \
              secret; add enabled = true under [auth]",
-            cli.config
+            storage.describe()
         );
     }
     println!("The 2FA settings are read once at startup, so restart the server before the");
