@@ -48,4 +48,17 @@ regexes = [
     # branch's history still carries it, and the scan reads the commits a pull
     # request adds as well as the tree it ends at.
     '''^fedcba9876543210$''',
+
+    # `a_key_device_stores_the_public_half`
+    # (crates/nexapipe/tests/storage_backends.rs) gave a device a public key to
+    # register. It is a fixture and not a credential: the test writes it into a
+    # configuration and reads it back, and the key is the public half of a pair
+    # whose private half was never anywhere.
+    #
+    # It no longer appears in the tree — a later commit replaced it with a key
+    # the test generates, because a key has to be a point on the curve and a
+    # written-out string need not be — but this branch's history still carries
+    # it, and the scan reads the commits a pull request adds as well as the tree
+    # it ends at.
+    '''^0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef$''',
 ]
