@@ -5,6 +5,7 @@ use nexapipe::config::{
 use nexapipe::proxy::{ProxyOptions, run_local_proxy, run_proxy};
 use nexapipe::routes::RoutingTable;
 use nexapipe::shutdown::{ShutdownSignal, wait_for_shutdown_signal};
+use nexapipe::storage::{FileStorage, Storage};
 use nexapipe_proto::secret::SecretString;
 use std::sync::Arc;
 
@@ -358,6 +359,11 @@ async fn main() {
         return;
     }
 
+    // Where the configuration is kept. A file today; a database tomorrow, and
+    // the difference is one line here rather than a path threaded through the
+    // whole server.
+    let storage: Arc<dyn Storage> = Arc::new(FileStorage::new(&cli.config));
+
     // A first start with no config file gets a minimal one written for it,
     // rather than a refusal to start with nothing to act on. Server mode only:
     // `--local-proxy` reads the same path as a *client* config, and the file
@@ -369,7 +375,10 @@ async fn main() {
     // output through the log channel rather than raw stdout, and the tracing
     // subscriber is not installed yet at this point.
     let config_just_generated = if !cli.local_proxy {
-        match nexapipe::config::ensure_config_file(&cli.config) {
+        match storage
+            .ensure_config(nexapipe::config::FIRST_RUN_CONFIG)
+            .await
+        {
             Ok(true) => true,
             Ok(false) => false,
             Err(e) => {
@@ -381,7 +390,7 @@ async fn main() {
         false
     };
 
-    let proxy_config = match ProxyConfig::from_file(&cli.config) {
+    let proxy_config = match nexapipe::config::load_config(storage.as_ref()).await {
         Ok(config) => config,
         Err(e) => {
             eprintln!("Failed to load config: {}", e);
@@ -408,7 +417,7 @@ async fn main() {
     let identity = if cli.local_proxy {
         None
     } else {
-        match ProxyConfig::ensure_iroh_secret_key(&cli.config, &proxy_config) {
+        match nexapipe::storage::ensure_endpoint_identity(storage.as_ref(), &proxy_config).await {
             Ok(identity) => Some(identity),
             Err(e) => {
                 tracing::error!("{}", e);
@@ -447,13 +456,7 @@ async fn main() {
     if cli.local_proxy {
         run_local_proxy_mode(&proxy_config, &shutdown_signal).await;
     } else {
-        run_server_mode(
-            &proxy_config,
-            &cli.config,
-            identity.as_ref(),
-            &shutdown_signal,
-        )
-        .await;
+        run_server_mode(&proxy_config, storage, identity.as_ref(), &shutdown_signal).await;
     }
 
     // The server mode has already drained its connections by the time it
@@ -463,7 +466,7 @@ async fn main() {
 
 async fn run_server_mode(
     proxy_config: &ProxyConfig,
-    config_path: &str,
+    storage: Arc<dyn Storage>,
     identity: Option<&EndpointIdentity>,
     shutdown_signal: &Arc<ShutdownSignal>,
 ) {
@@ -508,7 +511,7 @@ async fn run_server_mode(
     tracing::info!("Starting proxy with domain-based and path-based routing");
 
     // Load 2FA auth config
-    let auth_config = match ProxyConfig::load_with_auth(config_path) {
+    let auth_config = match nexapipe::config::load_config_with_auth(storage.as_ref()).await {
         Ok((_, auth_cfg)) => {
             if let Some(ref cfg) = auth_cfg {
                 if cfg.enabled {
@@ -540,11 +543,9 @@ async fn run_server_mode(
     // Called whether or not the file has an `[auth]` section: the `[iroh]`
     // half is a credential on its own, and `config.toml.example` — like the
     // generated first-run template — has no `[auth]` at all.
-    nexapipe::config::warn_about_readable_credentials(
-        std::path::Path::new(config_path),
-        proxy_config,
-        auth_config.as_ref(),
-    );
+    if let Some(path) = storage.credential_file() {
+        nexapipe::config::warn_about_readable_credentials(path, proxy_config, auth_config.as_ref());
+    }
 
     // The `[peers]` allow-list. A malformed entry is fatal rather than dropped:
     // a list whose whole purpose is to refuse strangers must not silently come
@@ -566,7 +567,7 @@ async fn run_server_mode(
 
     if let Err(e) = run_proxy(
         route_config,
-        config_path,
+        storage,
         shutdown_signal.clone(),
         ProxyOptions {
             server: server_config,

@@ -7,6 +7,7 @@
 use nexapipe_proto::secret::SecretString;
 use std::collections::HashMap;
 use std::fs;
+use std::path::Path;
 
 /// Every field of the spec reaches the route.
 ///
@@ -1497,13 +1498,13 @@ fn a_second_writer_sees_the_first_one_s_edit() {
     let first = {
         let path = path.clone();
         std::thread::spawn(move || {
-            with_config_lock(&path, || {
+            crate::storage::file::with_lock(Path::new(&path), || {
                 // Reads, then sits on the lock long enough that an unlocked
                 // second writer would have read the old value too.
                 let content = fs::read_to_string(&path)?;
                 assert_eq!(content.trim(), "counter = 0");
                 std::thread::sleep(std::time::Duration::from_millis(150));
-                write_config_file(&path, "counter = 1\n")
+                crate::storage::file::write_file(Path::new(&path), "counter = 1\n")
             })
             .expect("the first writer succeeds")
         })
@@ -1512,9 +1513,9 @@ fn a_second_writer_sees_the_first_one_s_edit() {
     // Let the first one take the lock before the second asks for it.
     std::thread::sleep(std::time::Duration::from_millis(25));
 
-    let seen = with_config_lock(&path, || {
+    let seen = crate::storage::file::with_lock(Path::new(&path), || {
         let content = fs::read_to_string(&path)?;
-        write_config_file(&path, "counter = 2\n")?;
+        crate::storage::file::write_file(Path::new(&path), "counter = 2\n")?;
         Ok(content)
     })
     .expect("the second writer succeeds");
@@ -1534,7 +1535,7 @@ fn a_second_writer_sees_the_first_one_s_edit() {
 }
 
 /// A config of TOTP secrets must not be readable by another account, and
-/// not only once the write has finished: `write_config_file` used to create
+/// not only once the write has finished: the config writer used to create
 /// the replacement under the umask and chmod it to 0600 *after* flushing the
 /// secrets to disk, so a local user reading it in that window got every
 /// TOTP seed in the file. The mode now goes into the call that creates it.
@@ -1542,7 +1543,8 @@ fn a_second_writer_sees_the_first_one_s_edit() {
 #[test]
 fn a_written_config_is_private_to_its_owner() {
     let (_dir, path) = scratch_config("counter = 0\n");
-    write_config_file(&path, "counter = 1\n").expect("the write succeeds");
+    crate::storage::file::write_file(Path::new(&path), "counter = 1\n")
+        .expect("the write succeeds");
 
     use std::os::unix::fs::PermissionsExt;
     let mode = fs::metadata(&path)
@@ -1571,7 +1573,8 @@ fn a_config_reached_through_a_symlink_is_the_one_that_changes() {
     std::os::unix::fs::symlink(&real, &link).expect("create the link");
 
     let path = link.to_str().expect("utf-8 path").to_string();
-    write_config_file(&path, "counter = 1\n").expect("the write succeeds");
+    crate::storage::file::write_file(Path::new(&path), "counter = 1\n")
+        .expect("the write succeeds");
 
     assert!(
         fs::symlink_metadata(&link)
@@ -3061,8 +3064,10 @@ fn a_config_that_goes_through_the_helpers_comes_back_unchanged() {
                   relay_mode = \"pinned\"\n";
     let (_dir, path) = scratch_config(source);
 
-    let document = read_config_document(&path, "nothing written").expect("the config parses");
-    write_config_document(&path, document).expect("the config is written");
+    let document = crate::storage::file::read_document(Path::new(&path), "nothing written")
+        .expect("the config parses");
+    crate::storage::file::write_document(Path::new(&path), document)
+        .expect("the config is written");
 
     let written = fs::read_to_string(&path).expect("the config is still there");
     assert_eq!(written, source, "the file did not come back unchanged");

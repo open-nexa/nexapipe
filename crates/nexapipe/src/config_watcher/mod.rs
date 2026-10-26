@@ -1,15 +1,14 @@
 use crate::auth::{AuthConfig, ClientAuth};
-use crate::config::ProxyConfig;
 use crate::conn::AuthState;
 use crate::conn::peers::PeerRegistry;
 use crate::conn::persist_auth_state;
 use crate::health::HealthProbes;
 use crate::proxy::{BackendClients, sync_health_checks};
 use crate::routes::RoutingTable;
+use crate::storage::{Stamp, Storage};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::fs;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
@@ -34,7 +33,12 @@ use tokio::time::Instant;
 /// (for connections opened after it), and is refused when it would turn 2FA
 /// *off*. See `ConfigWatcher::apply_auth_enabled`.
 pub struct ConfigWatcher {
-    config_path: String,
+    /// Where the configuration is kept, and how it is read.
+    ///
+    /// A store rather than a path: the watcher asks the store what it looks
+    /// like now, and a store that is not a file answers with a counter
+    /// instead of a modification time.
+    storage: Arc<dyn Storage>,
     route_config: Arc<RoutingTable>,
     clients: Arc<BackendClients>,
     /// Health probes already running, and the pool each one is watching, so a
@@ -98,8 +102,8 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(300);
 /// and what to do about a load that failed.
 #[derive(Debug, Clone, Copy)]
 struct WatchState {
-    /// The file as it was when it was last loaded.
-    loaded: FileStamp,
+    /// The store as it was when it was last loaded.
+    loaded: Stamp,
     /// When a failed load may be tried again.
     retry_at: Instant,
     /// How long the next wait is. Doubles after every failure.
@@ -107,7 +111,7 @@ struct WatchState {
 }
 
 impl WatchState {
-    fn new(loaded: FileStamp, now: Instant) -> Self {
+    fn new(loaded: Stamp, now: Instant) -> Self {
         Self {
             loaded,
             retry_at: now,
@@ -115,7 +119,7 @@ impl WatchState {
         }
     }
 
-    /// Whether the file as it is now should be loaded.
+    /// Whether the store as it is now should be loaded.
     ///
     /// The stamp is compared as a whole, and **neither half has to be
     /// newer**: the time *or* the length being different is enough. A file
@@ -124,12 +128,12 @@ impl WatchState {
     /// twice inside one second has the same time and a different length.
     ///
     /// A file that failed to load is tried again once the backoff says so.
-    fn should_load(&self, current: FileStamp, now: Instant) -> bool {
+    fn should_load(&self, current: Stamp, now: Instant) -> bool {
         current != self.loaded && now >= self.retry_at
     }
 
     /// The file was loaded: this is the one to compare against next time.
-    fn loaded(&mut self, current: FileStamp, now: Instant) {
+    fn loaded(&mut self, current: Stamp, now: Instant) {
         self.loaded = current;
         self.retry_at = now;
         self.retry_delay = Duration::ZERO;
@@ -148,40 +152,9 @@ impl WatchState {
     }
 }
 
-/// What the file looked like the last time it was read.
-///
-/// The length is here as well as the time, for the two reasons the state's
-/// own comment gives: a file written twice inside one second has the same
-/// time and a different length, and a file that replaced another one can be
-/// older.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileStamp {
-    modified: std::time::SystemTime,
-    len: u64,
-}
-
-impl FileStamp {
-    /// The stamp of a file that has not been loaded yet.
-    const UNKNOWN: Self = Self {
-        modified: std::time::SystemTime::UNIX_EPOCH,
-        len: 0,
-    };
-
-    /// The stamp of the file as it is now.
-    async fn read(path: &str) -> std::io::Result<Self> {
-        let metadata = fs::metadata(path).await?;
-        Ok(Self {
-            modified: metadata
-                .modified()
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH),
-            len: metadata.len(),
-        })
-    }
-}
-
 impl ConfigWatcher {
     pub fn new(
-        config_path: String,
+        storage: Arc<dyn Storage>,
         route_config: Arc<RoutingTable>,
         clients: Arc<BackendClients>,
         health_probes: Arc<Mutex<HealthProbes>>,
@@ -190,7 +163,7 @@ impl ConfigWatcher {
         peers: Arc<PeerRegistry>,
     ) -> Self {
         ConfigWatcher {
-            config_path,
+            storage,
             route_config,
             clients,
             health_probes,
@@ -208,25 +181,23 @@ impl ConfigWatcher {
     }
 
     pub async fn start_watch(&self) {
-        // The asynchronous one, like the check below: a synchronous
-        // `std::fs::metadata` in an async function blocks the runtime's
-        // thread, and the runtime has few of them.
         let mut state = WatchState::new(
-            FileStamp::read(&self.config_path)
+            // A store that is not there yet is a store that has not been
+            // loaded: the first tick loads it, whatever its stamp says.
+            self.storage
+                .stamp()
                 .await
-                // A file that is not there yet is a file that has not been
-                // loaded: the first tick loads it, whatever its time says.
-                .unwrap_or(FileStamp::UNKNOWN),
+                .unwrap_or_else(|_| Stamp::unknown()),
             Instant::now(),
         );
 
         loop {
             tokio::time::sleep(POLL_INTERVAL).await;
 
-            let current = match FileStamp::read(&self.config_path).await {
+            let current = match self.storage.stamp().await {
                 Ok(current) => current,
                 Err(e) => {
-                    tracing::warn!("Failed to check config file: {}", e);
+                    tracing::warn!("Failed to check the configuration: {}", e);
                     continue;
                 }
             };
@@ -274,41 +245,32 @@ impl ConfigWatcher {
         // while the file is being read is what the merge has to notice.
         let epoch = self.auth.as_ref().map(|s| s.enroll_epoch()).unwrap_or(0);
 
-        // **One read for both halves.** The file is read once and parsed once,
+        // **One read for both halves.** The store is read once and parsed once,
         // so the routes and the 2FA clients come from the same revision of it.
         // Two reads could hand the two halves two different revisions, and a
         // change made between them would be half-applied.
         //
-        // The read and the parse are synchronous, so they happen on a
-        // blocking thread: the worker this runs on is not parked in `read(2)`
-        // while every other task queued behind it waits for the disk.
-        let config_path = self.config_path.clone();
-        let loaded =
-            tokio::task::spawn_blocking(move || ProxyConfig::load_with_auth(&config_path)).await;
-        let (new_config, new_auth) = match loaded {
-            Ok(Ok((config, auth))) => (config, auth),
-            Ok(Err(e)) => {
-                tracing::error!("Config not reloaded, keeping the current routes: {}", e);
-                return false;
-            }
-            Err(e) => {
-                tracing::error!(
-                    "Config not reloaded, keeping the current routes: the read did not run: {}",
-                    e
-                );
-                return false;
-            }
-        };
+        // The read is the store's own: a file is read on a blocking thread, a
+        // database answers when it answers, and neither parks the runtime
+        // while it waits.
+        let (new_config, new_auth) =
+            match crate::config::load_config_with_auth(self.storage.as_ref()).await {
+                Ok(loaded) => loaded,
+                Err(e) => {
+                    tracing::error!("Config not reloaded, keeping the current routes: {}", e);
+                    return false;
+                }
+            };
 
         // The same warning the startup path gives. It does not need the auth
         // half to exist: a reload can bring in an inline `[iroh]` credential
         // on a file with no `[auth]` section at all, and that is a credential
         // in the open just the same.
-        crate::config::warn_about_readable_credentials(
-            std::path::Path::new(&self.config_path),
-            &new_config,
-            new_auth.as_ref(),
-        );
+        //
+        // A store that is not a file has no mode to check, and says so.
+        if let Some(path) = self.storage.credential_file() {
+            crate::config::warn_about_readable_credentials(path, &new_config, new_auth.as_ref());
+        }
 
         // Ahead of the routes, and on the same footing as them: a new
         // `[auth.clients]` entry is a change an operator makes while the server
@@ -416,26 +378,14 @@ impl ConfigWatcher {
                     return false;
                 }
 
-                // Read the file again — outside the lock — and sample the
+                // Read the store again — outside the lock — and sample the
                 // epoch again before it, so the same check covers this read.
                 epoch = state.enroll_epoch();
-                let config_path = self.config_path.clone();
-                let loaded =
-                    tokio::task::spawn_blocking(move || ProxyConfig::load_with_auth(&config_path))
-                        .await;
-                match loaded {
-                    Ok(Ok((_proxy, auth))) => snapshot = auth,
-                    Ok(Err(e)) => {
-                        tracing::error!(
-                            "2FA clients not reloaded, keeping the current ones: {}",
-                            e
-                        );
-                        return false;
-                    }
+                match crate::config::load_config_with_auth(self.storage.as_ref()).await {
+                    Ok((_proxy, auth)) => snapshot = auth,
                     Err(e) => {
                         tracing::error!(
-                            "2FA clients not reloaded, keeping the current ones: the read did not \
-                             run: {}",
+                            "2FA clients not reloaded, keeping the current ones: {}",
                             e
                         );
                         return false;
@@ -620,7 +570,7 @@ impl ConfigWatcher {
             {
                 tracing::warn!(
                     "2FA: failed to persist the reset enrollment counters to {}: {}",
-                    state.state_path(),
+                    state.storage().describe(),
                     e
                 );
             }
@@ -756,16 +706,25 @@ pub type SharedConfigWatcher = Arc<ConfigWatcher>;
 /// enrollment tokens stay where they are, and a client or device that the
 /// configuration does not have is not written: the operator may have removed
 /// it while the server was running.
+pub async fn save_auth_state_to(storage: &dyn Storage, config: &AuthConfig) -> anyhow::Result<()> {
+    // The whole read-modify-write runs under the store's own lock, not just the
+    // write: two counter writebacks that both read first would each build
+    // their document from the state as it was before the other one landed, and
+    // one set of counters would be lost.
+    storage
+        .put_state(&crate::auth::state::snapshot(config))
+        .await
+}
+
+/// Writes the counters to the state file at `path`.
+///
+/// The path-based twin of [`save_auth_state_to`], for a caller that names the
+/// file rather than the store: the state file beside the configuration, which
+/// is where the counters live.
 pub fn save_auth_state(path: &str, config: &AuthConfig) -> anyhow::Result<()> {
-    // The whole read-modify-write runs under the lock, not just the write: two
-    // counter writebacks that both read first would each build their document
-    // from the file as it was before the other one landed, and one set of
-    // counters would be lost.
-    crate::config::with_config_lock(path, || {
-        crate::auth::state::save(
-            std::path::Path::new(path),
-            &crate::auth::state::snapshot(config),
-        )
+    let path = std::path::Path::new(path);
+    crate::storage::file::with_lock(path, || {
+        crate::auth::state::save(path, &crate::auth::state::snapshot(config))
     })
 }
 

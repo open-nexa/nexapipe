@@ -403,7 +403,7 @@ impl Authenticator for ConfigAuthenticator {
                 tracing::warn!(
                     "2FA: failed to persist the auth counters for '{}' to {}: {}",
                     client_id,
-                    ctx.state.state_path(),
+                    ctx.state.storage().describe(),
                     e
                 );
             }
@@ -486,7 +486,10 @@ mod tests {
             .join("config.toml")
             .to_string_lossy()
             .into_owned();
-        let state = AuthState::new(config, path);
+        let state = AuthState::new(
+            config,
+            std::sync::Arc::new(crate::storage::file::FileStorage::new(path)),
+        );
         (dir, state)
     }
 
@@ -696,7 +699,11 @@ mod tests {
             .join("config.toml")
             .to_string_lossy()
             .into_owned();
-        let state = AuthState::with_authenticator(auth_config(), path, Arc::new(AlwaysRefuses));
+        let state = AuthState::with_authenticator(
+            auth_config(),
+            std::sync::Arc::new(crate::storage::file::FileStorage::new(path)),
+            Arc::new(AlwaysRefuses),
+        );
 
         let registration = registration();
         let register = move |identity: PeerIdentity| registration.register(identity);

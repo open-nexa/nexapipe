@@ -10,7 +10,7 @@ use super::*;
 fn a_file_written_twice_inside_one_second_is_a_change() {
     let time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
     let state = WatchState::new(
-        FileStamp {
+        Stamp::File {
             modified: time,
             len: 10,
         },
@@ -20,7 +20,7 @@ fn a_file_written_twice_inside_one_second_is_a_change() {
 
     assert!(
         !state.should_load(
-            FileStamp {
+            Stamp::File {
                 modified: time,
                 len: 10
             },
@@ -30,7 +30,7 @@ fn a_file_written_twice_inside_one_second_is_a_change() {
     );
     assert!(
         state.should_load(
-            FileStamp {
+            Stamp::File {
                 modified: time,
                 len: 11
             },
@@ -47,7 +47,7 @@ fn an_older_file_is_still_a_change() {
     let older = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(50);
     let newer = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
     let state = WatchState::new(
-        FileStamp {
+        Stamp::File {
             modified: newer,
             len: 10,
         },
@@ -56,7 +56,7 @@ fn an_older_file_is_still_a_change() {
 
     assert!(
         state.should_load(
-            FileStamp {
+            Stamp::File {
                 modified: older,
                 len: 10
             },
@@ -75,14 +75,14 @@ fn an_older_file_is_still_a_change() {
 fn a_failed_load_is_tried_again() {
     let time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
     let mut state = WatchState::new(
-        FileStamp {
+        Stamp::File {
             modified: time,
             len: 10,
         },
         Instant::now(),
     );
     let now = Instant::now();
-    let half_written = FileStamp {
+    let half_written = Stamp::File {
         modified: time,
         len: 11,
     };
@@ -111,7 +111,7 @@ fn a_failed_load_is_tried_again() {
 fn the_retry_backoff_grows_and_is_capped() {
     let time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
     let mut state = WatchState::new(
-        FileStamp {
+        Stamp::File {
             modified: time,
             len: 10,
         },
@@ -145,11 +145,11 @@ fn the_retry_backoff_grows_and_is_capped() {
 #[test]
 fn a_loaded_file_is_not_loaded_again() {
     let time = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(100);
-    let stamp = FileStamp {
+    let stamp = Stamp::File {
         modified: time,
         len: 10,
     };
-    let mut state = WatchState::new(FileStamp::UNKNOWN, Instant::now());
+    let mut state = WatchState::new(Stamp::unknown(), Instant::now());
     let now = Instant::now();
 
     assert!(
@@ -166,6 +166,7 @@ fn a_loaded_file_is_not_loaded_again() {
 
 use crate::auth::{ClientAuth, DeviceAuth};
 use crate::conn::peers::PeerIdentity;
+use crate::storage::{FileStorage, Storage};
 use nexapipe_proto::secret::SecretString;
 
 fn client(secret: &str) -> ClientAuth {
@@ -367,6 +368,14 @@ fn config_with(clients: &[(&str, ClientAuth)]) -> AuthConfig {
 }
 
 /// A watcher over a config file, with the 2FA state it guards.
+/// The store a test reads and writes through.
+///
+/// A file today; the point of the tests below is that they would not have to
+/// change when the store is not one.
+fn store(path: &str) -> Arc<dyn Storage> {
+    Arc::new(FileStorage::new(path))
+}
+
 fn watcher_for(state: AuthState, path: &str) -> ConfigWatcher {
     watcher_with_peers(state, path, Arc::new(PeerRegistry::new()))
 }
@@ -379,7 +388,7 @@ fn watcher_for(state: AuthState, path: &str) -> ConfigWatcher {
 /// only visible from the registry the reload closes through.
 fn watcher_with_peers(state: AuthState, path: &str, peers: Arc<PeerRegistry>) -> ConfigWatcher {
     ConfigWatcher::new(
-        path.to_string(),
+        store(path),
         Arc::new(RoutingTable::new(Vec::new())),
         Arc::new(
             crate::http::BackendClients::new(crate::config::Timeouts::default().connect, None)
@@ -437,7 +446,7 @@ async fn a_snapshot_is_merged_without_reading_the_file() {
     .unwrap();
     let path = path.to_str().unwrap().to_string();
 
-    let state = AuthState::new(AuthConfig::default(), &path);
+    let state = AuthState::new(AuthConfig::default(), store(&path));
     let watcher = watcher_for(state.clone(), &path);
 
     watcher
@@ -483,7 +492,7 @@ async fn a_snapshot_an_enrollment_made_stale_is_read_again() {
     .unwrap();
     let path = path.to_str().unwrap().to_string();
 
-    let state = AuthState::new(AuthConfig::default(), &path);
+    let state = AuthState::new(AuthConfig::default(), store(&path));
     let watcher = watcher_for(state.clone(), &path);
 
     // An enrollment lands after the snapshot was taken: the epoch moves.
@@ -531,7 +540,7 @@ async fn a_reload_whose_second_read_fails_is_tried_again() {
     .unwrap();
     let path = path.to_str().unwrap().to_string();
 
-    let state = AuthState::new(AuthConfig::default(), &path);
+    let state = AuthState::new(AuthConfig::default(), store(&path));
     let watcher = watcher_for(state.clone(), &path);
 
     // The snapshot is stale, so the reload reads again — and there is
@@ -569,7 +578,7 @@ async fn a_reload_applies_both_halves_of_one_read() {
     .unwrap();
     let path = path.to_str().unwrap().to_string();
 
-    let state = AuthState::new(AuthConfig::default(), &path);
+    let state = AuthState::new(AuthConfig::default(), store(&path));
     let watcher = watcher_for(state.clone(), &path);
 
     watcher.reload_config().await;
@@ -763,7 +772,7 @@ async fn a_rotated_invite_starts_with_its_own_budget() {
         crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
     let state = AuthState::new(
         auth.expect("the config declares an [auth] section"),
-        &path_str,
+        store(&path_str),
     );
     let watcher = watcher_for(state.clone(), &path_str);
 
@@ -815,7 +824,7 @@ async fn a_rotated_invite_leaves_nothing_for_the_next_start() {
         crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
     let state = AuthState::new(
         auth.expect("the config declares an [auth] section"),
-        &path_str,
+        store(&path_str),
     );
     let watcher = watcher_for(state.clone(), &path_str);
 
@@ -867,7 +876,7 @@ async fn an_unchanged_token_keeps_its_live_counters() {
         crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
     let state = AuthState::new(
         auth.expect("the config declares an [auth] section"),
-        &path_str,
+        store(&path_str),
     );
     let watcher = watcher_for(state.clone(), &path_str);
 
@@ -918,7 +927,7 @@ async fn the_state_file_counters_are_honoured_for_an_unchanged_token() {
     );
     assert_eq!(client.enrollment_locked_until, Some(window));
 
-    let state = AuthState::new(auth, &path_str);
+    let state = AuthState::new(auth, store(&path_str));
     let watcher = watcher_for(state.clone(), &path_str);
     watcher.reload_config().await;
 
@@ -958,9 +967,9 @@ async fn a_state_built_without_a_section_still_reloads_one() {
     }
     let path = path.to_str().unwrap().to_string();
 
-    let state = AuthState::new(AuthConfig::default(), &path);
+    let state = AuthState::new(AuthConfig::default(), store(&path));
     let watcher = ConfigWatcher::new(
-        path,
+        store(&path),
         Arc::new(RoutingTable::new(Vec::new())),
         Arc::new(
             crate::http::BackendClients::new(crate::config::Timeouts::default().connect, None)
@@ -1221,11 +1230,11 @@ async fn a_reload_that_finds_an_enrollment_has_overtaken_it_reads_again() {
     std::fs::write(&path, file_with("old", "OLDOLDOLDOLDOLDO")).expect("write the first file");
     let state = AuthState::new(
         config_with(&[("old", client("OLDOLDOLDOLDOLDO"))]),
-        path_str.clone(),
+        store(&path_str),
     );
 
     let watcher = ConfigWatcher::new(
-        path_str,
+        store(&path_str),
         Arc::new(RoutingTable::new(Vec::new())),
         Arc::new(
             crate::http::BackendClients::new(crate::config::Timeouts::default().connect, None)
@@ -1318,11 +1327,11 @@ async fn a_reload_closes_the_connection_authenticated_as_a_removed_device() {
         .into_iter()
         .map(|name| (name.to_string(), device("DEVICEDEVICEDEVIC")))
         .collect();
-    let state = AuthState::new(config_with(&[("alice", alice)]), path_str.clone());
+    let state = AuthState::new(config_with(&[("alice", alice)]), store(&path_str));
 
     let peers = Arc::new(PeerRegistry::new());
     let watcher = ConfigWatcher::new(
-        path_str,
+        store(&path_str),
         Arc::new(RoutingTable::new(Vec::new())),
         Arc::new(
             crate::http::BackendClients::new(crate::config::Timeouts::default().connect, None)
@@ -1494,7 +1503,7 @@ async fn a_reload_that_turns_2fa_on_closes_the_connections_that_never_authentica
 
     // 2FA is off, so the connection below is served without a handshake.
     std::fs::write(&path, "[auth]\nenabled = false\n").expect("write the config");
-    let state = AuthState::new(AuthConfig::default(), path_str.clone());
+    let state = AuthState::new(AuthConfig::default(), store(&path_str));
     let peers = Arc::new(PeerRegistry::new());
     let watcher = watcher_with_peers(state.clone(), &path_str, peers.clone());
 
@@ -1522,7 +1531,7 @@ async fn a_reload_that_turns_2fa_on_leaves_the_authenticated_connections_alone()
     let path_str = path.to_str().expect("utf-8 path").to_string();
 
     std::fs::write(&path, "[auth]\nenabled = false\n").expect("write the config");
-    let state = AuthState::new(AuthConfig::default(), path_str.clone());
+    let state = AuthState::new(AuthConfig::default(), store(&path_str));
     let peers = Arc::new(PeerRegistry::new());
     let watcher = watcher_with_peers(state.clone(), &path_str, peers.clone());
 
@@ -1561,7 +1570,7 @@ async fn a_reload_that_tightens_a_client_closes_its_connections() {
     // The live client may reach both hosts.
     let mut alice = client("ALICEALICEALICEA");
     alice.allow_hosts = Some(vec!["a.test".to_string(), "b.test".to_string()]);
-    let state = AuthState::new(config_with(&[("alice", alice)]), path_str.clone());
+    let state = AuthState::new(config_with(&[("alice", alice)]), store(&path_str));
     let peers = Arc::new(PeerRegistry::new());
     let watcher = watcher_with_peers(state.clone(), &path_str, peers.clone());
 
@@ -1602,7 +1611,7 @@ async fn a_reload_that_widens_a_client_leaves_its_connections_alone() {
     // The live client may reach one host only.
     let mut alice = client("ALICEALICEALICEA");
     alice.allow_hosts = Some(vec!["a.test".to_string()]);
-    let state = AuthState::new(config_with(&[("alice", alice)]), path_str.clone());
+    let state = AuthState::new(config_with(&[("alice", alice)]), store(&path_str));
     let peers = Arc::new(PeerRegistry::new());
     let watcher = watcher_with_peers(state.clone(), &path_str, peers.clone());
 
@@ -1639,7 +1648,7 @@ async fn a_reload_that_removes_a_client_closes_its_connections() {
 
     let state = AuthState::new(
         config_with(&[("alice", client("ALICEALICEALICEA"))]),
-        path_str.clone(),
+        store(&path_str),
     );
     let peers = Arc::new(PeerRegistry::new());
     let watcher = watcher_with_peers(state.clone(), &path_str, peers.clone());

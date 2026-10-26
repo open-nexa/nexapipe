@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use super::constant_time_eq;
 use super::handshake::write_auth_message;
-use super::state::{AuthState, blocking_config_write, persist_auth_state};
+use super::state::{AuthState, persist_auth_state, storage_write};
 
 /// Why a 2FA handshake did not produce an authenticated client.
 ///
@@ -488,7 +488,7 @@ pub(super) async fn enroll_client(
             tracing::warn!(
                 "2FA: failed to persist the enrollment lockout for '{}' to {}: {}",
                 client_id,
-                auth.state_path(),
+                auth.storage().describe(),
                 e
             );
         }
@@ -579,34 +579,35 @@ pub(super) async fn enroll_client(
     // below. It carries the enrollment itself, and the epoch bump that follows
     // it is the interlock that stops a reload from merging a pre-enrollment
     // snapshot back over the top of it — see the note there.
-    let enrollment_path = auth.path().to_string();
+    let storage = auth.storage().clone();
     let enrolled_client = client_id.to_string();
     let persisted = issued.clone();
-    if let Err(e) = blocking_config_write(enrollment_path, move |path| match &persisted {
-        IssuedCredential::DeviceSecret { name, secret } => {
-            crate::config::ProxyConfig::complete_device_enrollment(
-                path,
-                &enrolled_client,
-                name,
-                crate::auth::DeviceMaterial::Secret(secret.expose_secret()),
-            )
+    let write = async move {
+        match &persisted {
+            IssuedCredential::DeviceSecret { name, secret } => {
+                storage
+                    .complete_device_enrollment(
+                        &enrolled_client,
+                        name,
+                        crate::storage::DeviceCredential::Secret(secret.clone()),
+                    )
+                    .await
+            }
+            IssuedCredential::DeviceKey { name, key } => {
+                storage
+                    .complete_device_enrollment(
+                        &enrolled_client,
+                        name,
+                        crate::storage::DeviceCredential::PublicKey(key.clone()),
+                    )
+                    .await
+            }
+            IssuedCredential::SharedSecret(secret) => {
+                storage.complete_enrollment(&enrolled_client, secret).await
+            }
         }
-        IssuedCredential::DeviceKey { name, key } => {
-            crate::config::ProxyConfig::complete_device_enrollment(
-                path,
-                &enrolled_client,
-                name,
-                crate::auth::DeviceMaterial::PublicKey(key),
-            )
-        }
-        IssuedCredential::SharedSecret(secret) => crate::config::ProxyConfig::complete_enrollment(
-            path,
-            &enrolled_client,
-            secret.expose_secret(),
-        ),
-    })
-    .await
-    {
+    };
+    if let Err(e) = storage_write("the enrollment".to_string(), write).await {
         // Roll the in-memory client back, or this process would keep accepting
         // a secret that no longer exists anywhere else.
         undo_enrolled_secret(&mut cfg, client_id, slot, token);
@@ -664,7 +665,7 @@ pub(super) async fn enroll_client(
         tracing::warn!(
             "2FA: failed to persist the cleared counter for '{}' to {}: {}",
             client_id,
-            auth.state_path(),
+            auth.storage().describe(),
             e
         );
     }

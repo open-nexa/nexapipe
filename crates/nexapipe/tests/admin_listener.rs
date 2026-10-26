@@ -146,7 +146,10 @@ fn auth_with_secret(secret: &str) -> nexapipe::conn::AuthState {
     let path = path.to_string_lossy().into_owned();
     let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config parses");
     let auth = auth.expect("[auth] is present");
-    nexapipe::conn::AuthState::new(auth, path)
+    nexapipe::conn::AuthState::new(
+        auth,
+        std::sync::Arc::new(nexapipe::storage::FileStorage::new(path)),
+    )
 }
 
 /// Liveness has to work without a credential — a supervisor should not need one
@@ -459,7 +462,10 @@ async fn the_port_acl_is_listed_with_the_clients() {
         Vec::new(),
         false,
         Some("s3cr3t"),
-        Some(nexapipe::conn::AuthState::new(auth, path)),
+        Some(nexapipe::conn::AuthState::new(
+            auth,
+            std::sync::Arc::new(nexapipe::storage::FileStorage::new(path)),
+        )),
     )
     .await;
 
