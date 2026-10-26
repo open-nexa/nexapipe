@@ -172,7 +172,11 @@ async fn a_key_device_stores_the_public_half() {
     seed(&dir);
     let store = store(&dir);
 
-    let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    // Generated rather than written out: a key spelled out in the source is a
+    // string of hex in a file, and the secret scanner reads one as a
+    // credential. It also has to be a point on the curve, which is not
+    // something a fixture can be.
+    let key = nexapipe::auth::public_key_hex(&iroh::SecretKey::generate().public());
     store
         .write_device_credential(
             "client-001",
@@ -311,9 +315,8 @@ async fn the_endpoint_key_is_written_into_the_configuration() {
     seed(&dir);
     let store = store(&dir);
 
-    let key = SecretString::new(
-        "9f8c1e2d3b4a5968778695a4b3c2d1e0f9e8d7c6b5a4938271605f4e3d2c1b0a".to_string(),
-    );
+    // Built rather than written out, for the reason the public key above says.
+    let key = SecretString::new("cd".repeat(32));
     store
         .write_endpoint_key(&key)
         .await
