@@ -167,6 +167,38 @@ windows-sys = { version = "0.61", features = [
 name = "nexa-service"
 path = "src/bin/nexa-service.rs"
 
+# The release profile, which this crate did not have.
+#
+# This is its own cargo workspace — the root `Cargo.toml` excludes it — so the
+# carefully annotated tuning at the root (opt-level 3, LTO, strip) applied to
+# the server crates and to the Android `.so`, and to nothing on the desktop.
+# The desktop therefore built with cargo's defaults: no LTO, sixteen codegen
+# units, and no stripping.
+#
+# `lto = "thin"` rather than `"fat"` deliberately. Fat LTO on a Tauri binary
+# that links a webview shim and a service binary is a long compile for a small
+# extra gain; thin gets most of the size and nearly all of the speed.
+#
+# `panic = "unwind"` is the default, and it is written down because the root
+# workspace writes it down for the same reason: the vendored smoltcp patch is
+# about a panic that must not take the process down, and `nexa-service` runs
+# as a long-lived elevated process that links it. `panic = "abort"` is
+# deliberately **not** set — whether a panic in the data path should take the
+# service down is a real design question, and answering it by accident
+# through a size optimisation is exactly the trade to refuse.
+#
+# The cost is build time, and it is real: `codegen-units = 1` plus thin LTO on
+# a tree this size is a multi-minute release build. `tauri dev` is not
+# affected — it builds with the `dev` profile — so local iteration is
+# unchanged.
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "thin"
+strip = true
+debug = "none"
+panic = "unwind"
+
 # The vendored smoltcp carries a patch for a `subtract with underflow` panic on
 # the transmit path — see `third_party/smoltcp/PATCHES.md`. This crate is its own
 # workspace, excluded from the root one, so the root `[patch.crates-io]` never
