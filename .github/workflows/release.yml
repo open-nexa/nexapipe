@@ -328,6 +328,10 @@ jobs:
           Remove-Item -Recurse -Force $stage
           Get-ChildItem dist
 
+      - name: Record the artifact sizes
+        shell: bash
+        run: .github/scripts/record-sizes.sh "server archives" dist
+
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
         with:
@@ -887,6 +891,10 @@ jobs:
         run: |
           find release-artifact -type f | sort
 
+      - name: Record the artifact sizes
+        shell: bash
+        run: .github/scripts/record-sizes.sh "desktop bundles" ui-desktop/release-artifact
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
         with:
@@ -1364,6 +1372,17 @@ jobs:
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           done
+
+      # What the APKs and the native library weigh. The APK is what a phone
+      # downloads and the library is most of it, so the two are recorded
+      # together.
+      - name: Record the artifact sizes
+        if: steps.opts.outputs.skip_rust != 'true'
+        shell: bash
+        run: |
+          .github/scripts/record-sizes.sh "android apks and the native library" \
+            ui-android/*.apk \
+            ui-android/app/src/main/jniLibs
 
       - name: Upload APK artifact
         if: steps.opts.outputs.skip_rust != 'true'
