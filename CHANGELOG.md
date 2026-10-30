@@ -74,6 +74,37 @@ and its meaning.
   — which is what keeps the manifest free of the warning cargo gives for
   naming both.
 
+### Changed
+
+- **The desktop app is 32% smaller.** `ui-desktop/src-tauri` is its own cargo
+  workspace — the root one excludes it — so the carefully annotated tuning at
+  the root applied to the server crates and to the Android `.so`, and to
+  nothing on the desktop: the app was built with cargo's defaults, with no
+  LTO, sixteen codegen units and no stripping. It has a release profile now.
+  Measured, on an Apple M4 with `rustc 1.99.1`, by `cargo build --release`:
+  the app goes from 39.1 MiB to 26.5 MiB, and the service binary it runs from
+  19.0 MiB to 12.0 MiB. The cost is build time, and it is measured too: two
+  minutes became three and a half. `panic = "abort"` is deliberately not set —
+  whether a panic in the data path should take the service down is a real
+  design question, and the vendored smoltcp patch is about a panic that must
+  not take the process down.
+- **A native crash in the field can be debugged now.** The native library is
+  built with its symbols, and the copy that goes into the APK is stripped —
+  which is what the root workspace's release profile was already doing, so the
+  APK is the same size it was (224 bytes, or 0.002%, is the difference). The
+  copy carrying the symbols is kept outside `jniLibs`, because everything in
+  there is packaged into the APK, and uploaded beside the APKs. The symbols
+  are worth 9.6 MiB and cost the download nothing. The exported JNI entry
+  points are not among the ones the strip removes: all thirty-three are still
+  there afterwards, and the check that asserts the fourteen the release names
+  runs over the stripped file.
+- **A release weighs what it publishes.** Nothing in the pipeline recorded
+  what it produced: the server archives, the desktop bundles, the APKs and the
+  native library were all built and published without anybody writing down
+  what they weighed, so "this change cost 1.2 MB" was not a sentence anybody
+  could say about a release. Each of the three build jobs weighs what it
+  produced now, and the numbers go into the job's step summary.
+
 ## [1.0.1] — 2026-10-25
 
 A packaging release: the code is the code of 1.0.0, and what changed is where
