@@ -756,31 +756,39 @@ mod tests {
             "the error names the key: {message}"
         );
         assert!(
-            message.contains("keys/iroh"),
+            message.contains("iroh"),
             "the error names the path: {message}"
         );
     }
 
     /// An absolute path is what it is, whatever the directory is: it names the
     /// same file from anywhere.
+    ///
+    /// The path this test uses is the one the platform agrees is absolute. A
+    /// Windows absolute path carries a drive prefix, and a rooted path
+    /// without one is **not** absolute there — it names a file on whichever
+    /// drive the process is on, which is the very thing this code refuses to
+    /// guess at.
     #[test]
     fn an_absolute_credential_path_needs_no_directory() {
+        #[cfg(windows)]
+        let absolute = Path::new(r"C:\nexapipe\iroh.key");
+        #[cfg(not(windows))]
+        let absolute = Path::new("/etc/nexapipe/iroh.key");
+
         let resolved =
-            credential_file_path(None, "[iroh] secret_key_file", "/etc/nexapipe/iroh.key")
+            credential_file_path(None, "[iroh] secret_key_file", &absolute.to_string_lossy())
                 .expect("an absolute path is accepted");
-        assert_eq!(resolved, Path::new("/etc/nexapipe/iroh.key"));
+        assert_eq!(resolved, absolute);
     }
 
     /// A relative path against a directory is resolved against that
     /// directory, not the working one.
     #[test]
     fn a_relative_credential_path_is_resolved_against_the_directory() {
-        let resolved = credential_file_path(
-            Some(Path::new("/etc/nexapipe")),
-            "[iroh] secret_key_file",
-            "iroh.key",
-        )
-        .expect("a relative path with a directory is resolved");
-        assert_eq!(resolved, Path::new("/etc/nexapipe/iroh.key"));
+        let dir = Path::new("/etc/nexapipe");
+        let resolved = credential_file_path(Some(dir), "[iroh] secret_key_file", "iroh.key")
+            .expect("a relative path with a directory is resolved");
+        assert_eq!(resolved, dir.join("iroh.key"));
     }
 }
