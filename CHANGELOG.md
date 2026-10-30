@@ -74,6 +74,20 @@ and its meaning.
   — which is what keeps the manifest free of the warning cargo gives for
   naming both.
 
+### Changed
+
+- **The shipped 2FA example says two things that are not true.** The secret in
+  `config.toml.2fa.example` is published — it is in a public repository, so
+  anybody can compute a valid code from it — and the README did not say so.
+  The Node ID is a reachability credential on its own, and the 2FA secret is
+  what closes it: a published secret is a published way in. The example now
+  says what it is for, and the README says the same.
+- **The example no longer claims the server refuses to start on a readable
+  configuration.** It did, and it has not since the v0.6.1 change that removed
+  the check: a `0644` bind mount has to start, so the server warns once in the
+  log and starts anyway. The mode is the operator's to set, and the warning
+  is the only thing that says so.
+
 ## [1.0.1] — 2026-10-25
 
 A packaging release: the code is the code of 1.0.0, and what changed is where
