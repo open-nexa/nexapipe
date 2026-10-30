@@ -74,6 +74,48 @@ and its meaning.
   — which is what keeps the manifest free of the warning cargo gives for
   naming both.
 
+### Fixed
+
+- **A Linux client gets an update now.** The v1.0.0 release went out with an
+  updater manifest that covered four of the six platforms: `linux-x86_64` and
+  `linux-aarch64` were missing, so a Linux client got no update at all. The
+  artifacts were published, the release was green, and the only sign of it
+  was a warning in the job log. Tauri v2 signs the AppImage itself and the
+  updater replaces that file; the script looked for the v1-era
+  `.AppImage.tar.gz`, found nothing, and left the payload empty. The AppImage
+  is the payload now — the archive is still preferred when a builder produces
+  it — and its signature travels with it. A platform with no payload while the
+  signing key is configured fails the job instead of skipping its manifest: a
+  partial manifest is a release in which the missing platforms get no update
+  and nothing says so.
+- **A release publishes its assets before it publishes the index files that
+  name them.** `gh release create dist/*` made the release visible as "latest"
+  and then uploaded in glob order, so `latest.json` and `SHA256SUMS.txt` were
+  published before the several hundred megabytes of assets they name: for as
+  long as the upload took, the live updater manifest pointed at assets that
+  answered 404, and the updater downloaded them.
+- **A release refuses a tag that is not the version.** The version check was a
+  warning in the server job and absent from the APK job, and `--verify-tag`
+  only checks that the tag exists. A tag of `v9.9.9` on a tree whose
+  `Cargo.toml` says `1.0.0` published binaries that report `1.0.0`. Every
+  versioned job now refuses a tag that is not the workspace version, a tag
+  that is not a valid semver, and a tag that is not annotated — a lightweight
+  tag is a bare ref that anybody with push access can move, while the release
+  is signed and published against the tag.
+- **The image's `latest` tag moves after the release exists**, not before: a
+  user could otherwise pull an image whose release had not been published yet.
+  The manifest is copied byte for byte, so the digest does not change and the
+  cosign signature still covers `latest`.
+- **`SHA256SUMS.txt` is signed**, which makes the advertised integrity
+  mechanism replaceable together with the files it covers. It is signed with
+  the updater key now, and the signature is published next to it.
+- **The publishing jobs run in the `release` environment.** They run the
+  tagged tree's own code while holding the signing keys, the release
+  keystore and write access to the package registry, and no job declared an
+  environment, so no repository rule could gate them.
+- **The published image digest is in the release notes**, rather than only in
+  the job log.
+
 ## [1.0.1] — 2026-10-25
 
 A packaging release: the code is the code of 1.0.0, and what changed is where
