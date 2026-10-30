@@ -74,6 +74,56 @@ and its meaning.
   — which is what keeps the manifest free of the warning cargo gives for
   naming both.
 
+### Fixed
+
+- **A UDP flow is charged to the process byte budget.** The L4 UDP flow
+  allocated a 64 KiB receive buffer, a 4 KiB send buffer and a frame buffer
+  per flow, and took no reservation — unlike the TCP path, whose copy buffers
+  are charged by the same budget. The ceiling in `[limits] max_body_bytes`
+  documents that the per-stream copy buffers are charged there too, so the
+  largest per-stream buffer in the L4 path was the one the ceiling never saw:
+  with the defaults, one authenticated peer could hold about a gigabyte of
+  uncharged buffers, plus a socket per flow. The flow now takes one
+  reservation for all four buffers it holds before the first of them is
+  allocated, and a flow that cannot pay is refused with `BackendFailed`
+  rather than running anyway. The budget exists to refuse, not to warn.
+- **A UDP flow that cannot bind its socket is answered with a status.** The
+  bind is the one step of a flow that can fail for reasons that have nothing
+  to do with the backend — an exhausted descriptor table, a host with IPv6
+  disabled. It was raised as an error and the client was left with a closed
+  tunnel and no answer. It is now answered the way the other failures are: one
+  status byte, so the client can tell a backend it could not reach from a
+  server that closed the tunnel without answering.
+- **A route's own flow bounds are held to the deadline ceiling.**
+  `flow_timeout_secs` and `idle_timeout_secs` on a route were checked against
+  zero and nothing else, while the server-wide equivalents in `[timeouts]` are
+  refused above 86 400 s — precisely because a bound that long never fires
+  within a process lifetime. A route's own bound overrides the server-wide
+  one, so a route could carry a century and make the flow effectively
+  unbounded. Both keys are now refused above the same ceiling, with a message
+  naming the key and the ceiling.
+- **A WebSocket upgrade the backend refuses carries the backend's body.** A
+  backend that answers an upgrade request with a refusal — a 403, a 401 —
+  had its body dropped, and the client was handed an empty answer that said
+  nothing about why the upgrade was refused. The body is forwarded now, with
+  a length of its own, so the framing never disagrees with the bytes.
+- **That refusal body is read under the response budget.** Reading the
+  backend's refusal body was a read with no deadline on it, so a backend that
+  sent a head and then went quiet held the request — and the connection — open
+  for as long as it liked. It is now read under the same response deadline as
+  every other body.
+- **A WebSocket upgrade does not carry a header the client nominated.** The
+  `Connection` header lists the names that are hop-by-hop for that message, so
+  `Connection: X-Internal` means `X-Internal` is for this hop only and must
+  not be forwarded. The ordinary request path already dropped those names,
+  and so does the client's own local proxy — but the upgrade path had only the
+  fixed hop-by-hop list, so a header the client had explicitly marked as
+  hop-by-hop was handed to the third-party backend. A header that one path
+  drops and another forwards is a header whose presence depends on the path
+  the request took. `Connection` and `Upgrade` are the two that stay: the
+  upgrade is what the request is for, and a backend that does not see them
+  does not switch protocols.
+
 ## [1.0.1] — 2026-10-25
 
 A packaging release: the code is the code of 1.0.0, and what changed is where

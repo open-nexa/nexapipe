@@ -970,3 +970,176 @@ async fn a_udp_flow_does_not_use_a_stale_address() {
     assert!(outcome.is_ok());
     echo.await.unwrap();
 }
+
+/// What one UDP flow holds: the buffer a datagram is received into, the
+/// one the client's bytes are read into, the one a datagram is framed in,
+/// and the frame in flight a client dribbling a maximal frame makes the
+/// process hold.
+///
+/// Written out here rather than read from the code, so that the test pins
+/// the figure instead of agreeing with whatever the code happens to say.
+const FLOW_BUFFER_BYTES: usize = 65_536 + 4_096 + 65_509 + 69_633;
+
+/// A UDP flow is charged to the process byte budget.
+///
+/// The TCP path charges its copy buffers to the same budget — the ceiling
+/// in `[limits] max_body_bytes` says the per-stream copy buffers are
+/// charged there too — so a UDP flow that holds a 64 KiB receive buffer
+/// per flow and is charged nothing is a flow whose memory the operator's
+/// ceiling never sees.
+#[tokio::test]
+async fn a_udp_flow_is_charged_to_the_process_byte_budget() {
+    let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend.local_addr().unwrap();
+    let echo = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let Ok((n, from)) = backend.recv_from(&mut buf).await else {
+                return;
+            };
+            let _ = backend.send_to(&buf[..n], from).await;
+        }
+    });
+
+    let config = RoutingTable::new(vec![udp_route(
+        "turn.test",
+        &backend_addr.to_string(),
+        None,
+    )]);
+    let (client, server) = tokio::io::duplex(4096);
+    let task = tokio::spawn(async move {
+        serve_stream(
+            server,
+            Vec::new(),
+            &config,
+            &limiter(),
+            "test",
+            None,
+            "test-request-id",
+            None,
+        )
+        .await
+    });
+
+    let (mut client_read, mut client_write) = tokio::io::split(client);
+    client_write
+        .write_all(&preface(L4Proto::Udp, "turn.test", 3478))
+        .await
+        .unwrap();
+    assert_eq!(read_status(&mut client_read).await, Status::Ok);
+
+    // The flow is open, so the process is holding its buffers right now.
+    // The budget is the process's, so another test in this binary may be
+    // holding bytes of its own: what is asserted is that the flow's own
+    // charge is there, not an exact figure.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while crate::conn::limits::body_budget().held() < FLOW_BUFFER_BYTES {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the UDP flow holds {FLOW_BUFFER_BYTES} bytes of buffers and the process byte \
+             budget does not see one of them"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    drop(client_write);
+    drop(client_read);
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    echo.abort();
+}
+
+/// The charge is exact, and the bytes are given back when the flow ends.
+///
+/// A budget of its own rather than the process's, so that the figure can
+/// be asserted exactly: the process's is shared with every other flow in
+/// this binary.
+#[tokio::test]
+async fn a_udp_flow_pays_for_its_buffers_and_gives_them_back() {
+    let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = backend.local_addr().unwrap();
+    let echo = tokio::spawn(async move {
+        let mut buf = [0u8; 2048];
+        loop {
+            let Ok((n, from)) = backend.recv_from(&mut buf).await else {
+                return;
+            };
+            let _ = backend.send_to(&buf[..n], from).await;
+        }
+    });
+
+    let budget = Arc::new(ByteBudget::new(FLOW_BUFFER_BYTES));
+    let flow_budget = budget.clone();
+    let (mut client, server) = tokio::io::duplex(4096);
+    let task = tokio::spawn(async move {
+        serve_udp_flow(
+            server,
+            backend_addr,
+            "0.0.0.0:0",
+            Vec::new(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            &flow_budget,
+        )
+        .await
+    });
+
+    let mut byte = [0u8; 1];
+    client.read_exact(&mut byte).await.unwrap();
+    assert_eq!(Status::from_byte(byte[0]), Status::Ok);
+
+    // The flow is open, so the buffers exist and the budget is holding
+    // them.
+    assert_eq!(
+        budget.held(),
+        FLOW_BUFFER_BYTES,
+        "the flow is not charged for the buffers it holds"
+    );
+
+    // The client closes, the flow ends, and the bytes come back.
+    drop(client);
+    let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    assert_eq!(
+        budget.held(),
+        0,
+        "the bytes of a flow that ended are still charged"
+    );
+    echo.abort();
+}
+
+/// A flow that cannot pay for its buffers is refused, and refused with a
+/// status the client can act on.
+///
+/// The budget exists to refuse, not to warn: a flow that ran anyway would
+/// hold memory the operator's ceiling says the process may not hold.
+#[tokio::test]
+async fn a_udp_flow_that_cannot_pay_for_its_buffers_is_refused() {
+    // One byte short of what the flow holds.
+    let budget = Arc::new(ByteBudget::new(FLOW_BUFFER_BYTES - 1));
+    let flow_budget = budget.clone();
+    let (mut client, server) = tokio::io::duplex(64);
+    let task = tokio::spawn(async move {
+        serve_udp_flow(
+            server,
+            "127.0.0.1:9".parse().unwrap(),
+            "0.0.0.0:0",
+            Vec::new(),
+            Duration::from_secs(30),
+            Duration::from_secs(60),
+            &flow_budget,
+        )
+        .await
+    });
+
+    let mut byte = [0u8; 1];
+    client.read_exact(&mut byte).await.unwrap();
+    assert_eq!(
+        Status::from_byte(byte[0]),
+        Status::BackendFailed,
+        "a flow that cannot pay is not answered with a status the client can act on"
+    );
+    assert!(
+        task.await.unwrap().is_err(),
+        "a refused flow reports success"
+    );
+    assert_eq!(budget.held(), 0, "a refused flow holds bytes");
+}
