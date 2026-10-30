@@ -74,6 +74,41 @@ and its meaning.
   — which is what keeps the manifest free of the warning cargo gives for
   naming both.
 
+### Fixed
+
+- **A client that refuses gzip is not answered with it.** The negotiation was
+  a substring test: `Accept-Encoding: gzip;q=0` contains "gzip", so the proxy
+  compressed the body and the client — which had just said it cannot decode
+  gzip — was handed bytes it had no way to read. `gzip;q=0` is the client
+  saying no (RFC 9110 §12.5.3), and the answer now reads the header as the
+  list it is: a coding with a quality of zero is refused, a coding with no
+  quality is asked for at full weight, and `br, gzip;q=0.5` accepts gzip at
+  half a weight while the rest of the list stands.
+- **A backend's stale content-length does not cut the answer.** A message that
+  arrives with both a `Transfer-Encoding` and a `Content-Length` has its
+  length overridden by the encoding (RFC 9112 §6.1, rule 3). The
+  `Transfer-Encoding` was dropped as a hop-by-hop header and the
+  `Content-Length` was kept, so the client was served a body cut to a length
+  that described a framing the forwarded body did not have. The length goes
+  with the header that overrode it.
+- **A partial answer is not compressed.** A `Content-Range` names bytes of a
+  representation, and a content coding is a property of the whole
+  representation: the gzip stream of one range is not the encoding of that
+  representation, and two ranges cannot be put back together afterwards. A
+  `206`, or any answer carrying a `Content-Range`, is now sent as the backend
+  framed it.
+- **A body the plaintext listener refuses is refused with its own status.** A
+  body over the limit, a body that did not arrive in time and a body that
+  could not be read were all answered with a 502 — which blames the backend,
+  for a request that never reached one. A client that reads a 502 that way
+  may send the same body again. The three failures are now answered the way
+  the tunnel path already answers them: 413, 408 and 400.
+- **A duplicated backend is counted once per health round.** The health
+  checker counted the same backend once per entry it appeared under, so a
+  route that named the same backend twice was failed twice by one probe and
+  taken out of rotation by a single round's worth of noise. It is counted
+  once.
+
 ## [1.0.1] — 2026-10-25
 
 A packaging release: the code is the code of 1.0.0, and what changed is where
