@@ -17,6 +17,9 @@ local.properties
 .externalNativeBuild
 .cxx
 
+# The native symbols of a release build, kept beside the APK they belong to.
+/debug-symbols
+
 # OS
 .DS_Store
 Thumbs.db
