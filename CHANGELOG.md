@@ -74,6 +74,35 @@ and its meaning.
   — which is what keeps the manifest free of the warning cargo gives for
   naming both.
 
+### Fixed
+
+- **The client does not record its own refusal as a backend failure.** A full
+  connection pool and a credential replaced mid-dial are refusals the client
+  made, not facts about the backend. Both reached the place where every
+  non-configuration error was folded into a health verdict, so a backend that
+  was answering — and holding ten live connections open — was written into
+  the health table as unreachable. The consequences were both about the wrong
+  thing: the health snapshot reported a healthy backend as down and could flip
+  the "any reachable" answer off, and with a multi-backend domain the marked
+  backend was dropped from the candidates, so the balancer steered every later
+  request to the other backends until the next probe round — 30 to 35 seconds
+  away. A pool refusal and a replaced credential now have their own errors,
+  and those pass through without a verdict. The verdict is written only by
+  evidence that the backend failed: a dial or handshake that did not come
+  about, or a probe.
+- **The client's first write is inside the attempt's budget.** The retry loop
+  documents one budget for every attempt and applies it to opening the
+  stream, but the payload write that followed was not under it. A stream
+  write waits for the peer to grant flow-control credit, so a peer that takes
+  the stream and then stops reading leaves the write pending for good: the
+  attempt's deadline never fires, and the request hangs instead of failing at
+  the budget. The payload is not small on the paths that use it — the HTTP
+  path sends the filtered head plus the body that came with it, and the TLS
+  path the whole ClientHello. The write is now under the same deadline as the
+  open, and a timeout is treated the way the open's timeout already is: the
+  connection is discarded and the attempt ends, within the same overall
+  budget.
+
 ## [1.0.1] — 2026-10-25
 
 A packaging release: the code is the code of 1.0.0, and what changed is where
