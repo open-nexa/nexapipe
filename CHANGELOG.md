@@ -74,6 +74,44 @@ and its meaning.
   — which is what keeps the manifest free of the warning cargo gives for
   naming both.
 
+### Fixed
+
+- **The Android app and the client library agree about which invite codes are
+  valid.** The Android codec says it mirrors `nexapipe_client::provisioning`
+  and that both must accept and reject the same codes, because one writes
+  what the other reads. They did not, in five places, and the Android side was
+  the permissive one in every one of them. A parameter's name decided whether
+  it was read at all, so a code that carried its secret under a
+  differently-cased name lost the secret: the desktop refused the code
+  outright, and the app kept the credential and authenticated with it. A
+  malformed escape sequence was kept as a literal `%`, where the desktop
+  refused the code and the app imported it as an endpoint with a name of `%ZZ`
+  in it. Bytes that were not UTF-8 became replacement characters, so the same
+  code named an endpoint on the desktop and named something else on the app. A
+  parameter with no name was dropped and the rest read, where the desktop
+  refuses the code. And a code past the hard limit was parsed in full, where
+  the desktop refuses it — work an attacker gets for free. The tests are on
+  both sides and they check the same codes, because the point of the change is
+  that the two halves agree, not that either is right.
+- **The node id stays out of the Android log panel.** The node id is the
+  reachability credential: on a server started with `[auth] enabled = false` —
+  the default, and what the shipped example config uses — anybody who learns
+  it completes the handshake and reaches every route. The log panel keeps the
+  last hundred lines, and a screenshot of it is a screenshot of the machine's
+  inventory, so nine call sites already truncate the id to its first eight
+  characters. Seven did not: adding, removing, renaming and re-mapping an
+  endpoint, the two lines the invite importer writes, and the domain mapping
+  the connector logs — the importer truncated the very same value for its
+  toast four lines after writing it in full. The rule is now checked over the
+  whole app rather than over the call sites this change touched, so the next
+  call site that forgets it is caught too.
+- **An issued credential is filed under the client it was issued for.** The
+  credential names the client it was issued for, and the client refuses an
+  answer that names a different one, so the client id is the whole of the
+  match. The positional fallback handed an endpoint a credential the server
+  never issued to it, while the endpoint the credential was issued for got
+  none.
+
 ## [1.0.1] — 2026-10-25
 
 A packaging release: the code is the code of 1.0.0, and what changed is where
