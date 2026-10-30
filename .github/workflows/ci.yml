@@ -91,6 +91,7 @@ jobs:
       dependencies: ${{ steps.paths.outputs.dependencies }}
       desktop_lockfile: ${{ steps.paths.outputs.desktop_lockfile }}
       codeql: ${{ steps.paths.outputs.codeql }}
+      release: ${{ steps.paths.outputs.release }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
@@ -458,6 +459,38 @@ jobs:
   # script. The dependency review answers "what does this pull request
   # introduce", which is a question about the pull request and not about the
   # tree.
+  release-scripts:
+    name: release scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.release == 'true'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 @ 2026-10-07
+        with:
+          node-version-file: ui-desktop/.nvmrc
+
+      # The release pipeline is checked before anything is published, and here
+      # as well: a pull request that breaks the updater manifest is caught
+      # while it can still be fixed, rather than at the release — where the
+      # only sign of it was a warning in the job log and a client that never
+      # got an update.
+      #
+      # The self-test builds the bundles Tauri builds and checks what the
+      # scripts would publish, and reads the workflow for the properties the
+      # scripts cannot enforce themselves: the order the assets are uploaded
+      # in, the tag checks every versioned job makes, the image retag and the
+      # signing of the checksum file.
+      #
+      # No dependencies beyond node itself, so this runs without an install
+      # step.
+      - name: the release scripts agree with the release workflow
+        shell: bash
+        run: node ui-desktop/.github/scripts/selftest.mjs
+
   secrets:
     name: secrets (gitleaks + dependency review)
     runs-on: ubuntu-latest

@@ -17,6 +17,8 @@
 #   desktop_lockfile  the desktop package.json and the lockfile that pins it
 #   codeql            everything CodeQL reads: the Rust, the TypeScript and
 #                     the workflow files
+#   release           the release pipeline: the workflow that publishes and the
+#                     scripts it calls
 #
 # On a push there is no base to diff against, so every group is in scope: a
 # push to main is the state of the world, and the jobs run against it.
@@ -122,3 +124,10 @@ emit desktop_lockfile '^(ui-desktop/package(-lock)?\.json$|build_deb\.sh$|build_
 # the workflow files in .github/. A change to ui-android/ alone is Kotlin,
 # which CodeQL analyses in its own job.
 emit codeql '^(crates/|third_party/|ui-desktop/|\.github/)'
+
+# The release pipeline: the workflow that publishes a release and the scripts
+# it calls. A change to either of them can publish a release that reaches
+# half its users — the updater manifest is what tells a client where to
+# download from, and a platform that quietly drops out of it is a platform
+# that gets no update — so the job that checks them runs when they change.
+emit release '^ui-desktop/\.github/scripts/'
