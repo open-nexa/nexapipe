@@ -23,6 +23,7 @@
 //! serving without one is the thing the token exists to prevent.
 use crate::auth::totp::constant_time_eq;
 use crate::config::check_credential_file_permissions;
+use crate::storage::Storage;
 use nexapipe_proto::secret::SecretString;
 use std::path::Path;
 
@@ -76,6 +77,47 @@ pub fn load_or_create(config_path: &str) -> Option<SecretString> {
     }
 }
 
+/// The token for this instance, creating it on first start.
+///
+/// `None` when it could not be read or could not be created, which leaves
+/// `/v1/*` unavailable rather than open.
+pub async fn load_or_create_from(storage: &dyn Storage) -> Option<SecretString> {
+    let existing = match storage.admin_token().await {
+        Ok(token) => token,
+        Err(reason) => {
+            tracing::error!(
+                "Admin token at {} is unusable, /v1/* is served as 503: {reason}",
+                storage.describe_token()
+            );
+            return None;
+        }
+    };
+    if let Some(token) = existing {
+        return Some(token);
+    }
+
+    let token = SecretString::new(generate());
+    match storage.put_admin_token(&token).await {
+        Ok(()) => {
+            // Said once, and only on the run that made it: after this the
+            // store is the only thing that has to be read, and an operator
+            // looking for the token is looking for this line.
+            tracing::info!(
+                "Generated an admin token in {}; `nexapipe status` reads it from there",
+                storage.describe_token()
+            );
+            Some(token)
+        }
+        Err(reason) => {
+            tracing::error!(
+                "Could not create an admin token in {}, /v1/* is served as 503: {reason}",
+                storage.describe_token()
+            );
+            None
+        }
+    }
+}
+
 /// The token the server already made, without making one.
 ///
 /// For `nexapipe status`, which is a client of a running instance and not a
@@ -99,7 +141,11 @@ pub fn load_existing(config_path: &str) -> Option<SecretString> {
 }
 
 /// Reads an existing token file.
-fn load(path: &str) -> Result<SecretString, String> {
+///
+/// The reason comes back with it: a token file that is empty, or that another
+/// account can read, is a file an operator has to fix, and the fix is named
+/// in the reason.
+pub(crate) fn load(path: &str) -> Result<SecretString, String> {
     // A credential, so the same check that gates a key file gates this: a
     // token any account can read is not a token.
     check_credential_file_permissions(path).map_err(|e| e.to_string())?;
@@ -120,14 +166,23 @@ fn load(path: &str) -> Result<SecretString, String> {
 /// Generates a token and writes it where only this account can read it.
 fn create(path: &str) -> Result<SecretString, String> {
     let token = SecretString::new(generate());
+    write_token(path, &token)?;
+
+    Ok(token)
+}
+
+/// Writes a token to a new file only this account can read.
+///
+/// Refuses to replace one that is already there: whoever is using it would be
+/// locked out without being told.
+pub fn write_token(path: &str, token: &SecretString) -> Result<(), String> {
     write_private(path, token.expose_secret().as_str())
         .map_err(|e| format!("cannot write it ({e})"))?;
 
     // Checked after the write rather than before: the file this is about is
     // the one that now exists, and a mode the OS did not apply is a real
     // failure and not a hypothetical one.
-    check_credential_file_permissions(path).map_err(|e| e.to_string())?;
-    Ok(token)
+    check_credential_file_permissions(path).map_err(|e| e.to_string())
 }
 
 /// A fresh token: 32 bytes of randomness, hex encoded so it survives being

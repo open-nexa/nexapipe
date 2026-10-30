@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 
 use super::*;
 
+use crate::storage::Storage;
+
 /// What [`ProxyConfig::ensure_iroh_secret_key`] resolved the endpoint's
 /// identity to.
 #[derive(Clone, PartialEq, Eq)]
@@ -136,94 +138,146 @@ impl ProxyConfig {
         path: &str,
         config: &ProxyConfig,
     ) -> anyhow::Result<EndpointIdentity> {
-        let configured = config
-            .iroh
-            .as_ref()
-            .and_then(|iroh| iroh.secret_key.clone());
+        let storage = crate::storage::file::FileStorage::new(path);
+        match identity_action(config, storage.base_dir(), path)? {
+            IdentityAction::Configured(key) => Ok(EndpointIdentity::Configured(key)),
+            IdentityAction::Ephemeral => Ok(EndpointIdentity::Ephemeral(SecretString::new(
+                generate_secret_key_hex(),
+            ))),
+            IdentityAction::IntoFile(full) => Ok(identity_into_file(&full)),
+            IdentityAction::IntoConfig => {
+                // Zeroizing from the moment it exists: a plain `String` would
+                // leave the hex in the heap on the path where the write
+                // failed, and the clone the write needed would leave a second
+                // copy there on the path where it succeeded.
+                let hex = SecretString::new(generate_secret_key_hex());
+                match storage.write_endpoint_key(&hex) {
+                    Ok(()) => {
+                        tracing::info!(
+                            "Generated an endpoint identity and saved it to {path} as [iroh] \
+                             secret_key; the Node ID is now stable across restarts"
+                        );
+                        Ok(EndpointIdentity::Generated(hex))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "Could not write an endpoint identity to {path} ({e:#}); starting on a \
+                             throwaway one, so the Node ID will be different after the next restart"
+                        );
+                        Ok(EndpointIdentity::Ephemeral(SecretString::new(
+                            generate_secret_key_hex(),
+                        )))
+                    }
+                }
+            }
+        }
+    }
+}
 
-        if let Some(configured) = configured {
-            configured
-                .expose_secret()
-                .parse::<iroh::SecretKey>()
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "[iroh] secret_key in {path} is not a valid key ({e}): the Node ID would \
+/// What the startup path has to do about the endpoint's identity.
+///
+/// Split out of [`ProxyConfig::ensure_iroh_secret_key`] because the decision —
+/// is there a key, is there a file to put one in, may anything be written at
+/// all — is the same whichever store the configuration is in, and only the last
+/// step differs: a key file is written through the file, a configuration
+/// through the store that holds it.
+pub(crate) enum IdentityAction {
+    /// The configuration already holds a key, and it parses.
+    Configured(SecretString),
+    /// Write a fresh key into the file the configuration points at.
+    IntoFile(PathBuf),
+    /// Write a fresh key into the configuration.
+    IntoConfig,
+    /// Write nothing; run on a throwaway key.
+    Ephemeral,
+}
+
+/// What the startup path has to do about the endpoint's identity.
+///
+/// `where_` names the configuration in the message a bad key produces, and
+/// `base_dir` is the directory a relative `secret_key_file` is resolved
+/// against.
+pub(crate) fn identity_action(
+    config: &ProxyConfig,
+    base_dir: Option<&Path>,
+    where_: &str,
+) -> anyhow::Result<IdentityAction> {
+    let configured = config
+        .iroh
+        .as_ref()
+        .and_then(|iroh| iroh.secret_key.clone());
+
+    if let Some(configured) = configured {
+        configured
+            .expose_secret()
+            .parse::<iroh::SecretKey>()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "[iroh] secret_key in {where_} is not a valid key ({e}): the Node ID would \
                      change on every restart and every client would lose the server. Delete the \
                      line to have a working one generated, or run --generate-secret and paste its \
                      output"
-                    )
-                })?;
-            return Ok(EndpointIdentity::Configured(configured));
-        }
+                )
+            })?;
+        return Ok(IdentityAction::Configured(configured));
+    }
 
-        // A pointed-to key file that does not exist yet. Reached only when the
-        // load resolved no key from it, which is exactly the first-start case:
-        // a file that exists but is broken was refused during the load.
-        if let Some(file) = config
-            .iroh
-            .as_ref()
-            .and_then(|iroh| iroh.secret_key_file.as_deref())
-        {
-            let full = credential_file_path(Path::new(path).parent(), file);
-            if persist_identity_disabled() {
-                tracing::warn!(
-                    "{NO_PERSIST_ENV} is set: no secret key is written to {}, so the Node ID \
-                     will be different after every restart",
-                    full.display()
-                );
-                return Ok(EndpointIdentity::Ephemeral(SecretString::new(
-                    generate_secret_key_hex(),
-                )));
-            }
-            return match write_key_file(&full) {
-                Ok(hex) => {
-                    tracing::info!(
-                        "Generated an endpoint identity and saved it to {}; the Node ID is now \
-                         stable across restarts",
-                        full.display()
-                    );
-                    Ok(EndpointIdentity::Generated(SecretString::new(hex)))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Could not write an endpoint identity to {} ({e:#}); starting on a \
-                         throwaway one, so the Node ID will be different after the next restart",
-                        full.display()
-                    );
-                    Ok(EndpointIdentity::Ephemeral(SecretString::new(
-                        generate_secret_key_hex(),
-                    )))
-                }
-            };
-        }
-
+    // A pointed-to key file that does not exist yet. Reached only when the
+    // load resolved no key from it, which is exactly the first-start case:
+    // a file that exists but is broken was refused during the load.
+    if let Some(file) = config
+        .iroh
+        .as_ref()
+        .and_then(|iroh| iroh.secret_key_file.as_deref())
+    {
+        let full = credential_file_path(base_dir, "[iroh] secret_key_file", file)?;
         if persist_identity_disabled() {
             tracing::warn!(
-                "{NO_PERSIST_ENV} is set: [iroh] secret_key is not written to {path}, so the Node \
-                 ID will be different after every restart"
+                "{NO_PERSIST_ENV} is set: no secret key is written to {}, so the Node ID \
+                 will be different after every restart",
+                full.display()
             );
-            return Ok(EndpointIdentity::Ephemeral(SecretString::new(
-                generate_secret_key_hex(),
-            )));
+            return Ok(IdentityAction::Ephemeral);
         }
+        return Ok(IdentityAction::IntoFile(full));
+    }
 
-        match ProxyConfig::write_iroh_secret_key(path) {
-            Ok(hex) => {
-                tracing::info!(
-                    "Generated an endpoint identity and saved it to {path} as [iroh] secret_key; \
-                     the Node ID is now stable across restarts"
-                );
-                Ok(EndpointIdentity::Generated(SecretString::new(hex)))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Could not write an endpoint identity to {path} ({e:#}); starting on a \
-                     throwaway one, so the Node ID will be different after the next restart"
-                );
-                Ok(EndpointIdentity::Ephemeral(SecretString::new(
-                    generate_secret_key_hex(),
-                )))
-            }
+    if persist_identity_disabled() {
+        tracing::warn!(
+            "{NO_PERSIST_ENV} is set: [iroh] secret_key is not written to {where_}, so the Node \
+             ID will be different after every restart"
+        );
+        return Ok(IdentityAction::Ephemeral);
+    }
+
+    Ok(IdentityAction::IntoConfig)
+}
+
+/// The identity that comes from a key file: written when it can be, thrown away
+/// when it cannot.
+///
+/// A write that fails is *not* fatal. A config on a read-only mount, or one
+/// the server's user cannot write, is a normal deployment: refusing to start
+/// there would be strictly worse than the fresh-Node-ID behaviour this
+/// replaced. The key is generated either way, the warning says the Node ID
+/// will not survive a restart, and the server comes up.
+pub(crate) fn identity_into_file(full: &Path) -> EndpointIdentity {
+    match write_key_file(full) {
+        Ok(hex) => {
+            tracing::info!(
+                "Generated an endpoint identity and saved it to {}; the Node ID is now \
+                 stable across restarts",
+                full.display()
+            );
+            EndpointIdentity::Generated(SecretString::new(hex))
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Could not write an endpoint identity to {} ({e:#}); starting on a \
+                 throwaway one, so the Node ID will be different after the next restart",
+                full.display()
+            );
+            EndpointIdentity::Ephemeral(SecretString::new(generate_secret_key_hex()))
         }
     }
 }
@@ -330,12 +384,28 @@ pub(crate) fn absolute_env_path(path: &Path) -> PathBuf {
 /// sibling file (`secret_key_file = "iroh.key"`) mean the same thing no matter
 /// where the server is started from — the same reading
 /// `config.toml.admin-token` gets.
-pub(crate) fn credential_file_path(config_dir: Option<&Path>, path: &str) -> PathBuf {
+///
+/// A store with no directory has nothing for a relative path to be relative
+/// to, so one is refused rather than resolved against the working directory:
+/// the same path would then name a different file depending on where the
+/// process happened to be started, which is a guess dressed as a path.
+pub(crate) fn credential_file_path(
+    config_dir: Option<&Path>,
+    key: &str,
+    path: &str,
+) -> anyhow::Result<PathBuf> {
     let path = Path::new(path);
     if path.is_absolute() {
-        return path.to_path_buf();
+        return Ok(path.to_path_buf());
     }
-    config_dir.unwrap_or(Path::new(".")).join(path)
+    let Some(dir) = config_dir else {
+        anyhow::bail!(
+            "{key} is a relative path ({}) and this store has no directory to resolve it \
+             against: name an absolute path",
+            path.display()
+        );
+    };
+    Ok(dir.join(path))
 }
 
 /// Reads the file a `*_file` credential names.
@@ -416,11 +486,15 @@ pub(crate) fn resolve_secret_key_source(
     }
     // An environment-named file outranks the config's pointer: both are files,
     // but deployment wiring wins over what the file on disk says.
-    if let Some(full) = env_file.map(Path::to_path_buf).or_else(|| {
-        iroh.secret_key_file
-            .as_ref()
-            .map(|file| credential_file_path(config_dir, file))
-    }) {
+    let config_file = match iroh.secret_key_file.as_ref() {
+        Some(file) => Some(credential_file_path(
+            config_dir,
+            "[iroh] secret_key_file",
+            file,
+        )?),
+        None => None,
+    };
+    if let Some(full) = env_file.map(Path::to_path_buf).or(config_file) {
         return match read_credential_file(&full, "secret_key")? {
             Some(key) => Ok(Some((key, CredentialSource::File))),
             None => Ok(None),
@@ -468,7 +542,7 @@ pub(crate) fn resolve_relay_auth_token_source(
         )));
     }
     if let Some(file) = &iroh.relay_auth_token_file {
-        let full = credential_file_path(config_dir, file);
+        let full = credential_file_path(config_dir, "[iroh] relay_auth_token_file", file)?;
         return match read_credential_file(&full, "relay_auth_token")? {
             Some(token) => Ok(Some((token, CredentialSource::File))),
             None => anyhow::bail!(
@@ -652,24 +726,69 @@ impl ProxyConfig {
     /// edited as TOML rather than re-serialized from a `ProxyConfig`, which
     /// would drop the operator's prose along with the config.
     pub fn write_iroh_secret_key(path: &str) -> anyhow::Result<String> {
-        with_config_lock(path, || Self::write_iroh_secret_key_unlocked(path))
+        // Zeroizing from the moment it exists, so that a write that fails
+        // does not leave the key in the heap on the way out. The copy the
+        // caller receives is its own to wipe.
+        let hex = SecretString::new(generate_secret_key_hex());
+        crate::storage::file::FileStorage::new(path).write_endpoint_key(&hex)?;
+        Ok(hex.expose_secret_cloned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store with no directory has nothing for a relative path to be
+    /// relative to, so one is refused rather than resolved against the
+    /// working directory.
+    ///
+    /// The file the working directory happens to hold is not the file the
+    /// configuration named, and the same path would name a different file
+    /// depending on where the process was started from.
+    #[test]
+    fn a_relative_credential_path_needs_a_directory_to_be_relative_to() {
+        let error = credential_file_path(None, "[iroh] secret_key_file", "keys/iroh")
+            .expect_err("a relative path with no directory is refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("[iroh] secret_key_file"),
+            "the error names the key: {message}"
+        );
+        assert!(
+            message.contains("iroh"),
+            "the error names the path: {message}"
+        );
     }
 
-    fn write_iroh_secret_key_unlocked(path: &str) -> anyhow::Result<String> {
-        let key = iroh::SecretKey::generate();
-        let hex = hex::encode(key.to_bytes());
+    /// An absolute path is what it is, whatever the directory is: it names the
+    /// same file from anywhere.
+    ///
+    /// The path this test uses is the one the platform agrees is absolute. A
+    /// Windows absolute path carries a drive prefix, and a rooted path
+    /// without one is **not** absolute there — it names a file on whichever
+    /// drive the process is on, which is the very thing this code refuses to
+    /// guess at.
+    #[test]
+    fn an_absolute_credential_path_needs_no_directory() {
+        #[cfg(windows)]
+        let absolute = Path::new(r"C:\nexapipe\iroh.key");
+        #[cfg(not(windows))]
+        let absolute = Path::new("/etc/nexapipe/iroh.key");
 
-        let mut doc = read_config_document(path, "secret_key not written")?;
+        let resolved =
+            credential_file_path(None, "[iroh] secret_key_file", &absolute.to_string_lossy())
+                .expect("an absolute path is accepted");
+        assert_eq!(resolved, absolute);
+    }
 
-        // `sub_table` rather than `entry("iroh")`: a config with no `[iroh]` at
-        // all should gain the one key, not a header and a key.
-        let iroh_table = sub_table(doc.as_table_mut(), "iroh", path).map_err(|_| {
-            anyhow::anyhow!("{path}: [iroh] is not a table, secret_key not written")
-        })?;
-        iroh_table.insert("secret_key", toml_edit::value(hex.as_str()));
-
-        write_config_document(path, doc)?;
-
-        Ok(hex)
+    /// A relative path against a directory is resolved against that
+    /// directory, not the working one.
+    #[test]
+    fn a_relative_credential_path_is_resolved_against_the_directory() {
+        let dir = Path::new("/etc/nexapipe");
+        let resolved = credential_file_path(Some(dir), "[iroh] secret_key_file", "iroh.key")
+            .expect("a relative path with a directory is resolved");
+        assert_eq!(resolved, dir.join("iroh.key"));
     }
 }

@@ -1904,7 +1904,12 @@ fn auth_state(config: AuthConfig) -> (conn::AuthState, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("a temp dir");
     let path = dir.path().join("config.toml");
     (
-        conn::AuthState::new(config, path.to_string_lossy().into_owned()),
+        conn::AuthState::new(
+            config,
+            std::sync::Arc::new(nexapipe::storage::FileStorage::new(
+                path.to_string_lossy().into_owned(),
+            )),
+        ),
         dir,
     )
 }

@@ -7,6 +7,7 @@ pub mod local_proxy;
 
 mod access;
 mod health;
+mod instance;
 mod plaintext;
 mod request;
 mod server;
@@ -19,6 +20,7 @@ mod tests;
 pub use crate::http::BackendClients;
 
 pub use health::sync_health_checks;
+pub use instance::{Proxy, ProxyBuilder};
 pub use server::{ProxyOptions, run_local_proxy, run_proxy};
 
 pub(crate) use plaintext::plaintext_auth_conflict;

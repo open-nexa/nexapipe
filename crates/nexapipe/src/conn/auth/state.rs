@@ -5,7 +5,8 @@
 //! server counted.
 
 use crate::auth::AuthConfig;
-use crate::config_watcher::save_auth_state;
+use crate::config_watcher::save_auth_state_to;
+use crate::storage::Storage;
 
 use super::authenticator::{Authenticator, ConfigAuthenticator};
 
@@ -23,8 +24,12 @@ use std::sync::OnceLock;
 #[derive(Clone)]
 pub struct AuthState {
     config: Arc<tokio::sync::RwLock<AuthConfig>>,
-    path: String,
-    state_path: String,
+    /// Where the configuration and the counters are kept.
+    ///
+    /// A store rather than a path: the enrollment writes a credential into it,
+    /// the counters are written back into it, and a store that is not a file
+    /// has no paths to name.
+    storage: Arc<dyn Storage>,
     /// How many enrollments have been applied to the live config.
     ///
     /// The configuration watcher reads the file **before** it takes the lock
@@ -56,11 +61,11 @@ pub struct AuthState {
 }
 
 impl AuthState {
-    /// Wraps a freshly loaded config together with the file it came from.
+    /// Wraps a freshly loaded config together with the store it came from.
     ///
     /// The credentials in the configuration are what this checks.
-    pub fn new(config: AuthConfig, path: impl Into<String>) -> Self {
-        Self::with_authenticator(config, path, Arc::new(ConfigAuthenticator))
+    pub fn new(config: AuthConfig, storage: Arc<dyn Storage>) -> Self {
+        Self::with_authenticator(config, storage, Arc::new(ConfigAuthenticator))
     }
 
     /// Wraps a freshly loaded config, and the authenticator that checks the
@@ -73,17 +78,12 @@ impl AuthState {
     /// and the step memory stay where every other build keeps them.
     pub fn with_authenticator(
         config: AuthConfig,
-        path: impl Into<String>,
+        storage: Arc<dyn Storage>,
         authenticator: Arc<dyn Authenticator>,
     ) -> Self {
-        let path = path.into();
-        let state_path = crate::auth::state::path_for(&path)
-            .to_string_lossy()
-            .into_owned();
         Self {
             config: Arc::new(tokio::sync::RwLock::new(config)),
-            path,
-            state_path,
+            storage,
             enroll_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             authenticator,
         }
@@ -119,20 +119,9 @@ impl AuthState {
         &self.config
     }
 
-    /// The config file the enrollment token is written to.
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-
-    /// The state file the runtime counters are persisted to.
-    ///
-    /// Beside the configuration rather than inside it: the counters are what
-    /// the server learned while it was running, and writing them into the
-    /// operator's file would move its modification time every time a client
-    /// mistyped a code — which the configuration watcher watches, so a
-    /// lockout was a configuration reload.
-    pub fn state_path(&self) -> &str {
-        &self.state_path
+    /// The store the configuration and the counters are kept in.
+    pub fn storage(&self) -> &Arc<dyn Storage> {
+        &self.storage
     }
 }
 
@@ -158,7 +147,7 @@ impl AuthState {
 /// go. The read guard is dropped before the disk write, so the lock is held
 /// for the snapshot and not for the write.
 pub(crate) async fn persist_auth_state(auth: &AuthState) -> anyhow::Result<()> {
-    let path = auth.state_path().to_string();
+    let storage = auth.storage().clone();
     let config = auth.config().clone();
     let (done, wait) = tokio::sync::oneshot::channel();
 
@@ -169,14 +158,15 @@ pub(crate) async fn persist_auth_state(auth: &AuthState) -> anyhow::Result<()> {
         // The snapshot is what the write needs; the lock it was taken under is
         // not, and a writer should not wait for the disk on top of the gate.
         drop(cfg);
-        let result = tokio::task::spawn_blocking(move || save_auth_state(&path, &snapshot)).await;
+        let result = save_auth_state_to(storage.as_ref(), &snapshot).await;
         drop(gate);
         let _ = done.send(result);
     });
 
-    wait.await
-        .map_err(|_| anyhow::anyhow!("the auth state write was abandoned"))?
-        .map_err(|e| anyhow::anyhow!("the auth state write did not run: {e}"))?
+    let result = wait
+        .await
+        .map_err(|_| anyhow::anyhow!("the auth state write was abandoned"))?;
+    result.map_err(|e| anyhow::anyhow!("the auth state write did not run: {e}"))
 }
 
 /// Runs a write against the config file without occupying a worker.
@@ -202,21 +192,16 @@ pub(crate) async fn persist_auth_state(auth: &AuthState) -> anyhow::Result<()> {
 /// cannot be un-spawned. Two writes to one file then overlap and one of them
 /// is lost. The gate is taken *inside* the detached task, so it is held for as
 /// long as the write takes and not for as long as the caller is patient.
-pub(in crate::conn) async fn blocking_config_write<T, F>(
-    path: String,
-    write: F,
-) -> anyhow::Result<T>
+pub(in crate::conn) async fn storage_write<T, F>(what: String, write: F) -> anyhow::Result<T>
 where
-    F: FnOnce(&str) -> anyhow::Result<T> + Send + 'static,
+    F: std::future::Future<Output = anyhow::Result<T>> + Send + 'static,
     T: Send + 'static,
 {
-    // Named apart from the `path` the closure takes, which it moves.
-    let failed_path = path.clone();
     let (done, wait) = tokio::sync::oneshot::channel();
 
     tokio::spawn(async move {
         let _gate = config_write_gate().lock().await;
-        let result = tokio::task::spawn_blocking(move || write(&path)).await;
+        let result = write.await;
         // A caller that timed out is not an error worth reporting: the write
         // it asked for has happened, which is what the gate is for.
         let _ = done.send(result);
@@ -224,8 +209,8 @@ where
 
     let result = wait
         .await
-        .map_err(|_| anyhow::anyhow!("the write to {failed_path} was abandoned"))?;
-    result.map_err(|e| anyhow::anyhow!("the write to {failed_path} did not run: {e}"))?
+        .map_err(|_| anyhow::anyhow!("the write to {what} was abandoned"))?;
+    result.map_err(|e| anyhow::anyhow!("the write to {what} did not run: {e}"))
 }
 
 /// Serialises writes to the config file and to the state file beside it,
