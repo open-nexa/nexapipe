@@ -74,6 +74,43 @@ and its meaning.
   — which is what keeps the manifest free of the warning cargo gives for
   naming both.
 
+### Fixed
+
+- **The desktop does not act on one missed service read.** The service gate is
+  read over the IPC port, and that read has deadlines of its own — half a
+  second to connect and five to be answered. A busy machine misses them while
+  the service is alive and well, and the poll believed the miss at once: it
+  turned TUN off, lost the setting across the next launch, and raised the
+  drift banner that offers to reinstall a service that was never broken. The
+  reads now count consecutive failures, and the liveness answer is believed
+  only after three unanswered reads in a row; a read that answered clears the
+  count. Nothing is claimed while the answer is unknown — not the TUN request,
+  not the toast, not the banner. The drift claim rests on the version question
+  rather than on the liveness answer: a service that is up but did not say
+  which build it is is a drift, while a read that timed out says nothing about
+  the build at all.
+- **A service the manager says is absent is taken at once.** The hysteresis
+  that keeps a missed IPC deadline from turning TUN off was applied to every
+  unanswered read, including the ones the platform's own service manager
+  answered. That read is local — it talks to the service database, not to the
+  service over the IPC port — and it has no deadline a busy machine can miss. A
+  service it says is not installed is gone for certain, and making the TUN
+  request wait for the IPC to miss three deadlines first left a request
+  standing for a service that is not there. The status read now says when it
+  failed, so "not installed" and "the answer never came back" are two
+  different facts again.
+
+### Added
+
+- **The desktop's store tests run in CI, and every one of them runs.** The
+  script named the five test files it was written for, so a test file added
+  later would sit in the tree unread — the same thing that let the original
+  five go unrun in the first place, one file further along. The files are
+  found instead of listed: a test file that is added is a test file that runs.
+  The store also has a test of its own for the first time — five cases, each
+  of which fails against the code before the service-read fix and passes
+  against it.
+
 ## [1.0.1] — 2026-10-25
 
 A packaging release: the code is the code of 1.0.0, and what changed is where
