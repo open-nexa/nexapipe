@@ -429,3 +429,93 @@ fn a_device_credential_is_zeroizing() {
         "the seed reached a debug dump: {shown}"
     );
 }
+
+/// Each of the store's three documents is named by the one it is.
+///
+/// The configuration, the counters and the admin token are three documents in
+/// three files. A message about one of them has to name that one: an operator
+/// sent to the configuration to fix a counter that lives beside it finds
+/// nothing there.
+#[tokio::test]
+async fn each_document_is_named_by_the_document_it_is() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    seed(&dir);
+    let store = store(&dir);
+
+    let config = store.describe();
+    let state = store.describe_state();
+    let token = store.describe_token();
+
+    assert_ne!(
+        config, state,
+        "the counters are named by the configuration's own file"
+    );
+    assert_ne!(
+        config, token,
+        "the admin token is named by the configuration's own file"
+    );
+    assert_ne!(
+        state, token,
+        "the admin token is named by the counters' file"
+    );
+
+    // And each name is the file that document is actually written to.
+    assert!(
+        state.ends_with("config.state.toml"),
+        "the counters are not named by the file they are written to: {state}"
+    );
+    assert!(
+        token.ends_with("config.toml.admin-token"),
+        "the token is not named by the file it is written to: {token}"
+    );
+}
+
+/// The message an operator reads names the file the thing is actually in.
+///
+/// `nexapipe status` on an instance that has never started says where the
+/// admin token is. It has to be the token's own file: the token is not in the
+/// configuration, and an operator sent there finds nothing.
+#[tokio::test]
+async fn the_status_message_names_the_token_file() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[admin]\nlisten_addr = \"127.0.0.1:9090\"\n")
+        .expect("the configuration is written");
+    let store = store(&dir);
+
+    let error = nexapipe::status::status(&*store, false)
+        .await
+        .expect_err("there is no token yet");
+    let message = error.to_string();
+
+    assert!(
+        message.contains(&store.describe_token()),
+        "the message does not name the token's file ({}): {message}",
+        store.describe_token()
+    );
+    assert!(
+        !message.contains(&store.describe_state()),
+        "the message names the counters' file instead of the token's: {message}"
+    );
+}
+
+/// A configuration named without a directory still has one: the working
+/// directory is the one.
+///
+/// A store over a file always has a directory to resolve a relative path
+/// against — the configuration's own — so the question never arises for it.
+/// It arises for a store that has no files beside it, and that store has to
+/// refuse the path rather than guess at it.
+#[tokio::test]
+async fn a_configuration_named_without_a_directory_has_the_working_one() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    std::fs::write(&path, "[iroh]\nsecret_key_file = \"iroh.key\"\n")
+        .expect("the configuration is written");
+    let store = FileStorage::new(&path);
+
+    assert!(
+        store.base_dir().is_some(),
+        "a store over a file always has a directory: the configuration's own"
+    );
+}

@@ -480,10 +480,25 @@ impl Storage for FileStorage {
         self.config_path.display().to_string()
     }
 
+    fn describe_state(&self) -> String {
+        self.state_path.display().to_string()
+    }
+
+    fn describe_token(&self) -> String {
+        self.token_path.display().to_string()
+    }
+
     fn base_dir(&self) -> Option<&Path> {
-        self.config_path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
+        // The directory the configuration's own relative paths are resolved
+        // against.
+        //
+        // A configuration named without a directory — `config.toml` — lives in
+        // the working directory, so the working directory is the one, and it
+        // is `Some` even then. A store with no directory at all is a store
+        // with no files beside it, which is a different thing: there, a
+        // relative path has nothing to be relative to, and it is refused
+        // rather than guessed at.
+        self.config_path.parent()
     }
 
     fn credential_file(&self) -> Option<&Path> {

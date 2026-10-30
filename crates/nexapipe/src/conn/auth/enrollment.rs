@@ -488,7 +488,7 @@ pub(super) async fn enroll_client(
             tracing::warn!(
                 "2FA: failed to persist the enrollment lockout for '{}' to {}: {}",
                 client_id,
-                auth.storage().describe(),
+                auth.storage().describe_state(),
                 e
             );
         }
@@ -665,7 +665,7 @@ pub(super) async fn enroll_client(
         tracing::warn!(
             "2FA: failed to persist the cleared counter for '{}' to {}: {}",
             client_id,
-            auth.storage().describe(),
+            auth.storage().describe_state(),
             e
         );
     }

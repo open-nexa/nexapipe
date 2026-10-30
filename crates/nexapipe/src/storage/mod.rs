@@ -190,20 +190,19 @@ pub async fn ensure_endpoint_identity(
         )),
         IdentityAction::IntoFile(full) => Ok(identity_into_file(&full)),
         IdentityAction::IntoConfig => {
-            let hex = crate::config::generate_secret_key_hex();
-            match storage
-                .write_endpoint_key(&SecretString::new(hex.clone()))
-                .await
-            {
+            // The key is zeroizing from the moment it exists. A plain `String`
+            // would leave the hex in the heap on the path where the write
+            // failed, and the clone the write needed would leave a second copy
+            // there on the path where it succeeded.
+            let hex = SecretString::new(crate::config::generate_secret_key_hex());
+            match storage.write_endpoint_key(&hex).await {
                 Ok(()) => {
                     tracing::info!(
                         "Generated an endpoint identity and saved it in {} as [iroh] secret_key; \
                          the Node ID is now stable across restarts",
                         storage.describe()
                     );
-                    Ok(crate::config::EndpointIdentity::Generated(
-                        SecretString::new(hex),
-                    ))
+                    Ok(crate::config::EndpointIdentity::Generated(hex))
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -236,7 +235,28 @@ pub trait Storage: Send + Sync + 'static {
     /// database. The message an operator reads when the configuration is not
     /// there says which one, because "not found" without a name is a question
     /// the operator has to answer by guessing.
+    ///
+    /// This is the **configuration**. The two documents the process writes
+    /// beside it are named by [`Storage::describe_state`] and
+    /// [`Storage::describe_token`], because a message about one of them has
+    /// to name that one: an operator sent to the configuration file to fix a
+    /// counter that lives in another file finds nothing there.
     fn describe(&self) -> String;
+
+    /// What this store calls the document the runtime counters are kept in.
+    ///
+    /// The counters — how many times a client got it wrong, until when it is
+    /// locked out, when it was last seen — are kept beside the configuration
+    /// rather than in it, so the file that holds them is not the file the
+    /// operator edits.
+    fn describe_state(&self) -> String;
+
+    /// What this store calls the document the admin token is kept in.
+    ///
+    /// The token is one opaque value in a document of its own, and the message
+    /// that says where to find it has to name the document it is in rather
+    /// than the configuration next to it.
+    fn describe_token(&self) -> String;
 
     /// The directory a relative path in the configuration is resolved against.
     ///

@@ -87,7 +87,7 @@ pub async fn load_or_create_from(storage: &dyn Storage) -> Option<SecretString> 
         Err(reason) => {
             tracing::error!(
                 "Admin token at {} is unusable, /v1/* is served as 503: {reason}",
-                storage.describe()
+                storage.describe_token()
             );
             return None;
         }
@@ -104,14 +104,14 @@ pub async fn load_or_create_from(storage: &dyn Storage) -> Option<SecretString> 
             // looking for the token is looking for this line.
             tracing::info!(
                 "Generated an admin token in {}; `nexapipe status` reads it from there",
-                storage.describe()
+                storage.describe_token()
             );
             Some(token)
         }
         Err(reason) => {
             tracing::error!(
                 "Could not create an admin token in {}, /v1/* is served as 503: {reason}",
-                storage.describe()
+                storage.describe_token()
             );
             None
         }

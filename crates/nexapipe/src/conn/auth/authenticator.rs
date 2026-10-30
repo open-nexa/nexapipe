@@ -403,7 +403,7 @@ impl Authenticator for ConfigAuthenticator {
                 tracing::warn!(
                     "2FA: failed to persist the auth counters for '{}' to {}: {}",
                     client_id,
-                    ctx.state.storage().describe(),
+                    ctx.state.storage().describe_state(),
                     e
                 );
             }

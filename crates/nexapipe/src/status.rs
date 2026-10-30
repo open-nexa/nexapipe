@@ -70,14 +70,14 @@ pub async fn status(storage: &dyn Storage, json: bool) -> anyhow::Result<()> {
                 "the admin token in {} could not be read ({reason}); it is written when the server \
              first starts with an [admin] listener, so start the server once before asking it \
              for its status",
-                storage.describe()
+                storage.describe_token()
             )
         })?
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "no admin token in {}; it is written when the server first starts with an [admin] \
              listener, so start the server once before asking it for its status",
-                storage.describe()
+                storage.describe_token()
             )
         })?;
 

@@ -146,14 +146,18 @@ impl ProxyConfig {
             ))),
             IdentityAction::IntoFile(full) => Ok(identity_into_file(&full)),
             IdentityAction::IntoConfig => {
-                let hex = generate_secret_key_hex();
-                match storage.write_endpoint_key(&SecretString::new(hex.clone())) {
+                // Zeroizing from the moment it exists: a plain `String` would
+                // leave the hex in the heap on the path where the write
+                // failed, and the clone the write needed would leave a second
+                // copy there on the path where it succeeded.
+                let hex = SecretString::new(generate_secret_key_hex());
+                match storage.write_endpoint_key(&hex) {
                     Ok(()) => {
                         tracing::info!(
                             "Generated an endpoint identity and saved it to {path} as [iroh] \
                              secret_key; the Node ID is now stable across restarts"
                         );
-                        Ok(EndpointIdentity::Generated(SecretString::new(hex)))
+                        Ok(EndpointIdentity::Generated(hex))
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -226,7 +230,7 @@ pub(crate) fn identity_action(
         .as_ref()
         .and_then(|iroh| iroh.secret_key_file.as_deref())
     {
-        let full = credential_file_path(base_dir, file);
+        let full = credential_file_path(base_dir, "[iroh] secret_key_file", file)?;
         if persist_identity_disabled() {
             tracing::warn!(
                 "{NO_PERSIST_ENV} is set: no secret key is written to {}, so the Node ID \
@@ -380,12 +384,28 @@ pub(crate) fn absolute_env_path(path: &Path) -> PathBuf {
 /// sibling file (`secret_key_file = "iroh.key"`) mean the same thing no matter
 /// where the server is started from — the same reading
 /// `config.toml.admin-token` gets.
-pub(crate) fn credential_file_path(config_dir: Option<&Path>, path: &str) -> PathBuf {
+///
+/// A store with no directory has nothing for a relative path to be relative
+/// to, so one is refused rather than resolved against the working directory:
+/// the same path would then name a different file depending on where the
+/// process happened to be started, which is a guess dressed as a path.
+pub(crate) fn credential_file_path(
+    config_dir: Option<&Path>,
+    key: &str,
+    path: &str,
+) -> anyhow::Result<PathBuf> {
     let path = Path::new(path);
     if path.is_absolute() {
-        return path.to_path_buf();
+        return Ok(path.to_path_buf());
     }
-    config_dir.unwrap_or(Path::new(".")).join(path)
+    let Some(dir) = config_dir else {
+        anyhow::bail!(
+            "{key} is a relative path ({}) and this store has no directory to resolve it \
+             against: name an absolute path",
+            path.display()
+        );
+    };
+    Ok(dir.join(path))
 }
 
 /// Reads the file a `*_file` credential names.
@@ -466,11 +486,15 @@ pub(crate) fn resolve_secret_key_source(
     }
     // An environment-named file outranks the config's pointer: both are files,
     // but deployment wiring wins over what the file on disk says.
-    if let Some(full) = env_file.map(Path::to_path_buf).or_else(|| {
-        iroh.secret_key_file
-            .as_ref()
-            .map(|file| credential_file_path(config_dir, file))
-    }) {
+    let config_file = match iroh.secret_key_file.as_ref() {
+        Some(file) => Some(credential_file_path(
+            config_dir,
+            "[iroh] secret_key_file",
+            file,
+        )?),
+        None => None,
+    };
+    if let Some(full) = env_file.map(Path::to_path_buf).or(config_file) {
         return match read_credential_file(&full, "secret_key")? {
             Some(key) => Ok(Some((key, CredentialSource::File))),
             None => Ok(None),
@@ -518,7 +542,7 @@ pub(crate) fn resolve_relay_auth_token_source(
         )));
     }
     if let Some(file) = &iroh.relay_auth_token_file {
-        let full = credential_file_path(config_dir, file);
+        let full = credential_file_path(config_dir, "[iroh] relay_auth_token_file", file)?;
         return match read_credential_file(&full, "relay_auth_token")? {
             Some(token) => Ok(Some((token, CredentialSource::File))),
             None => anyhow::bail!(
@@ -702,9 +726,61 @@ impl ProxyConfig {
     /// edited as TOML rather than re-serialized from a `ProxyConfig`, which
     /// would drop the operator's prose along with the config.
     pub fn write_iroh_secret_key(path: &str) -> anyhow::Result<String> {
-        let hex = generate_secret_key_hex();
-        crate::storage::file::FileStorage::new(path)
-            .write_endpoint_key(&SecretString::new(hex.clone()))?;
-        Ok(hex)
+        // Zeroizing from the moment it exists, so that a write that fails
+        // does not leave the key in the heap on the way out. The copy the
+        // caller receives is its own to wipe.
+        let hex = SecretString::new(generate_secret_key_hex());
+        crate::storage::file::FileStorage::new(path).write_endpoint_key(&hex)?;
+        Ok(hex.expose_secret_cloned())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A store with no directory has nothing for a relative path to be
+    /// relative to, so one is refused rather than resolved against the
+    /// working directory.
+    ///
+    /// The file the working directory happens to hold is not the file the
+    /// configuration named, and the same path would name a different file
+    /// depending on where the process was started from.
+    #[test]
+    fn a_relative_credential_path_needs_a_directory_to_be_relative_to() {
+        let error = credential_file_path(None, "[iroh] secret_key_file", "keys/iroh")
+            .expect_err("a relative path with no directory is refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("[iroh] secret_key_file"),
+            "the error names the key: {message}"
+        );
+        assert!(
+            message.contains("keys/iroh"),
+            "the error names the path: {message}"
+        );
+    }
+
+    /// An absolute path is what it is, whatever the directory is: it names the
+    /// same file from anywhere.
+    #[test]
+    fn an_absolute_credential_path_needs_no_directory() {
+        let resolved =
+            credential_file_path(None, "[iroh] secret_key_file", "/etc/nexapipe/iroh.key")
+                .expect("an absolute path is accepted");
+        assert_eq!(resolved, Path::new("/etc/nexapipe/iroh.key"));
+    }
+
+    /// A relative path against a directory is resolved against that
+    /// directory, not the working one.
+    #[test]
+    fn a_relative_credential_path_is_resolved_against_the_directory() {
+        let resolved = credential_file_path(
+            Some(Path::new("/etc/nexapipe")),
+            "[iroh] secret_key_file",
+            "iroh.key",
+        )
+        .expect("a relative path with a directory is resolved");
+        assert_eq!(resolved, Path::new("/etc/nexapipe/iroh.key"));
     }
 }

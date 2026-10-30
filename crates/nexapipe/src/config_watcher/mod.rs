@@ -570,7 +570,7 @@ impl ConfigWatcher {
             {
                 tracing::warn!(
                     "2FA: failed to persist the reset enrollment counters to {}: {}",
-                    state.storage().describe(),
+                    state.storage().describe_state(),
                     e
                 );
             }
