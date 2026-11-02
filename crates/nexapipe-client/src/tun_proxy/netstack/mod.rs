@@ -171,17 +171,7 @@ impl StackBuilder {
     /// Returns the packet halves, the task that drives the stack, and the two
     /// halves of the UDP socket. The task is `None` when neither TCP nor UDP
     /// is enabled, and so are the sockets.
-    pub fn build(
-        self,
-    ) -> Result<
-        (
-            Stack,
-            Option<Runner>,
-            Option<UdpSocket>,
-            Option<TcpListener>,
-        ),
-        StackError,
-    > {
+    pub fn build(self) -> Result<StackParts, StackError> {
         if self.mtu == 0 {
             return Err(StackError::InvalidConfig("an MTU of zero"));
         }
@@ -245,6 +235,18 @@ impl StackBuilder {
         Ok((stack, Some(runner), udp_socket, tcp_listener))
     }
 }
+
+/// What a built stack is: the packet halves, the task that drives the stack,
+/// and the two halves of the UDP socket.
+///
+/// The task is `None` when neither TCP nor UDP is enabled, and so are the
+/// sockets.
+pub type StackParts = (
+    Stack,
+    Option<Runner>,
+    Option<UdpSocket>,
+    Option<TcpListener>,
+);
 
 /// The packet halves: the frames going into the stack, and the frames coming
 /// out of it.

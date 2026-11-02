@@ -66,6 +66,14 @@ impl AsyncRead for TcpStream {
     }
 }
 
+impl Drop for TcpStream {
+    fn drop(&mut self) {
+        // The application is gone: the runner looks at the flows that are
+        // left when it wakes up, so it has to be woken to notice.
+        self.control.notify.notify_one();
+    }
+}
+
 impl AsyncWrite for TcpStream {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -262,6 +270,10 @@ impl SocketControl {
         state.socket_closed = true;
         state.recv_closed = true;
         state.wake_reader();
+        // A writer that is waiting for room in the outgoing buffer has to be
+        // woken: it would otherwise wait for a room that is never going to
+        // come, and the flow would never end.
+        state.wake_writer();
         state.wake_closer();
     }
 
@@ -293,6 +305,12 @@ impl SocketControl {
         }
         let moved = state.recv.dequeue_slice(buf.initialize_unfilled());
         buf.advance(moved);
+        drop(state);
+        if moved > 0 {
+            // Room was freed: the runner can move the rest of the socket's
+            // bytes out of it, and the window the peer sees opens again.
+            self.notify.notify_one();
+        }
         Poll::Ready(Ok(()))
     }
 

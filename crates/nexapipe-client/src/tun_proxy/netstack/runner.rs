@@ -13,6 +13,7 @@
 //! wrote moves into the socket.
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,6 +43,24 @@ const TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(7200);
 /// How often a TCP socket is probed when it has nothing to send.
 const TCP_KEEP_ALIVE: Duration = Duration::from_secs(28);
 
+/// How long a handshake may take before the socket that waits for it is given
+/// up on.
+///
+/// A socket that opens a connection listens until the stack has seen the
+/// segment that opened it. A socket that is still listening that long after
+/// it was opened is one the stack refused — the segment's checksum did not
+/// add up — and a listening socket has no timeout of its own: it would wait
+/// for ever, holding a slot and a tunnel that nothing ever finishes.
+const TCP_HANDSHAKE_GRACE: Duration = Duration::from_secs(10);
+
+/// How long the end of a connection may take.
+///
+/// The application is gone once it has closed its side, but the bytes that
+/// are still in the socket's send buffer have to go out first, and the peer
+/// has to acknowledge them. A peer that never does must not hold the flow's
+/// slot for ever.
+const TCP_FIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// What the runner needs to run.
 pub(super) struct RunnerParts {
     /// The device the stack is bound to.
@@ -69,7 +88,9 @@ pub(super) fn spawn(parts: RunnerParts) -> Runner {
 
 async fn run(mut parts: RunnerParts) -> Result<(), StackError> {
     let mut sockets: SocketSet<'static> = SocketSet::new(vec![]);
-    let mut flows: HashMap<SocketHandle, Arc<SocketControl>> = HashMap::new();
+    let mut flows: HashMap<SocketHandle, Flow> = HashMap::new();
+    // The flows whose handshake is unfinished, by the addresses they connect.
+    let mut handshaking: HashMap<(SocketAddr, SocketAddr), SocketHandle> = HashMap::new();
 
     loop {
         // Every frame that is waiting is looked at before any of them reaches
@@ -81,13 +102,19 @@ async fn run(mut parts: RunnerParts) -> Result<(), StackError> {
             waiting.push(frame);
         }
         for frame in waiting {
-            take_frame(&mut parts, &mut sockets, &mut flows, frame);
+            take_frame(
+                &mut parts,
+                &mut sockets,
+                &mut flows,
+                &mut handshaking,
+                frame,
+            );
         }
 
         // Let the stack work on what it has.
         let now = Instant::now();
         parts.iface.poll(now, &mut parts.device, &mut sockets);
-        pump(&mut sockets, &mut flows);
+        pump(&mut sockets, &mut flows, &mut handshaking, now);
 
         // Then wait for the next thing to happen: a frame, an application with
         // something to say, or the stack's own timer.
@@ -107,7 +134,13 @@ async fn run(mut parts: RunnerParts) -> Result<(), StackError> {
         tokio::select! {
             frame = parts.ingress.recv() => {
                 match frame {
-                    Some(frame) => take_frame(&mut parts, &mut sockets, &mut flows, frame),
+                    Some(frame) => take_frame(
+                        &mut parts,
+                        &mut sockets,
+                        &mut flows,
+                        &mut handshaking,
+                        frame,
+                    ),
                     // The other end of the stack is gone: there is nothing
                     // left to drive it for.
                     None => break,
@@ -121,18 +154,34 @@ async fn run(mut parts: RunnerParts) -> Result<(), StackError> {
     Ok(())
 }
 
+/// One flow the runner drives.
+struct Flow {
+    /// What the application and the runner share.
+    control: Arc<SocketControl>,
+    /// The addresses the flow connects, while the handshake is unfinished.
+    ///
+    /// This is the key a segment that is sent again is matched against: the
+    /// socket that is already there answers it.
+    handshake: Option<(SocketAddr, SocketAddr)>,
+    /// When the socket was opened.
+    opened_at: Instant,
+    /// When the application closed its side and the FIN went out.
+    closed_at: Option<Instant>,
+}
+
 /// Take one frame from the device: open a connection if it opens one, and
 /// hand the frame to the stack.
 fn take_frame(
     parts: &mut RunnerParts,
     sockets: &mut SocketSet<'static>,
-    flows: &mut HashMap<SocketHandle, Arc<SocketControl>>,
+    flows: &mut HashMap<SocketHandle, Flow>,
+    handshaking: &mut HashMap<(SocketAddr, SocketAddr), SocketHandle>,
     frame: Vec<u8>,
 ) {
-    if parts.tcp_enabled {
-        if let Some(syn) = packet::tcp_syn(&frame) {
-            open_flow(parts, sockets, flows, syn);
-        }
+    if parts.tcp_enabled
+        && let Some(syn) = packet::tcp_syn(&frame)
+    {
+        open_flow(parts, sockets, flows, handshaking, syn);
     }
     parts.device.push(frame);
 }
@@ -147,9 +196,19 @@ fn take_frame(
 fn open_flow(
     parts: &mut RunnerParts,
     sockets: &mut SocketSet<'static>,
-    flows: &mut HashMap<SocketHandle, Arc<SocketControl>>,
+    flows: &mut HashMap<SocketHandle, Flow>,
+    handshaking: &mut HashMap<(SocketAddr, SocketAddr), SocketHandle>,
     syn: packet::Syn,
 ) {
+    // A segment that is sent again — the answer to it was lost, or the
+    // device is impatient — is answered by the socket that is already
+    // there. A second socket would listen for the rest of its life: the
+    // stack gives a listening socket no timeout, and it would hold a slot
+    // and a tunnel that nothing ever finishes.
+    if handshaking.contains_key(&(syn.src, syn.dst)) {
+        return;
+    }
+
     let mut socket = tcp::Socket::new(
         tcp::SocketBuffer::new(vec![0u8; parts.tcp_recv_buffer_size as usize]),
         tcp::SocketBuffer::new(vec![0u8; parts.tcp_send_buffer_size as usize]),
@@ -168,7 +227,16 @@ fn open_flow(
         parts.notify.clone(),
     ));
     let handle = sockets.add(socket);
-    flows.insert(handle, control.clone());
+    handshaking.insert((syn.src, syn.dst), handle);
+    flows.insert(
+        handle,
+        Flow {
+            control: control.clone(),
+            handshake: Some((syn.src, syn.dst)),
+            opened_at: Instant::now(),
+            closed_at: None,
+        },
+    );
 
     let stream = TcpStream::new(control, syn.src, syn.dst);
     if parts.accept.send(stream).is_err() {
@@ -178,12 +246,18 @@ fn open_flow(
 }
 
 /// Move the bytes between the sockets and the applications.
-fn pump(sockets: &mut SocketSet<'static>, flows: &mut HashMap<SocketHandle, Arc<SocketControl>>) {
+fn pump(
+    sockets: &mut SocketSet<'static>,
+    flows: &mut HashMap<SocketHandle, Flow>,
+    handshaking: &mut HashMap<(SocketAddr, SocketAddr), SocketHandle>,
+    now: Instant,
+) {
     let mut finished: Vec<SocketHandle> = Vec::new();
 
-    for (handle, control) in flows.iter() {
+    for (handle, flow) in flows.iter_mut() {
         // Every socket in the set is a TCP socket: the set holds nothing else.
         let socket = sockets.get_mut::<tcp::Socket>(*handle);
+        let control = &flow.control;
 
         // What the peer sent: into the application's buffer.
         //
@@ -240,6 +314,16 @@ fn pump(sockets: &mut SocketSet<'static>, flows: &mut HashMap<SocketHandle, Arc<
         if control.send_closed() && control.send_is_empty() && !control.fin_sent() {
             socket.close();
             control.mark_fin_sent();
+            flow.closed_at = Some(now);
+        }
+
+        // The handshake is over once the connection is up. Until then the
+        // socket answers a segment that is sent again, so the key stays:
+        // a segment that arrives now opens a connection of its own.
+        if !matches!(socket.state(), tcp::State::Listen | tcp::State::SynReceived)
+            && let Some(key) = flow.handshake.take()
+        {
+            handshaking.remove(&key);
         }
 
         // The socket is closed on both sides.
@@ -249,16 +333,48 @@ fn pump(sockets: &mut SocketSet<'static>, flows: &mut HashMap<SocketHandle, Arc<
             continue;
         }
 
-        // The application dropped the stream: nothing is waiting for this
-        // flow any more, so the socket goes with it.
-        if Arc::strong_count(control) == 1 {
+        // The stack never took the segment that opened the connection, so the
+        // socket is still listening. A listening socket has no timeout: it
+        // has to be given up on here, or it waits for ever.
+        if socket.state() == tcp::State::Listen
+            && now >= flow.opened_at + TCP_HANDSHAKE_GRACE.into()
+        {
             socket.abort();
             finished.push(*handle);
+            continue;
+        }
+
+        // The application dropped the stream: nothing is waiting for this
+        // flow any more, so the socket goes with it.
+        //
+        // A flow that was closed cleanly is not aborted: the bytes that are
+        // still in the socket's send buffer have to go out, and the FIN with
+        // them. Aborting would throw them away, and the peer would be told
+        // that the connection was reset instead of being answered.
+        if Arc::strong_count(control) == 1 && !control.fin_sent() {
+            socket.abort();
+            finished.push(*handle);
+            continue;
+        }
+
+        // The application is gone and the FIN is on its way out, but the peer
+        // has not answered it. The wait is bounded: a peer that never answers
+        // must not hold the flow's slot for ever.
+        if let Some(closed_at) = flow.closed_at
+            && now >= closed_at + TCP_FIN_TIMEOUT.into()
+        {
+            socket.abort();
+            finished.push(*handle);
+            continue;
         }
     }
 
     for handle in finished {
-        flows.remove(&handle);
+        if let Some(flow) = flows.remove(&handle)
+            && let Some(key) = flow.handshake
+        {
+            handshaking.remove(&key);
+        }
         sockets.remove(handle);
     }
 }

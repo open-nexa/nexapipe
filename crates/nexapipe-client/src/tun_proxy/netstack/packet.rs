@@ -69,6 +69,14 @@ fn split(frame: &[u8]) -> Option<(IpProtocol, IpAddr, IpAddr, &[u8])> {
     match IpVersion::of_packet(frame).ok()? {
         IpVersion::Ipv4 => {
             let packet = Ipv4Packet::new_checked(frame).ok()?;
+            // A fragment carries a piece of a transport header, not a whole
+            // one: what it starts with is application data, not a port. The
+            // stack does not reassemble fragments — it is built without the
+            // fragmentation feature — so a fragment is dropped here rather
+            // than read as a datagram or a segment.
+            if packet.more_frags() || packet.frag_offset() != 0 {
+                return None;
+            }
             Some((
                 packet.next_header(),
                 IpAddr::V4(packet.src_addr()),

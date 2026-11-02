@@ -91,6 +91,11 @@ fn data_segment(seq: u32, ack: u32, payload: &[u8]) -> Vec<u8> {
 }
 
 /// A TCP segment, with the checksums the stack checks.
+///
+/// The arguments are the ones a segment is made of, and a segment is made of
+/// all of them: bundling them into a struct would only move the list
+/// somewhere else.
+#[allow(clippy::too_many_arguments)]
 fn segment(
     src: Ipv4Addr,
     dst: Ipv4Addr,
@@ -188,6 +193,27 @@ fn datagram_frame(
     packet
 }
 
+/// A piece of a datagram that the kernel split.
+///
+/// What the piece carries starts where the datagram's header would be, and
+/// the header says so: the stack does not reassemble fragments, so the piece
+/// must not be read as a datagram.
+fn fragment_frame(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let mut frame = datagram_frame(src, dst, src_port, dst_port, payload);
+    // The flags and the fragment offset: a piece that starts eight bytes into
+    // the datagram.
+    frame[6..8].copy_from_slice(&1u16.to_be_bytes());
+    let checksum = ones_complement_sum(&frame[..20]);
+    frame[10..12].copy_from_slice(&checksum.to_be_bytes());
+    frame
+}
+
 /// The sequence and acknowledgement numbers of a segment.
 fn seq_ack(frame: &[u8]) -> (u32, u32) {
     let ip = Ipv4Packet::new_checked(frame).expect("a packet");
@@ -207,6 +233,20 @@ fn datagram_payload(frame: &[u8]) -> Vec<u8> {
     let ip = Ipv4Packet::new_checked(frame).expect("a packet");
     let udp = UdpPacket::new_checked(ip.payload()).expect("a datagram");
     udp.payload().to_vec()
+}
+
+/// Whether the segment ends the connection.
+fn is_fin(frame: &[u8]) -> bool {
+    let ip = Ipv4Packet::new_checked(frame).expect("a packet");
+    let tcp = TcpPacket::new_checked(ip.payload()).expect("a segment");
+    tcp.fin()
+}
+
+/// Whether the segment resets the connection.
+fn is_reset(frame: &[u8]) -> bool {
+    let ip = Ipv4Packet::new_checked(frame).expect("a packet");
+    let tcp = TcpPacket::new_checked(ip.payload()).expect("a segment");
+    tcp.rst()
 }
 
 /// The one's complement of the one's complement sum of the header's words.
@@ -397,4 +437,133 @@ async fn the_answer_to_a_datagram_goes_back_to_the_sender() {
         .expect("the stack has a frame")
         .expect("the frame is not an error");
     assert_eq!(datagram_payload(&frame), b"answer");
+}
+
+/// A piece of a datagram is not a datagram.
+#[tokio::test]
+async fn a_piece_of_a_datagram_is_not_a_datagram() {
+    let (stack, runner, udp, _listener) = udp_stack();
+    tokio::spawn(async move {
+        let _ = runner.expect("a stack with UDP has a runner").await;
+    });
+    let (mut sink, _stream) = stack.split();
+    let (mut reader, _writer) = udp.expect("a stack with UDP has a socket").split();
+
+    // The piece starts where the datagram's header would be. Reading it as
+    // one would open a flow to a port that is made up.
+    sink.send(fragment_frame(CLIENT, SERVER, 53_000, 53, b"query"))
+        .await
+        .expect("the stack takes the piece");
+
+    assert!(
+        timeout(Duration::from_millis(300), reader.next())
+            .await
+            .is_err(),
+        "a piece of a datagram is not a datagram"
+    );
+}
+
+/// A segment that is sent again opens one flow, not two.
+#[tokio::test]
+async fn a_segment_that_is_sent_again_opens_one_flow() {
+    let (stack, runner, _udp, listener) = tcp_stack();
+    tokio::spawn(async move {
+        let _ = runner.expect("a stack with TCP has a runner").await;
+    });
+    let (mut sink, _stream) = stack.split();
+    let mut listener = listener.expect("a stack with TCP has a listener");
+
+    // The device did not get the answer to the first segment, so it sends it
+    // again.
+    sink.send(syn_segment())
+        .await
+        .expect("the stack takes the segment");
+    sink.send(syn_segment())
+        .await
+        .expect("the stack takes the segment");
+
+    let (stream, _client, _server) = timeout(PATIENCE, listener.next())
+        .await
+        .expect("the stack opens the flow")
+        .expect("the listener has a flow");
+
+    // One flow, not two: the socket that is already there answers the
+    // segment that was sent again. A second one would listen for the rest of
+    // its life and hold a slot and a tunnel that nothing ever finishes.
+    assert!(
+        timeout(Duration::from_millis(300), listener.next())
+            .await
+            .is_err(),
+        "the segment that was sent again does not open a second flow"
+    );
+    drop(stream);
+}
+
+/// A connection that is closed cleanly is not reset.
+#[tokio::test]
+async fn a_connection_that_is_closed_cleanly_is_not_reset() {
+    let (stack, runner, _udp, listener) = tcp_stack();
+    tokio::spawn(async move {
+        let _ = runner.expect("a stack with TCP has a runner").await;
+    });
+    let (mut sink, mut stream_out) = stack.split();
+    let mut listener = listener.expect("a stack with TCP has a listener");
+
+    sink.send(syn_segment())
+        .await
+        .expect("the stack takes the segment");
+    let (mut flow, _client, _server) = timeout(PATIENCE, listener.next())
+        .await
+        .expect("the stack opens the flow")
+        .expect("the listener has a flow");
+
+    let answer = timeout(PATIENCE, stream_out.next())
+        .await
+        .expect("the stack answers the handshake")
+        .expect("the stack has an answer")
+        .expect("the answer is not an error");
+    let (seq, ack) = seq_ack(&answer);
+    sink.send(ack_segment(ack, seq + 1))
+        .await
+        .expect("the stack takes the ack");
+
+    // The application writes its last bytes and closes its side.
+    flow.write_all(b"hello").await.expect("the write succeeds");
+    flow.shutdown().await.expect("the close succeeds");
+    drop(flow);
+
+    // The stack answers with the bytes and the end of the connection.
+    let mut next_seq = seq + 1;
+    let mut ended = false;
+    while !ended {
+        let frame = timeout(PATIENCE, stream_out.next())
+            .await
+            .expect("the stack sends the bytes")
+            .expect("the stack has a frame")
+            .expect("the frame is not an error");
+        let (frame_seq, _frame_ack) = seq_ack(&frame);
+        let payload = payload_of(&frame);
+        ended = is_fin(&frame);
+        next_seq = frame_seq + payload.len() as u32 + u32::from(ended);
+    }
+
+    // The runner has time to notice that the application is gone.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // The peer acknowledges the end of the connection.
+    sink.send(ack_segment(ack, next_seq))
+        .await
+        .expect("the stack takes the ack");
+
+    // The stack must not answer with a reset. The connection was closed
+    // cleanly, and a reset would tell the device to throw away what it has
+    // already received.
+    let mut reset = false;
+    while let Ok(Some(Ok(frame))) = timeout(Duration::from_millis(300), stream_out.next()).await {
+        if is_reset(&frame) {
+            reset = true;
+            break;
+        }
+    }
+    assert!(!reset, "a connection that was closed cleanly is not reset");
 }
