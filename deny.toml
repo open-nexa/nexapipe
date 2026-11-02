@@ -50,15 +50,15 @@ yanked = "warn"
 # and the desktop check failed on exactly these until they were written down
 # in both places.
 #
-# RUSTSEC-2026-0367/0368/0369: symlink and SUID/SGID handling flaws in
-# `zip::ZipArchive::extract`, fixed only in zip >= 9.0.0. zip enters this
-# dependency tree solely through tauri-plugin-updater, and every published
-# version of that plugin — 2.14.0 and 3.0.0-alpha.3 included — pins
-# `zip ^4`, so the lockfile cannot move to the patched line. Exposure is
-# narrow in practice: the updater only extracts archives served by our own
-# release backend after minisign signature verification. Remove these three
-# and bump the lockfile as soon as a tauri-plugin-updater release allows
-# zip >= 9.
+# RUSTSEC-2026-0367/0368/0369 and RUSTSEC-2026-0429: symlink, SUID/SGID and
+# abort-on-symlink handling flaws in `zip::ZipArchive::extract`, fixed only in
+# zip >= 9.0.0. zip enters this dependency tree solely through
+# tauri-plugin-updater, and every published version of that plugin — 2.14.0 and
+# 3.0.0-alpha.3 included — pins `zip ^4`, so the lockfile cannot move to the
+# patched line. Exposure is narrow in practice: the updater only extracts
+# archives served by our own release backend after minisign signature
+# verification. Remove these four and bump the lockfile as soon as a
+# tauri-plugin-updater release allows zip >= 9.
 #
 # RUSTSEC-2024-0429: unsoundness in the `Iterator` and `DoubleEndedIterator`
 # impls for `glib::VariantStrIter`, fixed only in glib >= 0.20. glib reaches
@@ -71,6 +71,7 @@ ignore = [
     { id = "RUSTSEC-2026-0367", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
     { id = "RUSTSEC-2026-0368", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
     { id = "RUSTSEC-2026-0369", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
+    { id = "RUSTSEC-2026-0429", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
     { id = "RUSTSEC-2024-0429", reason = "glib 0.18.x via the desktop's GTK stack; fixed only in glib >= 0.20, which needs a tauri major bump" },
 ]
 # An advisory on this list that no crate in the graph matches is worth
