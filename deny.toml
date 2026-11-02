@@ -12,9 +12,6 @@
 # the Tauri and webkit stack lives — a much larger graph than the server's. The
 # CI job runs `cargo deny` once per workspace.
 #
-# The vendored smoltcp fork (third_party/smoltcp, patched in through
-# `[patch.crates-io]`) is a path source, so it is inside the graph rather than
-# fetched from anywhere: the tree it came from is this repository.
 
 [graph]
 # Every feature of every crate, not the default set: a dependency that only
@@ -160,8 +157,7 @@ exceptions = []
 [sources]
 # A crate fetched from a registry this file does not know, or from a git
 # repository that is not named here, is refused. crates.io is the only
-# registry the tree is allowed to use. The vendored smoltcp fork is a path
-# dependency, not a git source, so `allow-git` stays empty.
+# registry the tree is allowed to use, so `allow-git` stays empty.
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]

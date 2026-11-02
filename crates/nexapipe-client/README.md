@@ -65,28 +65,15 @@ proxy.run().await?;   // run() blocks; call stop() from elsewhere to end it
 | `uniffi` | UniFFI bindings for Swift, Kotlin and Python. |
 | `tracing` (default) | `tracing` integration. |
 
-### The `tun-proxy` feature needs one line in your `Cargo.toml`
+### The `tun-proxy` feature needs nothing in your `Cargo.toml`
 
-The TUN runs a TCP/IP stack, and every published smoltcp release — 0.12, 0.13
-and 0.14 alike — carries a panic in its TCP transmit path: an ACK that arrives
-beyond what was sent makes a sequence-number subtraction underflow, and the
-stack task dies with it. This repository vendors a patched copy of smoltcp
-0.12.0 with that guard in place, and the workspace uses it through a
-`[patch.crates-io]` — which, being a workspace setting, does not reach a
-consumer.
+The TUN runs a TCP/IP stack — smoltcp — and this crate depends on it
+directly, on a release that carries the fix for the sequence-number underflow
+panic (smoltcp PR #1079, in 0.13 and later). There is no patch to apply and
+no `[patch.crates-io]` to write: the stack the TUN runs is the crates.io one.
 
-Until upstream fixes it, a consumer of the `tun-proxy` feature needs that patch
-too:
-
-```toml
-[patch.crates-io]
-smoltcp = { git = "https://github.com/open-nexa/nexapipe", path = "third_party/smoltcp" }
-```
-
-What the patch changes, and why, is written down in
-[`third_party/smoltcp/PATCHES.md`](https://github.com/open-nexa/nexapipe/blob/main/third_party/smoltcp/PATCHES.md).
-The features that do not run the TCP/IP stack — `local-proxy` and the L4 tunnel
-— are unaffected.
+What the client does with it — the framing around the stack, the handshake, the
+flows — is in `src/tun_proxy/netstack/`, and it is the client's own code.
 
 ### Documentation
 
