@@ -42,8 +42,7 @@ reviews:
       - main
 
   path_filters:
-    # Vendored code (local smoltcp fork) and generated / build output
-    - "!third_party/**"
+    # Generated / build output
     - "!**/target/**"
     - "!**/node_modules/**"
     - "!**/dist/**"
