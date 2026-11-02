@@ -67,10 +67,22 @@ proxy.run().await?;   // run() blocks; call stop() from elsewhere to end it
 
 ### The `tun-proxy` feature needs nothing in your `Cargo.toml`
 
-The TUN runs a TCP/IP stack — smoltcp — and this crate depends on it
-directly, on a release that carries the fix for the sequence-number underflow
-panic (smoltcp PR #1079, in 0.13 and later). There is no patch to apply and
-no `[patch.crates-io]` to write: the stack the TUN runs is the crates.io one.
+*From the next release on.* The TUN runs a TCP/IP stack — smoltcp — and this
+crate then depends on it directly, on a release that carries the fix for the
+sequence-number underflow panic (smoltcp PR #1079, in 0.13 and later). There
+is no patch to apply and no `[patch.crates-io]` to write: the stack the TUN
+runs is the crates.io one.
+
+`nexapipe-client` 1.0.1 and earlier still depend on `netstack-smoltcp`, which
+pins smoltcp 0.12 — the release with the panic. Those users need the override
+until they upgrade. The vendored copy it points at is no longer on the
+repository's `main`, so the override is pinned to the last tag that still
+carries it:
+
+```toml
+[patch.crates-io]
+smoltcp = { git = "https://github.com/open-nexa/nexapipe", tag = "v1.0.0", path = "third_party/smoltcp" }
+```
 
 What the client does with it — the framing around the stack, the handshake, the
 flows — is in `src/tun_proxy/netstack/`, and it is the client's own code.
