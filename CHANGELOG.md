@@ -86,6 +86,15 @@ and its meaning.
 
 ### Changed
 
+- **A packet on the desktop's TUN costs one allocation, not an allocation and
+  a copy.** The pump read every packet into a buffer and then copied it into
+  a freshly allocated one for the stack, because the stack's sink owns what it
+  is given. Reading straight into that buffer leaves one allocation per
+  packet instead of two and a memcpy of every byte of it.
+  The Android pump keeps the copy: it reads from a file descriptor, and the
+  stable standard library has no way to fill a vector from one. The copy is
+  1,400 bytes per packet, which at the rate a full link carries them is a
+  fraction of a percent of a core.
 - **The TUN proxy's TCP window is a credit, not an allocation.** Every socket
   the stack opened took four buffers of the window's size — two for the
   protocol and two for the application's side of the tunnel — so a flow cost
