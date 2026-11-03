@@ -10,7 +10,6 @@ use tokio::sync::{Notify, Semaphore};
 use tokio::task::JoinHandle;
 
 pub(crate) use connection::handle_local_connection;
-pub(crate) use tunnel::OPEN_ATTEMPTS;
 pub(crate) use tunnel::open_stream_with_retry_until;
 
 #[cfg(feature = "tracing")]
