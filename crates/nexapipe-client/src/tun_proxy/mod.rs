@@ -193,11 +193,12 @@ const TUN_MTU: usize = 1400;
 
 /// The per-socket TCP window the TUN stack uses, in bytes.
 ///
-/// **The window is the flow's memory.** The stack gives every socket four
-/// buffers of this size — two for the protocol and two for the application
-/// side of the tunnel — so a flow costs four times this whether it is
-/// carrying anything or not. Measured (see the `tun_flow_memory` example): at
-/// 320 KiB a flow is 1,280 KiB of address space, at 128 KiB it is 512 KiB.
+/// **The window is the flow's memory.** The stack gives every socket two
+/// buffers of this size — the two the protocol itself keeps — and the two on
+/// the application's side of the tunnel grow as the flow carries bytes, so a
+/// flow that carries nothing does not pay for them. Measured (see the
+/// `tun_flow_memory` example): at 128 KiB a flow is 257 KiB of address space
+/// and at 512 KiB it is 1,025 KiB — twice the window, either way.
 ///
 /// **It is also the flow's throughput.** Steady single-flow speed is the
 /// window divided by the round-trip time:
@@ -311,7 +312,21 @@ const TUN_WRITE_QUEUE: usize = 1024;
 /// application could start: a peer that sent one datagram each from a few
 /// thousand source ports, or a leak of flows whose idle timer had not run out
 /// yet, was answered with as many tunnels as it cared to open.
-const MAX_UDP_FLOWS: usize = 32;
+///
+/// **A hundred and twenty-eight, and the number is about what a phone
+/// actually does.** Thirty-two was low enough that an ordinary device reached
+/// it: a browser's QUIC connections, a voice call, a game and a push service
+/// are four flows between them, and the fifth application to speak UDP found
+/// the table full. A flow that does not fit is **dropped rather than
+/// refused** — the datagram goes nowhere and the application sends it again,
+/// which costs a retransmission and shows up as a slow, lossy link rather
+/// than as an error.
+///
+/// The memory is not what bounds this: a flow's queue is bounded by
+/// [`UDP_FLOW_QUEUE_BYTES`] and is only as full as the traffic asks it to be,
+/// so a hundred and twenty-eight idle flows cost a hundred and twenty-eight
+/// tunnels and not a hundred and twenty-eight megabytes.
+const MAX_UDP_FLOWS: usize = 128;
 
 /// How many TCP flows may be open at once.
 ///
@@ -672,6 +687,18 @@ impl TunProxy {
             tasks.push(tokio::spawn(async move {
                 let async_fd = async_fd;
                 let mut sink = stack_sink;
+                // The packet is read into a buffer of its own and then copied
+                // into the one the stack takes, because the stack owns what
+                // it is given.
+                //
+                // **The copy stays here, and it is the cheaper of the two
+                // answers.** Filling a vector straight from a file descriptor
+                // is what the desktop's reader does — an async reader has a
+                // `read_buf` that does it — but the stable standard library
+                // has no such method for a plain file, and the one it has is
+                // not stable. The copy is 1,400 bytes per packet, which at
+                // the rate a full link carries them is a fraction of a
+                // percent of a core.
                 let mut buf = vec![0u8; TUN_MTU];
                 loop {
                     if stopped_clone.load(Ordering::Acquire) {
@@ -825,19 +852,24 @@ impl TunProxy {
             tasks.push(tokio::spawn(async move {
                 let mut reader = reader;
                 let mut sink = sink;
-                let mut buf = vec![0u8; TUN_MTU];
+                // Read straight into the buffer the stack takes: a packet costs
+                // one allocation rather than an allocation and a copy of every
+                // byte of it.
+                let mut packet = Vec::with_capacity(TUN_MTU);
                 loop {
                     if stopped_clone.load(Ordering::Acquire) {
                         break;
                     }
-                    match reader.read(&mut buf).await {
+                    match reader.read_buf(&mut packet).await {
                         Ok(0) => {
                             // EOF — the TUN device was closed.
                             jni_log!("[tun-proxy] TUN read EOF, stopping pump-in");
                             break;
                         }
-                        Ok(n) => {
-                            if let Err(e) = sink.send(buf[..n].to_vec()).await {
+                        Ok(_) => {
+                            let packet =
+                                std::mem::replace(&mut packet, Vec::with_capacity(TUN_MTU));
+                            if let Err(e) = sink.send(packet).await {
                                 jni_log!("[tun-proxy] stack send error: {}", e);
                                 break;
                             }

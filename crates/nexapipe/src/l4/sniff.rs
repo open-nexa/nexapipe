@@ -802,6 +802,7 @@ mod tests {
                 Duration::from_secs(5),
                 Duration::from_secs(5),
                 &sniffer,
+                &mut crate::l4::OpenCost::new(),
             )
             .await
         });
@@ -862,6 +863,7 @@ mod tests {
                 Duration::from_secs(5),
                 Duration::from_secs(5),
                 &sniffer,
+                &mut crate::l4::OpenCost::new(),
             )
             .await
         });
