@@ -94,7 +94,7 @@ emit() {
 # operator copies before their first run, and `config.toml.2fa.example` is
 # what the two-factor and the ACL/ports tests parse. A change to either one
 # has to run the tests that read it.
-emit rust '^(crates/|third_party/|examples/|Cargo\.toml$|Cargo\.lock$|deny\.toml$|config\.toml(\.[A-Za-z0-9-]+)?\.example$)'
+emit rust '^(crates/|examples/|Cargo\.toml$|Cargo\.lock$|deny\.toml$|config\.toml(\.[A-Za-z0-9-]+)?\.example$)'
 
 # The client crate and the wire format crate it shares with the server. The
 # desktop app and the Android app both link it, so a change here is a change
@@ -123,7 +123,7 @@ emit desktop_lockfile '^(ui-desktop/package(-lock)?\.json$|build_deb\.sh$|build_
 # What CodeQL reads: the Rust in crates/, the TypeScript in ui-desktop/ and
 # the workflow files in .github/. A change to ui-android/ alone is Kotlin,
 # which CodeQL analyses in its own job.
-emit codeql '^(crates/|third_party/|ui-desktop/|\.github/)'
+emit codeql '^(crates/|ui-desktop/|\.github/)'
 
 # The release pipeline: the workflow that publishes a release and the scripts
 # it calls. A change to either of them can publish a release that reaches
