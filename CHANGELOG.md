@@ -73,6 +73,28 @@ and its meaning.
   already do it, rather than a `license-file` pointing at the repository root
   — which is what keeps the manifest free of the warning cargo gives for
   naming both.
+- **The desktop's store tests run in CI, and every one of them runs.** The
+  script named the five test files it was written for, so a test file added
+  later would sit in the tree unread — the same thing that let the original
+  five go unrun in the first place, one file further along. The files are
+  found instead of listed: a test file that is added is a test file that runs.
+  The store also has a test of its own for the first time — five cases, each
+  of which fails against the code before the service-read fix and passes
+  against it.
+
+### Changed
+
+- **The TUN proxy's user-space TCP/IP stack is ours now, and smoltcp comes
+  from crates.io.** The client used to link a wrapper crate that pinned
+  smoltcp 0.12 — the release with a TCP sequence-number underflow panic — and
+  the repository carried a vendored, patched copy of smoltcp to work around
+  it. Upstream fixed the cause in 0.13 (smoltcp PR #1079), so the fork, its
+  `[patch.crates-io]` entries and the re-vendoring they asked for are gone:
+  `crates/nexapipe-client/src/tun_proxy/netstack/` drives the crates.io
+  release directly.
+  What the device sees is the same — the same handshake, the same windows, the
+  same UDP path — and the tests that drive it are new: a segment that opens a
+  connection, the bytes that travel each way, and a datagram in and out.
 
 ### Fixed
 
@@ -99,17 +121,6 @@ and its meaning.
   standing for a service that is not there. The status read now says when it
   failed, so "not installed" and "the answer never came back" are two
   different facts again.
-
-### Added
-
-- **The desktop's store tests run in CI, and every one of them runs.** The
-  script named the five test files it was written for, so a test file added
-  later would sit in the tree unread — the same thing that let the original
-  five go unrun in the first place, one file further along. The files are
-  found instead of listed: a test file that is added is a test file that runs.
-  The store also has a test of its own for the first time — five cases, each
-  of which fails against the code before the service-read fix and passes
-  against it.
 
 ## [1.0.1] — 2026-10-25
 
