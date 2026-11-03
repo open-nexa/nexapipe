@@ -173,23 +173,6 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddNode(
     with_env_or(&mut unowned_env, -1, |env| add_node(env, node_id, domains))
 }
 
-/// Adds a node named by a full ticket rather than a bare Node ID.
-///
-/// It is the ticket that goes into `NodeConfig.server_ticket`: handing iroh a
-/// Node ID *and* a ticket makes the address lookup take the ID and discard the
-/// addresses, which is precisely what `discovery = "none"` cannot afford.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddTicketNode(
-    mut unowned_env: EnvUnowned,
-    _class: JClass,
-    ticket: JString,
-    domains: JString,
-) -> jint {
-    with_env_or(&mut unowned_env, -1, |env| {
-        add_ticket_node(env, ticket, domains)
-    })
-}
-
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeRemoveNode(
     mut unowned_env: EnvUnowned,
@@ -355,62 +338,6 @@ fn add_node(env: &mut Env<'_>, node_id: JString, domains: JString) -> jint {
     };
 
     guard.nodes.push(node_config);
-    0
-}
-
-fn add_ticket_node(env: &mut Env<'_>, ticket: JString, domains: JString) -> jint {
-    if env.exception_check() {
-        jni_log!("JNI exception pending before nativeAddTicketNode");
-        env.exception_clear();
-        return -1;
-    }
-
-    let ticket_str = match ticket.try_to_string(env) {
-        Ok(s) => s.trim().to_string(),
-        Err(_) => return -1,
-    };
-    let domains_str = match domains.try_to_string(env) {
-        Ok(s) => s,
-        Err(_) => return -1,
-    };
-    // Refuse a string that is not a ticket here rather than at connect time:
-    // a bad ticket would otherwise be dialled as a (very long) Node ID.
-    if ticket_str.parse::<EndpointTicket>().is_err() {
-        jni_log!("nativeAddTicketNode: not a valid endpoint ticket");
-        return -1;
-    }
-
-    let domains_list: Vec<String> = domains_str
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    let state = match get_state() {
-        Some(s) => s,
-        None => return -1,
-    };
-    let mut guard = match state.lock() {
-        Ok(g) => g,
-        Err(_) => return -1,
-    };
-
-    if let Some(existing) = guard
-        .nodes
-        .iter_mut()
-        .find(|n| n.server_ticket.as_deref() == Some(ticket_str.as_str()))
-    {
-        if !domains_list.is_empty() {
-            existing.domains = domains_list;
-        }
-        return 0;
-    }
-
-    guard.nodes.push(NodeConfig {
-        server_node_id: None,
-        server_ticket: Some(ticket_str),
-        domains: domains_list,
-    });
     0
 }
 
