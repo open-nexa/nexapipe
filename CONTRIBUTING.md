@@ -72,11 +72,10 @@ Other house rules:
   `uniffi`). The `uniffi` bindings are proc-macro based, so there is no UDL file
   to regenerate; the module is `uniffi_bindings.rs` (a module named `uniffi`
   would shadow the crate of the same name at the crate root).
-- `third_party/smoltcp` is vendored with a patch and wired through
-  `[patch.crates-io]` in the workspace root `Cargo.toml`. Do not edit it.
-  [`third_party/smoltcp/PATCHES.md`](third_party/smoltcp/PATCHES.md) records
-  what the patch changes, why, and the steps for dropping it once upstream
-  fixes the panic it guards — read it before touching either file.
+- The TUN proxy's user-space TCP/IP stack is smoltcp, taken from crates.io and
+  driven by `crates/nexapipe-client/src/tun_proxy/netstack/`. That code is ours:
+  change it like any other, and keep it working with the smoltcp release the
+  workspace resolves.
 - Inline comments are in English.
 - New behaviour comes with a test; the L4 tests drive `l4::serve_stream` over a
   `tokio::io::duplex` pair, so a TCP or UDP flow can be tested without iroh.

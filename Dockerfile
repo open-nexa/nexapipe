@@ -15,7 +15,6 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 # `[patch.crates-io]` points at the vendored smoltcp fork, so it has to be in
 # the build context as well.
-COPY third_party ./third_party
 
 # The client crate lists both `lib` and `cdylib` as its crate types, and cargo builds the
 # cdylib slot even when the client is only a dependency here. musl turns crt-static on by

@@ -1,4 +1,4 @@
-//! TUN proxy: a user-space TCP/IP stack implemented in Rust with netstack-smoltcp,
+//! TUN proxy: a user-space TCP/IP stack implemented in Rust with smoltcp,
 //! shared by the Android client (fd-based entry, `TunProxy::new`) and the desktop
 //! app (IP-packet reader/writer entry, [`TunProxy::with_io`]).
 //!
@@ -89,10 +89,6 @@ macro_rules! jni_log {
 }
 
 use futures_util::{SinkExt, StreamExt};
-use netstack_smoltcp::udp::{ReadHalf as UdpReadHalf, UdpMsg, WriteHalf as UdpWriteHalf};
-use netstack_smoltcp::{
-    AnyIpPktFrame, Stack, StackBuilder, TcpListener as SmolTcpListener, TcpStream as SmolTcpStream,
-};
 use nexapipe_proto::{
     FRAME_HEADER_LEN, Frame, MAX_UDP_PAYLOAD, decode_frame, encode_frame, payload_fits_datagram,
 };
@@ -124,6 +120,7 @@ use tokio::task::JoinHandle;
 // because `test` is true on every host that builds the unit-test harness.
 #[cfg(unix)]
 mod fd;
+pub mod netstack;
 mod tcp;
 mod udp;
 
@@ -131,6 +128,10 @@ mod udp;
 use fd::dup_tun_fds;
 #[cfg(target_os = "android")]
 use fd::{TunFds, set_nonblocking};
+use netstack::{
+    ReadHalf as UdpReadHalf, Stack, StackBuilder, TcpListener as SmolTcpListener,
+    TcpStream as SmolTcpStream, UdpDatagram, WriteHalf as UdpWriteHalf,
+};
 #[cfg(target_os = "android")]
 use std::os::fd::OwnedFd;
 use tcp::run_tcp_acceptor;
@@ -387,7 +388,7 @@ struct TunContext {
     /// shared writer, and a `Mutex` around it (the previous design) made every
     /// concurrent reply wait for the lock, so one slow flow delayed the DNS
     /// answers behind it.
-    tun_out: mpsc::Sender<UdpMsg>,
+    tun_out: mpsc::Sender<UdpDatagram>,
     /// Slots left for TCP flows: one is taken per accepted connection and
     /// given back when the flow ends, however it ends.
     tcp_flow_slots: Arc<Semaphore>,
@@ -429,7 +430,7 @@ pub struct TunStackConfig {
 }
 
 /// The stack's packet halves: IP packets in (from the TUN) and out (to the TUN).
-type StackSink = futures_util::stream::SplitSink<Stack, AnyIpPktFrame>;
+type StackSink = futures_util::stream::SplitSink<Stack, Vec<u8>>;
 type StackStream = futures_util::stream::SplitStream<Stack>;
 
 /// Build the smoltcp stack and spawn every task that is not a TUN device pump:
@@ -465,13 +466,14 @@ fn start_stack_services(
     // question. Both TUN entry points come through here.
     report_domain_patterns(&proxy_domains);
 
-    // The Runner drives smoltcp's internal processing: retransmits, timeouts, etc.
+    // The runner drives the stack's internal processing: retransmits,
+    // timeouts, and the sockets' data.
     if let Some(runner) = runner {
         let stopped_clone = stopped.clone();
         tasks.push(tokio::spawn(async move {
             match runner.await {
-                Ok(()) => jni_log!("[tun-proxy] smoltcp runner completed"),
-                Err(e) => jni_log!("[tun-proxy] smoltcp runner error: {}", e),
+                Ok(()) => jni_log!("[tun-proxy] the stack's runner completed"),
+                Err(e) => jni_log!("[tun-proxy] the stack's runner stopped: {}", e),
             }
             stopped_clone.store(true, Ordering::Release);
         }));
@@ -480,7 +482,7 @@ fn start_stack_services(
     // Split Stack → (Sink for IP packets in, Stream for IP packets out).
     let (sink, stream) = stack.split();
 
-    let (tun_out, tun_out_rx) = mpsc::channel::<UdpMsg>(TUN_WRITE_QUEUE);
+    let (tun_out, tun_out_rx) = mpsc::channel::<UdpDatagram>(TUN_WRITE_QUEUE);
 
     // The upstream resolvers, and the sockets they are asked through. One set
     // for the whole proxy: a socket per query would mean a new source port for
@@ -503,7 +505,7 @@ fn start_stack_services(
 
     // TCP acceptor — accept the TCP connections produced by smoltcp and route them by destination IP.
     //
-    // Beware a netstack-smoltcp naming trap: TcpListener yields (stream, local_addr, remote_addr)
+    // Beware a naming trap: TcpListener yields (stream, local_addr, remote_addr)
     // where local_addr = stream.local_addr() = src_addr = the packet's source IP = the client address,
     //      remote_addr = stream.remote_addr() = dst_addr = the packet's destination IP = the server address.
     // So local/remote semantics are the REVERSE of standard TCP! We use the third element (remote_addr) to decide the destination IP.

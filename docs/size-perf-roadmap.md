@@ -80,11 +80,11 @@ Worth recording, because it is easy to "fix" these and lose ground:
   megabytes for packet throughput on the data path, which is the right side of
   that trade for a proxy. **Do not set `"s"` globally.** If `S3` below shrinks
   the Android `.so`, it does it by cutting dependencies, not by flipping this.
-- **`panic = "unwind"`** (`Cargo.toml:28`) is required, not incidental. The
-  vendored smoltcp patch (`third_party/smoltcp/PATCHES.md`) is about a panic that
-  must not take the process down, and `nexapipe-client` is a `cdylib` loaded
-  into somebody else's app, where abort is the host's problem now. **Do not
-  change this on the library crate.**
+- **`panic = "unwind"`** (`Cargo.toml:28`) is required, not incidental. The TUN
+  proxy drives a third-party TCP/IP stack inside this process, and a panic in
+  it must not take the process down: `nexapipe-client` is a `cdylib` loaded into
+  somebody else's app, where abort is the host's problem now. **Do not change
+  this on the library crate.**
 - **One APK per ABI** (`ui-android/app/build.gradle.kts:87-102`), with a comment
   explaining why there is deliberately no universal APK. Already correct.
 
@@ -671,7 +671,7 @@ Line numbers drift; the command that reproduces each row is given with it.
 |---|---|
 | The desktop is outside the root workspace | `Cargo.toml:7` — `exclude = ["ui-desktop/src-tauri"]` |
 | The tuned profile exists only for the server and the library | `Cargo.toml:27-35`, next to no `[profile.release]` anywhere in `ui-desktop/src-tauri/Cargo.toml` (file ends at line 139) |
-| `opt-level = 3` and `panic = "unwind"` are deliberate | `Cargo.toml:29-30` (the comment says why) and `Cargo.toml:28`; the smoltcp patch rationale is `third_party/smoltcp/PATCHES.md` |
+| `opt-level = 3` and `panic = "unwind"` are deliberate | `Cargo.toml:29-30` (the comment says why) and `Cargo.toml:28`; the stack that runs inside the process is `crates/nexapipe-client/src/tun_proxy/netstack/` |
 | Android release minification is off | `ui-android/app/build.gradle.kts:118` — `isMinifyEnabled = false`, no `isShrinkResources` anywhere |
 | ProGuard rules are the untouched template | `ui-android/app/proguard-rules.pro` — every rule still commented out |
 | One APK per ABI, no universal APK | `ui-android/app/build.gradle.kts:83-102` |

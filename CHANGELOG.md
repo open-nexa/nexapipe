@@ -104,6 +104,17 @@ and its meaning.
   what they weighed, so "this change cost 1.2 MB" was not a sentence anybody
   could say about a release. Each of the three build jobs weighs what it
   produced now, and the numbers go into the job's step summary.
+- **The TUN proxy's user-space TCP/IP stack is ours now, and smoltcp comes
+  from crates.io.** The client used to link a wrapper crate that pinned
+  smoltcp 0.12 — the release with a TCP sequence-number underflow panic — and
+  the repository carried a vendored, patched copy of smoltcp to work around
+  it. Upstream fixed the cause in 0.13 (smoltcp PR #1079), so the fork, its
+  `[patch.crates-io]` entries and the re-vendoring they asked for are gone:
+  `crates/nexapipe-client/src/tun_proxy/netstack/` drives the crates.io
+  release directly.
+  What the device sees is the same — the same handshake, the same windows, the
+  same UDP path — and the tests that drive it are new: a segment that opens a
+  connection, the bytes that travel each way, and a datagram in and out.
 
 ## [1.0.1] — 2026-10-25
 
