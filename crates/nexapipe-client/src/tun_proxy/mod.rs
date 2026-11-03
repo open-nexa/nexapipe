@@ -686,7 +686,12 @@ impl TunProxy {
             tasks.push(tokio::spawn(async move {
                 let async_fd = async_fd;
                 let mut sink = stack_sink;
-                let mut buf = vec![0u8; TUN_MTU];
+                // The packet is read straight into the buffer the stack takes,
+                // so a packet costs one allocation rather than an allocation
+                // and a copy of every byte of it. The stack owns what it is
+                // given, so the buffer is handed over and a fresh one takes
+                // its place.
+                let mut packet = Vec::with_capacity(TUN_MTU);
                 loop {
                     if stopped_clone.load(Ordering::Acquire) {
                         break;
@@ -700,15 +705,17 @@ impl TunProxy {
                     };
                     // Use try_io: &File implements Read, so we can use get_ref() (the immutable guard
                     // only has get_ref()). try_io auto-clears readiness on WouldBlock, no manual clear_ready needed.
-                    match guard.try_io(|inner| inner.get_ref().read(&mut buf)) {
+                    match guard.try_io(|inner| inner.get_ref().read_buf(&mut packet)) {
                         Ok(Ok(0)) => {
                             // EOF — the TUN fd was closed.
                             jni_log!("[tun-proxy] TUN read EOF, stopping pump-in");
                             break;
                         }
-                        Ok(Ok(n)) => {
-                            // n > 0 — read an IP packet; feed it into the smoltcp stack.
-                            if let Err(e) = sink.send(buf[..n].to_vec()).await {
+                        Ok(Ok(_)) => {
+                            // An IP packet; feed it into the smoltcp stack.
+                            let packet =
+                                std::mem::replace(&mut packet, Vec::with_capacity(TUN_MTU));
+                            if let Err(e) = sink.send(packet).await {
                                 jni_log!("[tun-proxy] stack send error: {}", e);
                                 break;
                             }
@@ -718,7 +725,9 @@ impl TunProxy {
                             break;
                         }
                         Err(_would_block) => {
+                            // Nothing was read: the packet is still empty, and
                             // try_io already cleared readiness; wait again.
+                            packet.clear();
                             continue;
                         }
                     }
@@ -839,19 +848,24 @@ impl TunProxy {
             tasks.push(tokio::spawn(async move {
                 let mut reader = reader;
                 let mut sink = sink;
-                let mut buf = vec![0u8; TUN_MTU];
+                // Read straight into the buffer the stack takes: a packet costs
+                // one allocation rather than an allocation and a copy of every
+                // byte of it.
+                let mut packet = Vec::with_capacity(TUN_MTU);
                 loop {
                     if stopped_clone.load(Ordering::Acquire) {
                         break;
                     }
-                    match reader.read(&mut buf).await {
+                    match reader.read_buf(&mut packet).await {
                         Ok(0) => {
                             // EOF — the TUN device was closed.
                             jni_log!("[tun-proxy] TUN read EOF, stopping pump-in");
                             break;
                         }
-                        Ok(n) => {
-                            if let Err(e) = sink.send(buf[..n].to_vec()).await {
+                        Ok(_) => {
+                            let packet =
+                                std::mem::replace(&mut packet, Vec::with_capacity(TUN_MTU));
+                            if let Err(e) = sink.send(packet).await {
                                 jni_log!("[tun-proxy] stack send error: {}", e);
                                 break;
                             }
