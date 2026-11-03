@@ -297,6 +297,29 @@ impl Pool {
     fn len(&self) -> usize {
         self.domain_to_ip.len()
     }
+
+    /// Rebuild the forward map (`domain_to_ip`) from the reverse one.
+    ///
+    /// Called when a poisoned lock is recovered. `alloc` writes the reverse
+    /// map first and the forward map second, so a panic between the two — the
+    /// half-applied update the poison flag is left holding — leaves the
+    /// reverse map the newer of the two. The reverse map is also the one the
+    /// packet path reads: an address is looked up to find its domain, so it
+    /// is the one that decides routing. The recovery therefore keeps
+    /// `ip_to_domain` and rebuilds `domain_to_ip` from it, rather than the
+    /// other way round: the map that decides routing is the map that is
+    /// trusted.
+    ///
+    /// A domain that the stale forward map held under two addresses keeps the
+    /// one `ip_to_domain` names, which is the address the next packet is
+    /// routed by anyway.
+    fn rebuild_forward(&mut self) {
+        self.domain_to_ip = self
+            .ip_to_domain
+            .iter()
+            .map(|(ip, addr)| (addr.domain.clone(), *ip))
+            .collect();
+    }
 }
 
 impl Default for IpMapping {
@@ -398,14 +421,23 @@ impl IpMapping {
         self.len() == 0
     }
 
-    /// A poisoned lock still holds a consistent table, so recovering from one is
-    /// better than taking the whole tunnel down: every critical section here is
-    /// a handful of `HashMap` calls and nothing that can panic in between, so
-    /// there is no half-applied update for the poison flag to protect us from.
+    /// A poisoned lock still holds a usable table, so recovering from one is
+    /// better than taking the whole tunnel down. The critical sections are a
+    /// handful of `HashMap` calls, but the two maps `alloc` updates are not
+    /// written as one step: a panic between them leaves the forward map
+    /// stale, and a stale forward map hands a domain the wrong address —
+    /// traffic meant for it would arrive on another domain's route. On poison
+    /// the forward map is rebuilt from the reverse one, which is what the
+    /// packet path reads (see `Pool::rebuild_forward`).
     fn locked(&self) -> MutexGuard<'_, Inner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.inner.lock().unwrap_or_else(|poisoned| {
+            let mut inner = poisoned.into_inner();
+            inner.v4.rebuild_forward();
+            if let Some(v6) = inner.v6.as_mut() {
+                v6.rebuild_forward();
+            }
+            inner
+        })
     }
 }
 
@@ -482,6 +514,46 @@ mod tests {
             let ip = mapping.allocate(name);
             assert_eq!(mapping.lookup_domain(&ip).as_deref(), Some(name));
         }
+    }
+
+    /// A poisoned lock is recovered with the two maps in step.
+    ///
+    /// `alloc` writes the reverse map before the forward one, so the
+    /// half-applied update a panic leaves behind is a reverse map that has
+    /// moved on and a forward map that has not. The recovery rebuilds the
+    /// forward map from the reverse one, so the routing decision — which is
+    /// the reverse lookup — is never second-guessed, and a domain that
+    /// re-asks keeps the address its packets are already being routed by.
+    #[test]
+    fn a_poisoned_lock_recovers_with_the_maps_in_step() {
+        let mapping =
+            IpMapping::with_range(Ipv4Addr::new(10, 0, 1, 16), Ipv4Addr::new(10, 0, 1, 17));
+        let ip = mapping.allocate("first.test");
+
+        // Poison the lock with the two maps out of step, the way a panic in
+        // `alloc` would leave them: the reverse map says the address belongs
+        // to `second.test`, the forward map still says `first.test`.
+        std::thread::scope(|s| {
+            let poisoned = s.spawn(|| {
+                let mut guard = mapping.inner.lock().unwrap();
+                let address = guard
+                    .v4
+                    .ip_to_domain
+                    .get_mut(&(u32::from(ip) as u128))
+                    .expect("the address was handed out");
+                address.domain = Arc::from("second.test");
+                panic!("poison the lock between the two updates");
+            });
+            // The panic is the point; joining merely waits for it.
+            let _ = poisoned.join();
+        });
+
+        // The recovery rebuilt the forward map: the reverse lookup answers by
+        // the reverse map, and the forward map agrees with it — `second.test`
+        // keeps the address, and `first.test` is no longer handed it.
+        assert_eq!(mapping.lookup_domain(&ip).as_deref(), Some("second.test"));
+        assert_eq!(mapping.allocate("second.test"), ip);
+        assert_ne!(mapping.allocate("first.test"), ip);
     }
 
     /// The name is shared, not copied.
