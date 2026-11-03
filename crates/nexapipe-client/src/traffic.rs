@@ -223,7 +223,6 @@ impl Flow {
             listed: None,
         }
     }
-
     /// `open`, and listed in `registry` as one flow of `node` until this value
     /// is dropped.
     ///
@@ -290,6 +289,43 @@ impl Flow {
             // cancelled, and a copy loop must not gain an exit it cannot be
             // woken from.
             None => std::future::pending().await,
+        }
+    }
+
+    /// A handle that can end this flow from another task.
+    ///
+    /// A flow has two halves, and one of them can learn that the flow is over
+    /// before the other does: the half that reads the reply is told the server
+    /// refused the tunnel, while the half that writes the application's bytes
+    /// is still waiting for something to send. The refusal has to reach it,
+    /// and this is what carries the news.
+    ///
+    /// A flow nobody is tracking cannot be cancelled — there is nothing to
+    /// cancel — so the handle does nothing when it is used.
+    pub fn cancel_handle(&self) -> FlowCancel {
+        FlowCancel {
+            entry: self.listed.as_ref().map(|listed| listed.entry.clone()),
+        }
+    }
+}
+
+/// A handle that can end a flow from another task.
+///
+/// See [`Flow::cancel_handle`]. Cloning it is cheap and does not count as
+/// another flow: the flow is the entry, and the entry is shared.
+#[derive(Debug, Clone)]
+pub struct FlowCancel {
+    entry: Option<Arc<FlowEntry>>,
+}
+
+impl FlowCancel {
+    /// Asks the flow to end.
+    ///
+    /// The copy loop waiting on the flow's cancel switch stops, and the task
+    /// that owns the flow ends with it.
+    pub fn cancel(&self) {
+        if let Some(entry) = &self.entry {
+            entry.cancel();
         }
     }
 }
