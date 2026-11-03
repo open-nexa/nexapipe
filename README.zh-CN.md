@@ -107,7 +107,8 @@ Android JNI 用的 `cdylib`，以及面向 Swift/Kotlin/Python 的 UniFFI 绑定
 | `ui-desktop/` | Tauri 2 桌面应用（Vue 3 + TypeScript）。 |
 | `config.toml.example` | 覆盖全部配置项的示例（服务端 + 客户端）。它出厂即开启 2FA 且没有任何已 enrolled 的客户端，因此全新安装在 enrolled 第一个客户端之前会拒绝所有连接。复制成 `config.toml` —— 该文件名已被 gitignore，它是运维者的实际配置。Docker compose 用的是 `config/config.toml`，通过 `NEXAPIPE_CONFIG_DIR=/app/config` 让二进制默认读取。 |
 | `config.toml.2fa.example` | 同一个文件，但更短：它不含日志、健康检查和指标这三段，并带有一个 `[auth.clients]` 条目 —— 一个已经 enrolled 的客户端。两份示例都是 2FA 开启。 |
-| `run_android.ps1` | 一键 Android 调试循环（构建 → 安装 → 启动 → logcat）。 |
+| `run_android.ps1` | 一键 Android 调试循环（构建 → 安装 → 启动 → logcat），Windows 版。 |
+| `run_android.sh` | 同一个一键 Android 调试循环的 macOS/Linux（bash）版本。 |
 
 ---
 

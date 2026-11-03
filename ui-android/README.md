@@ -123,6 +123,10 @@ It does everything: preflight (cargo-ndk, adb, SDK, NDK, device) → Rust build 
 verify the exported JNI symbols → copy the `.so` → `gradlew :app:installDebug` →
 launch → smoke check → stream logcat into `nexa_vpn_log.txt`.
 
+On macOS and Linux the same loop runs as `./run_android.sh` from the repository
+root: the same six stages, with the flags as long options (`--serial`, `--abi`,
+`--build-only`, `--check`, …).
+
 Useful switches: `-BuildOnly` (build and verify, no device), `-Restart` (cold
 start), `-SkipRust`, `-SkipInstall`, `-SkipLaunch`, `-NoLog`, `-Check`
 (diagnostics only), `-Serial <serial>`.

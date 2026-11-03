@@ -91,6 +91,12 @@ and its meaning.
   The client logs the same split from its own side — the time the stream took
   to open and the time the status byte took to come back — so the two ends can
   be compared against each other.
+- **The one-shot Android debug loop runs on macOS and Linux too.**
+  `run_android.sh` is the bash port of `run_android.ps1`: the same six stages —
+  preflight, Rust build, JNI symbol check, install, launch with a smoke check,
+  logcat streaming — with the same flags as long options (`--serial`, `--abi`,
+  `--build-only`, `--check`, …). A developer on a Unix machine no longer needs
+  PowerShell to drive a device.
 
 ### Changed
 
