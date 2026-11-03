@@ -59,7 +59,26 @@ nexapipe-proto.workspace = true
 # wipes itself when it goes out of scope, so the credential does not stay in
 # the heap. See `src/auth/message.rs`.
 zeroize.workspace = true
-netstack-smoltcp = { version = "0.2", optional = true }
+# The user-space TCP/IP stack behind the TUN proxy, driven by
+# `src/tun_proxy/netstack/`. It is the unpatched crates.io release: the
+# sequence-number underflow panic that once needed a vendored fork of smoltcp
+# is fixed upstream (smoltcp PR #1079), and 0.13 is the first release that
+# carries the fix.
+smoltcp = { version = "0.14", default-features = false, features = [
+    "std",
+    "log",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-tcp",
+    "auto-icmp-echo-reply",
+], optional = true }
+# The UDP packets the stack hands to the device are written here rather than
+# by the stack, and etherparse writes them.
+etherparse = { version = "0.16", optional = true }
+# `PollSender`: how a sink waits for room in a queue without blocking the
+# task it runs in.
+tokio-util = { version = "0.7", optional = true }
 libc = { version = "0.2", optional = true }
 # 2FA support
 # `zeroize` so the TOTP validator wipes its own copy of the seed when it is
@@ -82,7 +101,7 @@ local-proxy = ["tokio/net"]
 uniffi = ["dep:uniffi", "local-proxy"]
 tracing = ["dep:tracing"]
 jni = ["dep:jni", "dep:log", "dep:android_logger", "dep:ndk-context"]
-tun-proxy = ["local-proxy", "dep:netstack-smoltcp", "dep:libc"]
+tun-proxy = ["local-proxy", "dep:smoltcp", "dep:etherparse", "dep:tokio-util", "dep:libc"]
 
 # What docs.rs builds the page from. Without this it builds with the default
 # features alone, and eight of this crate's twenty-three modules are behind a
