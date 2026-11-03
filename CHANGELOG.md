@@ -86,6 +86,18 @@ and its meaning.
 
 ### Changed
 
+- **The TUN proxy's TCP window is a credit, not an allocation.** Every socket
+  the stack opened took four buffers of the window's size — two for the
+  protocol and two for the application's side of the tunnel — so a flow cost
+  four times the window whether it carried a byte or not. The two on the
+  application's side now grow as the flow carries bytes, and a flow that
+  carries nothing holds nothing.
+  Measured with the `tun_flow_memory` example: at a 128 KiB window a flow is
+  257 KiB of address space rather than 512 KiB, and the sixty-four flows a
+  phone may have open cost 16 MiB rather than 32 MiB. The window is still
+  what a flow's steady speed is made of, so raising it is still the way to
+  carry more — but it now costs what the traffic asks for rather than what
+  the window allows.
 - **The TUN proxy holds a hundred and twenty-eight UDP flows, not thirty-two.**
   A flow that does not fit is dropped rather than refused: the datagram goes
   nowhere and the application sends it again, which costs a retransmission

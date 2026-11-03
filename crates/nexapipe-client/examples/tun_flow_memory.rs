@@ -1,11 +1,13 @@
 //! What one TCP flow costs in the TUN stack.
 //!
-//! The stack creates a socket per flow, and the socket owns four buffers whose
-//! size is the TCP window — two for the protocol and two for the application
-//! side of the tunnel. This opens a number of flows through a real stack (one
-//! SYN each, which is all it takes for the stack to create the socket) and
-//! reports what they cost: the bytes the heap was asked for, and the peak
-//! resident set.
+//! The stack creates a socket per flow, and the socket owns two buffers whose
+//! size is the TCP window — the two the protocol itself keeps. The two on the
+//! application's side of the tunnel grow as the flow carries bytes, so a flow
+//! that carries nothing does not pay for them.
+//!
+//! This opens a number of flows through a real stack (one SYN each, which is
+//! all it takes for the stack to create the socket) and reports what they
+//! cost: the bytes the heap was asked for, and the peak resident set.
 //!
 //! ```text
 //! cargo run --release -p nexapipe-client --example tun_flow_memory --features tun-proxy

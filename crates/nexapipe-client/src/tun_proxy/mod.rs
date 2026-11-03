@@ -193,11 +193,12 @@ const TUN_MTU: usize = 1400;
 
 /// The per-socket TCP window the TUN stack uses, in bytes.
 ///
-/// **The window is the flow's memory.** The stack gives every socket four
-/// buffers of this size — two for the protocol and two for the application
-/// side of the tunnel — so a flow costs four times this whether it is
-/// carrying anything or not. Measured (see the `tun_flow_memory` example): at
-/// 320 KiB a flow is 1,280 KiB of address space, at 128 KiB it is 512 KiB.
+/// **The window is the flow's memory.** The stack gives every socket two
+/// buffers of this size — the two the protocol itself keeps — and the two on
+/// the application's side of the tunnel grow as the flow carries bytes, so a
+/// flow that carries nothing does not pay for them. Measured (see the
+/// `tun_flow_memory` example): at 128 KiB a flow is 257 KiB of address space
+/// and at 512 KiB it is 1,025 KiB — twice the window, either way.
 ///
 /// **It is also the flow's throughput.** Steady single-flow speed is the
 /// window divided by the round-trip time:
