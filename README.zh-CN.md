@@ -494,7 +494,7 @@ relay 那份也是同样的声明。这些指令不是同一时期引入的，sy
 | `--invite-name <NAME>` | 与端点一同保存的标签。 |
 | `--invite-relay <URL>` | 邀请码中的中继 URL（默认：`[iroh] relay_url`）。 |
 | `--endpoint-id <NODE_ID>` | 要对外公布的端点（默认：由 `[iroh] secret_key` 推导）。需要地址查找：客户端通过 discovery 解析它。 |
-| `--invite-ticket <TICKET>` | 用完整端点 ticket（服务端启动时打印的那个）代替 Node ID 对外公布。地址随链接携带，因此在 `[iroh] discovery = "none"` 下同样可用。需配合 `--generate-invite`；与 `--endpoint-id` 互斥。 |
+| `--invite-ticket <TICKET>` | 用完整端点 ticket（服务端启动时打印的那个）代替 Node ID 对外公布。地址随链接携带，因此在 `[iroh] discovery = "none"` 下同样可用。需配合 `--generate-invite`；与 `--endpoint-id` 互斥。必须是本服务端自己的 ticket：会把本服务端的 2FA 凭据带到别的端点的邀请码会被拒绝。 |
 
 ### `nexapipe client`
 

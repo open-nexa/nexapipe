@@ -70,6 +70,13 @@ and refusing an ID edit on a ticket node). A Node ID invite generated while
 `discovery = "none"` is set prints a warning pointing at `--invite-ticket`,
 because without the lookup that link cannot be resolved by anyone.
 
+The ticket has to be the server's own. A ticket names an endpoint by its
+identity and its addresses, and an invite may carry the server's 2FA
+credential with it — a client that scans such a link sends that credential to
+the endpoint the ticket names. A ticket naming another endpoint is therefore
+refused when the invite carries a credential, and warned about when it does
+not.
+
 ## 2. Relays
 
 Four modes, and what each one bounds:

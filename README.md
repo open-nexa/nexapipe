@@ -558,7 +558,7 @@ will name.
 | `--invite-name <NAME>` | Label stored alongside the endpoint. |
 | `--invite-relay <URL>` | Relay URL in the invite (default: `[iroh] relay_url`). |
 | `--endpoint-id <NODE_ID>` | Endpoint to publish (default: derived from `[iroh] secret_key`). Requires lookup: the client resolves it through discovery. |
-| `--invite-ticket <TICKET>` | Publish a full endpoint ticket (as printed at server start) instead of a Node ID. The addresses ride in the link, so the invite works with `[iroh] discovery = "none"`. Requires `--generate-invite`; conflicts with `--endpoint-id`. |
+| `--invite-ticket <TICKET>` | Publish a full endpoint ticket (as printed at server start) instead of a Node ID. The addresses ride in the link, so the invite works with `[iroh] discovery = "none"`. Requires `--generate-invite`; conflicts with `--endpoint-id`. It has to be this server's own ticket: an invite that would carry this server's 2FA credential to another endpoint is refused. |
 
 ### `nexapipe client`
 

@@ -34,7 +34,9 @@ and its meaning.
   The CLI accepts `--invite-ticket <TICKET>` with `--generate-invite`, so the
   addresses ride in the `nexapipe://ticket/` link instead of being looked up —
   and a Node ID invite generated while `discovery = "none"` is set prints a
-  warning saying so, because that link cannot be resolved by anyone. The
+  warning saying so, because that link cannot be resolved by anyone. A ticket
+  has to be this server's own: an invite that would carry this server's 2FA
+  credential to another endpoint is refused rather than published. The
   embedded local proxy reads the same `[iroh]` relay and discovery settings as
   the server, so `--local-proxy` no longer quietly asks n0 where a peer is.
   A UniFFI caller passes `discovery_mode` in its `ClientConfig`, and

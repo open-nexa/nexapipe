@@ -4,6 +4,7 @@
 use crate::Cli;
 
 use iroh::SecretKey;
+use iroh_tickets::endpoint::EndpointTicket;
 use nexapipe::auth::AuthConfig;
 use nexapipe::config::ProxyConfig;
 use nexapipe::storage::Storage;
@@ -64,6 +65,55 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
             EndpointTarget::node_id_target(&public.to_string())?
         }
     };
+
+    // A ticket names an endpoint by its identity *and* by its addresses, and
+    // the invite may carry this server's 2FA credential with it. A client that
+    // scans such a link sends that credential to the endpoint the ticket names
+    // — so a ticket naming a different endpoint would hand this server's
+    // secret to a third party, and a one-time code captured there can be
+    // replayed against this server for as long as the code is valid.
+    //
+    // The check is made here, before the credential is touched: writing a
+    // pending enrollment token and then refusing would revoke the token the
+    // operator still holds.
+    if let EndpointTarget::Ticket(ticket) = &target {
+        let ticket_id = ticket_node_id(ticket)?;
+        // Whether the invite carries a credential at all. Without a client id
+        // it carries none, and a ticket naming another endpoint is then a
+        // wrong address rather than a leaked secret.
+        let carries_credential = cli
+            .generate_invite
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|id| !id.is_empty());
+        match config_server_identity(proxy_config.as_ref())? {
+            Some(server_id) if server_id != ticket_id => {
+                if carries_credential {
+                    anyhow::bail!(
+                        "the ticket names endpoint {ticket_id}, but this server is {server_id}; \
+                         an invite built from it would carry this server's 2FA credential to a \
+                         different endpoint. Use the ticket this server printed at start-up."
+                    );
+                }
+                eprintln!(
+                    "warning: the ticket names endpoint {ticket_id}, but this server is \
+                     {server_id}: the invite points at a different endpoint"
+                );
+            }
+            // The configuration says nothing about this server's identity, so
+            // the ticket cannot be checked against it. The endpoint generates
+            // an identity at start-up and writes it back, so this is the state
+            // of a configuration whose server has never run.
+            None => {
+                eprintln!(
+                    "warning: the ticket names endpoint {ticket_id}, and this configuration has \
+                     no [iroh] secret_key to check it against: the endpoint generates its \
+                     identity at start-up, so a stale ticket would point at another endpoint"
+                );
+            }
+            _ => {}
+        }
+    }
 
     let (domains, domains_source) = invite_domains(&cli.invite_domains, proxy_config.as_ref());
     // Only a relay this endpoint is actually pinned to is worth advertising: with `default`
@@ -448,6 +498,40 @@ async fn create_client_for_invite(
     println!();
 
     Ok(secret)
+}
+
+/// The Node ID a ticket names.
+///
+/// A ticket carries the identity inside it, next to the addresses: the two
+/// are what a peer is, and the identity is what says *which* peer.
+fn ticket_node_id(ticket: &str) -> anyhow::Result<String> {
+    let parsed = ticket
+        .trim()
+        .parse::<EndpointTicket>()
+        .map_err(|e| anyhow::anyhow!("not a valid endpoint ticket ({e})"))?;
+    let addr: iroh::EndpointAddr = parsed.into();
+    Ok(addr.id.to_string())
+}
+
+/// The Node ID this server runs as, when the configuration says.
+///
+/// `None` when `[iroh] secret_key` is absent: the endpoint then generates an
+/// identity at start-up and writes it back, so the file is the only place the
+/// identity can be read from — and before the first start it is not there at
+/// all.
+fn config_server_identity(config: Option<&ProxyConfig>) -> anyhow::Result<Option<String>> {
+    let Some(secret) = config
+        .and_then(|config| config.iroh.as_ref())
+        .and_then(|iroh| iroh.secret_key.as_ref())
+    else {
+        return Ok(None);
+    };
+    let key: SecretKey = secret
+        .expose_secret()
+        .as_str()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("[iroh] secret_key is invalid ({e})"))?;
+    Ok(Some(key.public().to_string()))
 }
 
 /// Where the domain list comes from, so the printed invite says so.
