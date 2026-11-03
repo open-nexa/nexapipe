@@ -224,7 +224,9 @@ impl Harness {
         let after_first = self.connections.load(Ordering::Relaxed);
 
         let start = Instant::now();
-        let second = open_tcp_checked(&group, HOST, PORT).await.expect("the flow opens");
+        let second = open_tcp_checked(&group, HOST, PORT)
+            .await
+            .expect("the flow opens");
         let elapsed = start.elapsed();
         black_box(&second);
 
