@@ -700,9 +700,7 @@ fn question_of(message: &[u8]) -> Option<(&[u8], &[u8])> {
     let start = 12;
     let mut offset = start;
     loop {
-        let Some(&label_len) = message.get(offset) else {
-            return None;
-        };
+        let &label_len = message.get(offset)?;
         offset += 1;
         if label_len == 0 {
             break;

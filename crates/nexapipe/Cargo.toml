@@ -102,6 +102,9 @@ sha2 = "0.11"
 [dev-dependencies]
 # Spawns the built binary in the integration tests (see tests/).
 duct = '1.1.1'
+# The key a device proves itself with: the test needs a real ed25519 public
+# key, and the only way to have one is to make it.
+iroh.workspace = true
 # `start_paused`, so the read timeouts are tested without waiting them out.
 tokio = { workspace = true, features = ['test-util'] }
 rqrr = { version = "0.11", default-features = false }
