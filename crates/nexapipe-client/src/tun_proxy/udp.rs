@@ -40,6 +40,14 @@ impl UdpQueue {
     /// cannot pass its bound between the check and the send. A reservation
     /// that does not fit is given back at once, so a datagram that is dropped
     /// for want of room leaves the count as it was.
+    ///
+    /// The `fetch_add` / condition-check / `fetch_sub` sequence means the
+    /// counter may briefly overshoot the bound when several reservations race:
+    /// the overshoot is transient and bounded by the number of concurrent
+    /// senders, and `Relaxed` ordering is sufficient because the counter is
+    /// only read for a go/no-go decision, not for synchronisation. UDP is
+    /// allowed to lose datagrams, and a reservation that finds the counter
+    /// over the bound on its way back down is one that does.
     fn reserve(&self, len: usize) -> bool {
         let queued = self.queued.fetch_add(len, Ordering::Relaxed) + len;
         if queued > UDP_FLOW_QUEUE_BYTES {
@@ -181,6 +189,13 @@ pub(super) async fn run_tun_udp_writer(
 /// Split the stack's inbound UDP stream into DNS queries and proxied flows.
 pub(super) async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
     let table: FlowTable = Arc::new(Mutex::new(HashMap::new()));
+    // The fast-path check for the flow ceiling: an atomic count of live flows,
+    // decremented when a flow's entry actually leaves the table. The `retain`
+    // sweep below still runs when the count says the table is full, because a
+    // flow that has ended is still in the table until its task reaches
+    // `release_flow` — the count and the table agree in the end, not
+    // necessarily at every instant.
+    let active_flows = Arc::new(AtomicUsize::new(0));
     // One log line per episode of being full, not one per dropped datagram.
     let warned_full = AtomicBool::new(false);
 
@@ -225,19 +240,26 @@ pub(super) async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
                 else {
                     return;
                 };
-                if ctx
-                    .tun_out
-                    .send(UdpDatagram {
-                        payload: response,
-                        // The answer comes from the address the query went
-                        // to, and goes back to the one it came from.
-                        src: dst_addr,
-                        dst: client_addr,
-                    })
-                    .await
-                    .is_err()
-                {
-                    jni_log!("[tun-proxy] TUN writer is gone, dropping the DNS reply");
+                // DNS replies are time-sensitive, and this task holds a DNS
+                // permit: parking it on a full writer queue holds the permit
+                // too, and the queries behind it are dropped for want of one.
+                // A reply that does not fit is dropped instead — the
+                // resolver's own retry is the recovery, and it needs neither
+                // the permit nor the queue slot this reply is holding.
+                match ctx.tun_out.try_send(UdpDatagram {
+                    payload: response,
+                    // The answer comes from the address the query went
+                    // to, and goes back to the one it came from.
+                    src: dst_addr,
+                    dst: client_addr,
+                }) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        jni_log!("[tun-proxy] TUN writer queue full, dropping the DNS reply");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        jni_log!("[tun-proxy] TUN writer is gone, dropping the DNS reply");
+                    }
                 }
             });
             continue;
@@ -272,13 +294,17 @@ pub(super) async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
                 let queue = UdpQueue::new(sender);
                 let mut flows = lock_flows(&table);
 
-                if flows.len() >= MAX_UDP_FLOWS {
+                if active_flows.load(Ordering::Relaxed) >= MAX_UDP_FLOWS {
                     // A flow that has ended is still in the table until its
                     // task gets to `release_flow`, so the count is not the
-                    // number of live flows — look again before refusing.
+                    // number of live flows — sweep the dead ones out before
+                    // refusing. This is the only path that touches every
+                    // entry, and it only runs when the atomic says the
+                    // ceiling was reached, not on every datagram.
                     flows.retain(|_, queue| !queue.sender.is_closed());
+                    active_flows.store(flows.len(), Ordering::Relaxed);
                 }
-                if flows.len() >= MAX_UDP_FLOWS {
+                if active_flows.load(Ordering::Relaxed) >= MAX_UDP_FLOWS {
                     drop(flows);
                     if !warned_full.swap(true, Ordering::Relaxed) {
                         jni_log!(
@@ -294,6 +320,7 @@ pub(super) async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
                 warned_full.store(false, Ordering::Relaxed);
                 flows.insert(key, queue.clone());
                 drop(flows);
+                active_flows.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(run_udp_flow(
                     ctx.clone(),
                     table.clone(),
@@ -301,6 +328,7 @@ pub(super) async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
                     queue.clone(),
                     receiver,
                     domain,
+                    active_flows.clone(),
                 ));
                 queue
             }
@@ -352,6 +380,7 @@ async fn run_udp_flow(
     mine: UdpQueue,
     mut datagrams: mpsc::Receiver<Vec<u8>>,
     domain: std::sync::Arc<str>,
+    active_flows: Arc<AtomicUsize>,
 ) {
     let (client_addr, virtual_dst) = key;
     let port = virtual_dst.port();
@@ -361,7 +390,7 @@ async fn run_udp_flow(
             Ok(tunnel) => tunnel,
             Err(e) => {
                 jni_log!("[tun-proxy] UDP {}:{} refused: {}", domain, port, e);
-                release_flow(&table, &key, &mine);
+                release_flow(&table, &key, &mine, &active_flows);
                 return;
             }
         };
@@ -389,7 +418,7 @@ async fn run_udp_flow(
     .await
     {
         jni_log!("[tun-proxy] UDP {}:{} refused: {}", domain, port, e);
-        release_flow(&table, &key, &mine);
+        release_flow(&table, &key, &mine, &active_flows);
         return;
     }
 
@@ -583,21 +612,24 @@ async fn run_udp_flow(
     }
 
     let _ = tunnel_send.finish();
-    release_flow(&table, &key, &mine);
+    release_flow(&table, &key, &mine, &active_flows);
 }
 
 /// Drop a finished flow from the table.
 ///
 /// Only removes the entry if it is still *ours*: a flow that ends after the
 /// demultiplexer replaced it (which happens when the channel is closed) must not
-/// take the live flow's channel down with it.
-fn release_flow(table: &FlowTable, key: &FlowKey, mine: &UdpQueue) {
+/// take the live flow's channel down with it. The active-flow count is
+/// decremented only when an entry is actually removed, so a replacement flow
+/// that took the slot keeps it counted.
+fn release_flow(table: &FlowTable, key: &FlowKey, mine: &UdpQueue, active_flows: &AtomicUsize) {
     let mut flows = lock_flows(table);
     if flows
         .get(key)
         .is_some_and(|entry| entry.sender.same_channel(&mine.sender))
     {
         flows.remove(key);
+        active_flows.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
