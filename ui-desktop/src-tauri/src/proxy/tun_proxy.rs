@@ -185,11 +185,11 @@ fn own_dns_addresses(listen_addr: &str) -> Vec<IpAddr> {
 }
 
 /// Must match `TUN_MTU` in `crates/nexapipe-client/src/tun_proxy.rs` (the smoltcp stack is
-/// built with it) and `tunMtu` in `ui-android/.../NexaVpnService.kt`. 1400 keeps one inner IP
-/// packet inside a single QUIC datagram (~1435 usable bytes after the short header + AEAD tag);
-/// at 1500 every inner segment was split across two datagrams, roughly doubling the packet
-/// count and AEAD cost.
-const TUN_MTU: usize = 1400;
+/// built with it) and `tunMtu` in `ui-android/.../NexaVpnService.kt`. 1280 is the IPv6 minimum
+/// MTU, below every path MTU iroh's PLPMTUD can settle on, so an inner segment always fits in
+/// one QUIC datagram even while the probe is still running or has fallen back after loss. See
+/// the client crate's constant for why it is not tracked at runtime.
+const TUN_MTU: usize = 1280;
 /// Wait-loop poll interval — lets `run()` react to stop() (and to the stack dying on its own)
 /// in a timely fashion.
 const READ_POLL_TIMEOUT: Duration = Duration::from_millis(100);

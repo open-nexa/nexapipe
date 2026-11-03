@@ -40,7 +40,7 @@ const SERVER_IP: Ipv4Addr = Ipv4Addr::new(10, 0, 1, 2);
 const SERVER_PORT: u16 = 443;
 
 /// The MTU the TUN uses.
-const TUN_MTU: usize = 1400;
+const TUN_MTU: usize = 1280;
 
 /// How many flows to open when the caller does not say.
 const DEFAULT_FLOWS: usize = 32;

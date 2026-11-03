@@ -14,7 +14,7 @@ en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
 utun8: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 9000
 \tinet 198.18.0.1 --> 198.18.0.1 netmask 0xfffffffc
 \tinet6 fe80::c62:9049:5746:8c61%utun8 prefixlen 64 scopeid 0x17
-nexa-tun: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1400
+nexa-tun: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1280
 \tinet 198.18.0.254 netmask 0xffffff00
 ";
     let foreign = super::parse_ifconfig_addresses(text, "nexa-tun");
@@ -42,7 +42,7 @@ fn a_foreign_address_inside_a_candidate_block_is_collected() {
     inet 10.0.0.83/24 brd 10.0.0.255 scope global enp3s0
 9: tun0: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 9000
     inet 198.18.0.1/30 scope global tun0
-10: nexa-tun: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1400
+10: nexa-tun: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1280
     inet 198.18.0.254/24 scope global nexa-tun
 ";
     for text in [oneline, multiline] {
