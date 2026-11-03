@@ -55,7 +55,7 @@ use iroh::Endpoint;
 use iroh::endpoint::presets;
 use nexapipe_client::IrohConnectionPool;
 use nexapipe_client::endpoint_group::EndpointGroup;
-use nexapipe_client::l4::open_tcp;
+use nexapipe_client::l4::open_tcp_checked;
 use std::hint::black_box;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -218,13 +218,15 @@ impl Harness {
         let group = Arc::new(EndpointGroup::new_with_single_pool(pool).await);
 
         // The first flow opens the connection.
-        let _first = open_tcp(&group, HOST, PORT)
+        let _first = open_tcp_checked(&group, HOST, PORT)
             .await
             .expect("the first flow opens");
         let after_first = self.connections.load(Ordering::Relaxed);
 
         let start = Instant::now();
-        let second = open_tcp(&group, HOST, PORT).await.expect("the flow opens");
+        let second = open_tcp_checked(&group, HOST, PORT)
+            .await
+            .expect("the flow opens");
         let elapsed = start.elapsed();
         black_box(&second);
 
