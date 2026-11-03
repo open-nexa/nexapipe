@@ -334,9 +334,6 @@ object IrohProxy {
 
     external fun nativeAddNode(nodeId: String, domains: String): Int
 
-    /** Adds a node named by a ticket rather than a bare Node ID. */
-    external fun nativeAddTicketNode(ticket: String, domains: String): Int
-
     external fun nativeAddDomainMapping(domain: String, nodeId: String): Int
 
     /** Maps a domain to a peer named by a ticket, so its addresses travel with the route. */
