@@ -808,7 +808,7 @@ async fn two_concurrent_flows_share_one_connection() {
     for _ in 0..2 {
         let group = group.clone();
         tasks.push(tokio::spawn(async move {
-            crate::l4::open_tcp(&group, "db.test", 5432).await
+            crate::l4::open_tcp_checked(&group, "db.test", 5432).await
         }));
     }
     let mut flows = Vec::new();
@@ -829,7 +829,7 @@ async fn two_concurrent_flows_share_one_connection() {
     // And the connection is still there for the next flow: the flows
     // borrowed it, they did not take it away.
     drop(flows);
-    let next = crate::l4::open_tcp(&group, "db.test", 5432)
+    let next = crate::l4::open_tcp_checked(&group, "db.test", 5432)
         .await
         .expect("the next flow opens");
     assert_eq!(

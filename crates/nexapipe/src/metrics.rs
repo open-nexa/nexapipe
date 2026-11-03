@@ -132,6 +132,98 @@ pub struct Metrics {
     bytes_received: AtomicU64,
     /// L4 flows by protocol and status class: `[tcp, udp][class]`.
     flows: [[AtomicU64; STATUS_CLASSES]; L4_PROTOS],
+    /// How long it took to open an L4 flow, and how long each phase of it took.
+    ///
+    /// The three are what a slow tunnel is made of: the whole open, the route
+    /// lookup inside it, and the backend connection (or resolution) the rest
+    /// of it is. A dashboard that has only the total cannot say whether the
+    /// time went into this process or into the network.
+    l4_open: DurationHistogram,
+    /// The route lookup: from "the preface named a host" to "the route that
+    /// serves it is known".
+    l4_route: DurationHistogram,
+    /// The backend preparation: the TCP connection for a TCP flow, the address
+    /// resolution for a UDP one.
+    l4_backend: DurationHistogram,
+}
+
+/// One duration histogram: how many observations there were, their sum, and the
+/// exclusive bucket counts.
+///
+/// The same shape as the request-duration histogram above, in a struct so the
+/// three L4 phases do not each spell the same fields out again.
+struct DurationHistogram {
+    /// How many observations there were.
+    count: AtomicU64,
+    /// The sum of every observation, in milliseconds.
+    sum_ms: AtomicU64,
+    /// One counter per upper bound in [`DURATION_BUCKET_LE_MS`], **exclusive** —
+    /// an observation is counted in the narrowest bound it is under and
+    /// nowhere else, and Prometheus's cumulative series is summed while
+    /// rendering. The reason for the exclusive counts is the one the
+    /// request-duration buckets carry: a scrape that read between two updates
+    /// would otherwise see a bucket go *down* as `le` rises.
+    buckets: [AtomicU64; DURATION_BUCKETS],
+}
+
+impl DurationHistogram {
+    /// Every counter at zero.
+    const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            sum_ms: AtomicU64::new(0),
+            buckets: [
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+                AtomicU64::new(0),
+            ],
+        }
+    }
+
+    /// Records one observation.
+    fn record(&self, duration_ms: u64) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_ms.fetch_add(duration_ms, Ordering::Relaxed);
+        // The narrowest bound that holds the duration. `partition_point` needs
+        // the slice sorted, which the bound list is, and answers with the index
+        // of the first entry that is *not* below the duration — so an
+        // observation slower than every bound comes back as the length, lands
+        // in no finite bucket, and is counted by `_count` and `+Inf` alone.
+        let index = DURATION_BUCKET_LE_MS.partition_point(|le| *le < duration_ms);
+        if let Some(bucket) = self.buckets.get(index) {
+            bucket.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Renders the histogram in the Prometheus text exposition format.
+    fn render(&self, out: &mut String, name: &str, help: &str) {
+        let _ = writeln!(out, "# HELP {name} {help}");
+        let _ = writeln!(out, "# TYPE {name} histogram");
+        // Cumulative, summed from the exclusive counts as the bounds are walked
+        // out, so every series is at least the one before it however many
+        // observations land mid-scrape.
+        let mut cumulative = 0u64;
+        for (index, le) in DURATION_BUCKET_LE_MS.iter().enumerate() {
+            cumulative += self.buckets[index].load(Ordering::Relaxed);
+            let _ = writeln!(out, "{name}_bucket{{le=\"{le}\"}} {cumulative}");
+        }
+        // Every observation is inside `+Inf`, including one slower than the
+        // widest finite bound, so this series is the count rather than a
+        // bucket of its own — as is `_count`, for the same reason.
+        let count = self.count.load(Ordering::Relaxed).max(cumulative);
+        let _ = writeln!(out, "{name}_bucket{{le=\"+Inf\"}} {count}");
+        let _ = writeln!(out, "{name}_sum {}", self.sum_ms.load(Ordering::Relaxed));
+        let _ = writeln!(out, "{name}_count {count}");
+    }
 }
 
 /// Status classes a response can fall into: `1xx` through `5xx` plus `other`.
@@ -223,6 +315,9 @@ impl Metrics {
                     AtomicU64::new(0),
                 ],
             ],
+            l4_open: DurationHistogram::new(),
+            l4_route: DurationHistogram::new(),
+            l4_backend: DurationHistogram::new(),
         }
     }
 
@@ -288,6 +383,19 @@ impl Metrics {
             _ => 0,
         };
         self.flows[proto][status_class(status)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Records one L4 flow's opening, in the three phases it is made of.
+    ///
+    /// `open_ms` is the whole open — from the preface being read to the status
+    /// byte being written. `route_ms` is the route lookup inside it, and
+    /// `backend_ms` is the backend connection (or resolution) the rest of it
+    /// is. A flow that was refused before it reached a backend has no backend
+    /// phase, and says so with a zero.
+    pub fn record_l4_open(&self, open_ms: u64, route_ms: u64, backend_ms: u64) {
+        self.l4_open.record(open_ms);
+        self.l4_route.record(route_ms);
+        self.l4_backend.record(backend_ms);
     }
 
     /// Records bytes served to a client.
@@ -540,6 +648,25 @@ impl Metrics {
             }
         }
 
+        // The three phases of opening a flow, so that a slow tunnel can be
+        // said to be slow *in this process* or slow *in the network* rather
+        // than only slow.
+        self.l4_open.render(
+            &mut out,
+            "nexapipe_l4_open_duration_ms",
+            "How long it took to open an L4 flow, in milliseconds.",
+        );
+        self.l4_route.render(
+            &mut out,
+            "nexapipe_l4_route_duration_ms",
+            "How long the route lookup inside an L4 flow's opening took, in milliseconds.",
+        );
+        self.l4_backend.render(
+            &mut out,
+            "nexapipe_l4_backend_duration_ms",
+            "How long the backend connection inside an L4 flow's opening took, in milliseconds.",
+        );
+
         gauge(
             &mut out,
             "nexapipe_backends_up",
@@ -788,6 +915,9 @@ mod tests {
             "nexapipe_request_duration_ms",
             "nexapipe_traffic_bytes_total",
             "nexapipe_l4_flows_total",
+            "nexapipe_l4_open_duration_ms",
+            "nexapipe_l4_route_duration_ms",
+            "nexapipe_l4_backend_duration_ms",
             "nexapipe_backends_up",
             "nexapipe_backends_down",
             "nexapipe_in_flight",
@@ -825,6 +955,37 @@ mod tests {
 
         assert_eq!(metrics.bytes_sent.load(Ordering::Relaxed), 1500);
         assert_eq!(metrics.bytes_received.load(Ordering::Relaxed), 64);
+    }
+
+    /// The three phases of opening a flow are three separate histograms, and
+    /// each of them has to answer the question it is named after: how long the
+    /// open took as a whole, how long the route lookup inside it took, and how
+    /// long the backend connection did.
+    ///
+    /// The buckets are cumulative, so a scrape can read a quantile out of them
+    /// — which is the whole reason they are histograms and not sums.
+    #[test]
+    fn the_open_phases_are_three_histograms_of_their_own() {
+        let metrics = Metrics::new();
+        metrics.record_l4_open(120, 2, 110);
+        metrics.record_l4_open(30, 1, 20);
+
+        let body = metrics.render(&empty_view());
+
+        // The open of 120 ms is inside the 250 ms bound and not inside the 100 ms
+        // one; the open of 30 ms is inside both. Cumulative, so the 100 ms
+        // series holds one observation and the 250 ms series holds two.
+        assert!(body.contains("nexapipe_l4_open_duration_ms_bucket{le=\"100\"} 1"));
+        assert!(body.contains("nexapipe_l4_open_duration_ms_bucket{le=\"250\"} 2"));
+        assert!(body.contains("nexapipe_l4_open_duration_ms_bucket{le=\"+Inf\"} 2"));
+        assert!(body.contains("nexapipe_l4_open_duration_ms_sum 150"));
+        assert!(body.contains("nexapipe_l4_open_duration_ms_count 2"));
+
+        // The route lookup was quick in both, and the backend connection is
+        // where the time went: the same story, told by three histograms.
+        assert!(body.contains("nexapipe_l4_route_duration_ms_bucket{le=\"5\"} 2"));
+        assert!(body.contains("nexapipe_l4_backend_duration_ms_bucket{le=\"100\"} 1"));
+        assert!(body.contains("nexapipe_l4_backend_duration_ms_bucket{le=\"250\"} 2"));
     }
 
     /// A tunnel reports its two legs as the two directions, which is the whole

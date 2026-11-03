@@ -40,14 +40,15 @@
 mod sniff;
 
 use crate::auth::ClientAcl;
+use crate::conn::limits::{ByteBudget, ByteReservation};
 use crate::conn::peers::PeerIdentity;
 use crate::l4::sniff::{FlowSniffer, Side, SniffReader};
 use crate::metrics;
 use crate::routes::{BackendLookup, RoutingTable};
 use crate::stream_util::{DuplexIroh, copy_both_ways_until, read_more_by};
 use nexapipe_proto::{
-    Frame, L4Proto, MAX_PREFACE_LEN, PREFACE_MAGIC, Preface, ProtoError, Status, decode_frame,
-    encode_frame, payload_fits_datagram,
+    FRAME_HEADER_LEN, Frame, L4Proto, MAX_PREFACE_LEN, MAX_UDP_PAYLOAD, PREFACE_MAGIC, Preface,
+    ProtoError, Status, decode_frame, encode_frame, payload_fits_datagram,
 };
 use std::io;
 use std::net::SocketAddr;
@@ -72,6 +73,47 @@ const PREFACE_TIMEOUT: Duration = Duration::from_secs(10);
 /// client gets an explicit [`Status::TooManyFlows`] and can fail the flow it is opening
 /// instead of hanging.
 pub const DEFAULT_MAX_FLOWS_PER_CONNECTION: usize = 256;
+
+/// The buffer a UDP flow receives a datagram into.
+///
+/// A datagram over IPv4 carries at most [`MAX_UDP_PAYLOAD`] bytes, and the buffer
+/// has to hold one of them whole.
+const UDP_RECV_BUFFER_BYTES: usize = 64 * 1024;
+
+/// The buffer a UDP flow reads the client's bytes into.
+const UDP_SEND_BUFFER_BYTES: usize = 4 * 1024;
+
+/// The buffer a UDP flow frames a datagram in, at its largest.
+///
+/// A length prefix and a payload a datagram can carry. The buffer is allocated
+/// at this size rather than grown into it, so that what the flow holds is what
+/// the reservation pays for.
+const UDP_FRAME_BUFFER_BYTES: usize = FRAME_HEADER_LEN + MAX_UDP_PAYLOAD;
+
+/// The frame in flight: the bytes of a datagram that has not arrived whole yet.
+///
+/// The length prefix, the largest payload the prefix can announce, and one
+/// read's worth of overshoot — a read can carry the end of a frame and the
+/// beginning of the next one, and the frame in flight has to have room for
+/// both.
+const UDP_PENDING_BUFFER_BYTES: usize =
+    FRAME_HEADER_LEN + u16::MAX as usize + UDP_SEND_BUFFER_BYTES;
+
+/// What one UDP flow holds, and what the process is charged for it.
+///
+/// Four buffers, one flow each, and none of them small. The TCP path charges
+/// its copy buffers to the same budget — the ceiling in
+/// `[limits] max_body_bytes` says the per-stream copy buffers are charged
+/// there too — so this one does too: a peer that opened many UDP flows paid
+/// for them in memory the operator's ceiling never knew about, which made the
+/// ceiling they configured not the ceiling they got.
+///
+/// Taken before the first of the four is allocated, so a flow that cannot pay
+/// does not run at all.
+const UDP_FLOW_BUFFER_BYTES: usize = UDP_RECV_BUFFER_BYTES
+    + UDP_SEND_BUFFER_BYTES
+    + UDP_FRAME_BUFFER_BYTES
+    + UDP_PENDING_BUFFER_BYTES;
 
 /// True when `first_byte` means "this stream is an L4 tunnel".
 pub fn is_l4_stream(first_byte: u8) -> bool {
@@ -139,6 +181,37 @@ pub struct FlowGuard {
 impl Drop for FlowGuard {
     fn drop(&mut self) {
         self.limiter.current.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// What one flow's opening cost, in the phases it is made of.
+///
+/// The three are what a slow tunnel is made of: the route lookup, the backend
+/// connection (or resolution), and the whole open around them. They are kept
+/// apart because the whole open also contains the round trip to the client,
+/// and a number that mixes the two cannot say whether the time was spent in
+/// this process or on the network.
+#[derive(Debug)]
+struct OpenCost {
+    /// When the preface was read: the clock every phase is measured against.
+    started: std::time::Instant,
+    /// From the preface being read to the status byte being written.
+    total_ms: u64,
+    /// The route lookup.
+    route_ms: u64,
+    /// The backend connection (TCP) or resolution (UDP).
+    backend_ms: u64,
+}
+
+impl OpenCost {
+    /// A cost that starts counting now.
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            total_ms: 0,
+            route_ms: 0,
+            backend_ms: 0,
+        }
     }
 }
 
@@ -216,6 +289,10 @@ where
         Err(PrefaceFailure::Io(e)) => return Err(e.into()),
     };
 
+    // The clock of this flow's opening starts here: the preface is in, and
+    // everything the flow costs from now on is what the client is waiting for.
+    let mut cost = OpenCost::new();
+
     // A client whose allowlist does not name this host is refused exactly the
     // way an unconfigured one is — `NoRoute`, not a distinct status, so the
     // answer cannot be used to probe which hosts exist behind the tunnel.
@@ -233,6 +310,7 @@ where
             preface.host,
             preface.port
         );
+        metrics::METRICS.record_l4_open(cost.total_ms, 0, 0);
         return Ok(());
     }
 
@@ -250,9 +328,11 @@ where
     // in the log with it.
     crate::log::record_request_on_span(&span, preface.proto.name(), &target);
 
+    let lookup_started = std::time::Instant::now();
     let lookup = config
         .get_l4_backend(&preface.host, preface.port, mode)
         .await;
+    let route_ms = lookup_started.elapsed().as_millis() as u64;
 
     let unhealthy = matches!(lookup, BackendLookup::Unavailable);
     let Some(route) = lookup.backend() else {
@@ -285,6 +365,7 @@ where
         // counted alongside requests — a rate made of both would be a rate of
         // two different things.
         metrics::METRICS.record_l4_flow(preface.proto.name(), logged_as);
+        metrics::METRICS.record_l4_open(cost.total_ms, route_ms, 0);
         span.record("status", logged_as as u64);
         crate::log::log_access_flow(
             request_id,
@@ -313,6 +394,7 @@ where
             target
         );
         metrics::METRICS.record_l4_flow(preface.proto.name(), 429);
+        metrics::METRICS.record_l4_open(cost.total_ms, route_ms, 0);
         span.record("status", 429u64);
         crate::log::log_access_flow(
             request_id,
@@ -347,6 +429,10 @@ where
     // One sniffer for the whole flow, shared by its two ends: what the client
     // said and what the origin answered are one answer between them.
     let sniffer = Arc::new(FlowSniffer::new());
+    // What this flow's opening cost. The phases are filled in as they happen —
+    // the backend one by the function that connects, the total once the status
+    // byte is on the wire — and recorded when the flow ends.
+    cost.route_ms = route_ms;
     let result = match preface.proto {
         L4Proto::Tcp => {
             let flow_timeout = route.flow_timeout.unwrap_or(deadlines.l4_flow);
@@ -357,15 +443,40 @@ where
                 connect_timeout,
                 flow_timeout,
                 &sniffer,
+                &mut cost,
             )
             .await
         }
         L4Proto::Udp => {
             let idle = route.idle_timeout.unwrap_or(deadlines.l4_idle);
             let flow_timeout = route.flow_timeout.unwrap_or(deadlines.l4_flow);
-            serve_udp(stream, &route.backend, leftover, idle, flow_timeout).await
+            serve_udp(
+                stream,
+                &route.backend,
+                leftover,
+                idle,
+                flow_timeout,
+                crate::conn::limits::body_budget(),
+                &mut cost,
+            )
+            .await
         }
     };
+
+    // What the flow's opening cost, now that it is over. A flow that failed
+    // before it reached a backend has no backend phase, and says so with a
+    // zero rather than with a number nobody measured.
+    metrics::METRICS.record_l4_open(cost.total_ms, cost.route_ms, cost.backend_ms);
+    if cost.total_ms > 0 {
+        tracing::debug!(
+            "L4 {}: {} opened in {} ms (route {} ms, backend {} ms)",
+            preface.proto.name(),
+            target,
+            cost.total_ms,
+            cost.route_ms,
+            cost.backend_ms
+        );
+    }
 
     // What the flow said about itself, now that it has said it. `None` for a
     // flow that said nothing this proxy can read, which is most of them.
@@ -426,6 +537,7 @@ async fn serve_tcp<S>(
     connect_timeout: Duration,
     flow_timeout: Duration,
     sniffer: &Arc<FlowSniffer>,
+    cost: &mut OpenCost,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -435,16 +547,23 @@ where
         anyhow::bail!("cannot parse backend address {backend:?} as host:port");
     };
 
+    let backend_started = std::time::Instant::now();
     let mut backend_stream = match crate::backend_conn::connect(&host, port, connect_timeout).await
     {
         Ok(s) => s,
         Err(e) => {
             let _ = write_status(&mut stream, Status::BackendFailed).await;
+            cost.backend_ms = backend_started.elapsed().as_millis() as u64;
+            cost.total_ms = cost.started.elapsed().as_millis() as u64;
             return Err(e);
         }
     };
+    cost.backend_ms = backend_started.elapsed().as_millis() as u64;
 
     write_status(&mut stream, Status::Ok).await?;
+    // The open is over the moment the status byte is on the wire: everything
+    // after this is the flow itself, which the access log times separately.
+    cost.total_ms = cost.started.elapsed().as_millis() as u64;
 
     // The client may have written payload in the same segment as the preface. Those
     // bytes were read off the wire before the backend existed, and dropping them would
@@ -502,6 +621,8 @@ async fn serve_udp<S>(
     leftover: Vec<u8>,
     idle: Duration,
     flow_timeout: Duration,
+    budget: &Arc<ByteBudget>,
+    cost: &mut OpenCost,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -511,33 +632,118 @@ where
         anyhow::bail!("cannot parse backend address {backend:?} as host:port");
     };
 
+    // A UDP flow has no dial to make: what it costs is the resolution of the
+    // backend's name, which is the same phase under another name.
+    let backend_started = std::time::Instant::now();
     let target = match resolve_udp_target(&host, port).await {
         Ok(addr) => addr,
         Err(e) => {
             let _ = write_status(&mut stream, Status::BackendFailed).await;
+            cost.backend_ms = backend_started.elapsed().as_millis() as u64;
+            cost.total_ms = cost.started.elapsed().as_millis() as u64;
             return Err(e);
         }
     };
 
     // The socket has to be bound to the target's address family, or `connect` fails on
     // every backend that is not IPv4.
-    let bind_addr = if target.is_ipv4() {
-        "0.0.0.0:0"
+    let bind_addr = udp_bind_addr(&target);
+
+    serve_udp_flow(
+        stream,
+        target,
+        &bind_addr,
+        leftover,
+        idle,
+        flow_timeout,
+        budget,
+        backend_started,
+        cost,
+    )
+    .await
+}
+
+/// The address a UDP flow's socket is bound to.
+///
+/// The wildcard address of the target's family, and nothing else: the socket
+/// is a client socket, so it binds to a port the kernel picks and sends from
+/// wherever it happens to be.
+fn udp_bind_addr(target: &SocketAddr) -> String {
+    if target.is_ipv4() {
+        "0.0.0.0:0".to_string()
     } else {
-        "[::]:0"
+        "[::]:0".to_string()
+    }
+}
+
+/// The flow itself, once the target and the address to bind it to are known.
+///
+/// The bind address is a parameter rather than derived here, because the bind
+/// is the one step of the flow that can fail for reasons of its own — a host
+/// with IPv6 disabled, an exhausted descriptor table — and a step that cannot
+/// be reached cannot be tested.
+async fn serve_udp_flow<S>(
+    mut stream: S,
+    target: SocketAddr,
+    bind_addr: &str,
+    leftover: Vec<u8>,
+    idle: Duration,
+    flow_timeout: Duration,
+    budget: &Arc<ByteBudget>,
+    backend_started: std::time::Instant,
+    cost: &mut OpenCost,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // The buffers this flow holds are paid for before the first of them
+    // exists. A flow that cannot afford them does not run: the budget exists
+    // to refuse, not to warn, and a flow refused here never takes a socket
+    // either.
+    //
+    // Held in a named binding rather than dropped at once: a `_` would give
+    // the bytes back while the buffers they pay for are still alive.
+    let _reservation = match ByteReservation::take_buffers(budget, UDP_FLOW_BUFFER_BYTES) {
+        Ok(reservation) => reservation,
+        Err(e) => {
+            let _ = write_status(&mut stream, Status::BackendFailed).await;
+            cost.backend_ms = backend_started.elapsed().as_millis() as u64;
+            cost.total_ms = cost.started.elapsed().as_millis() as u64;
+            return Err(e);
+        }
     };
-    let socket = Arc::new(UdpSocket::bind(bind_addr).await?);
+
+    // The bind is the one step of the flow that can fail for reasons that
+    // have nothing to do with the backend: an exhausted descriptor table, a
+    // host with IPv6 disabled. It is answered like the other failures are —
+    // one status byte, so the client can tell a backend it could not reach
+    // from a server that closed the tunnel without answering.
+    let socket = Arc::new(match UdpSocket::bind(bind_addr).await {
+        Ok(socket) => socket,
+        Err(e) => {
+            let _ = write_status(&mut stream, Status::BackendFailed).await;
+            cost.backend_ms = backend_started.elapsed().as_millis() as u64;
+            cost.total_ms = cost.started.elapsed().as_millis() as u64;
+            return Err(anyhow::anyhow!(
+                "failed to bind the UDP socket on {bind_addr}: {e}"
+            ));
+        }
+    });
 
     // A connected UDP socket drops datagrams from anybody else, which keeps an
     // off-path attacker from injecting replies into the tunnel.
     if let Err(e) = socket.connect(target).await {
         let _ = write_status(&mut stream, Status::BackendFailed).await;
+        cost.backend_ms = backend_started.elapsed().as_millis() as u64;
+        cost.total_ms = cost.started.elapsed().as_millis() as u64;
         return Err(anyhow::anyhow!(
             "failed to connect UDP socket to {target}: {e}"
         ));
     }
+    cost.backend_ms = backend_started.elapsed().as_millis() as u64;
 
     write_status(&mut stream, Status::Ok).await?;
+    cost.total_ms = cost.started.elapsed().as_millis() as u64;
 
     tracing::debug!("L4 UDP: {} tunnel open (idle timeout {:?})", target, idle);
 
@@ -547,10 +753,15 @@ where
     // can be finished rather than reset. Each block gets its own `Arc` clone.
     let socket_up = socket.clone();
     let socket_down = socket.clone();
-    let mut pending = leftover;
+    // The frame in flight, in a buffer of the size the reservation pays for.
+    // Allocated once rather than grown into: a frame is decoded and drained
+    // as soon as it is complete, so what is left between two reads is at most
+    // one incomplete frame, and the buffer never has to grow past that.
+    let mut pending = Vec::with_capacity(UDP_PENDING_BUFFER_BYTES);
+    pending.extend_from_slice(&leftover);
 
     let client_to_backend = async {
-        let mut buf = vec![0u8; 4096];
+        let mut buf = vec![0u8; UDP_SEND_BUFFER_BYTES];
         // A cursor into `pending`, compacted once per read rather than after
         // every frame: draining moves every byte behind a frame down, so a
         // segment carrying N datagrams cost N memmoves over the whole tail.
@@ -598,7 +809,20 @@ where
 
             match tokio::time::timeout(idle, reader.read(&mut buf)).await {
                 Ok(Ok(0)) => return,
-                Ok(Ok(n)) => pending.extend_from_slice(&buf[..n]),
+                Ok(Ok(n)) => {
+                    // The buffer the frame in flight is held in is paid for by
+                    // the reservation, and it has room for one frame and the
+                    // read that completes it. A client that sends more than
+                    // that without the frame ever being complete is not
+                    // speaking the protocol.
+                    if pending.len() + n > UDP_PENDING_BUFFER_BYTES {
+                        tracing::debug!(
+                            "L4 UDP: the client sent more than a frame without completing it"
+                        );
+                        return;
+                    }
+                    pending.extend_from_slice(&buf[..n]);
+                }
                 Ok(Err(e)) => {
                     tracing::debug!("L4 UDP: client read failed: {}", e);
                     return;
@@ -612,8 +836,8 @@ where
     };
 
     let backend_to_client = async {
-        let mut buf = vec![0u8; 65_536];
-        let mut frame = Vec::with_capacity(2048);
+        let mut buf = vec![0u8; UDP_RECV_BUFFER_BYTES];
+        let mut frame = Vec::with_capacity(UDP_FRAME_BUFFER_BYTES);
         loop {
             let n = match tokio::time::timeout(idle, socket_down.recv(&mut buf)).await {
                 Ok(Ok(n)) => n,
