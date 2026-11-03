@@ -297,6 +297,26 @@ impl Pool {
     fn len(&self) -> usize {
         self.domain_to_ip.len()
     }
+
+    /// Rebuild `domain_to_ip` from `ip_to_domain`.
+    ///
+    /// Called after a mutex poison: a panic between the forward and reverse
+    /// inserts in [`alloc`](Self::alloc) leaves the two maps out of sync, and
+    /// the reverse map is the one that may be stale. The forward map is the
+    /// source of truth — it is what the packet path reads — so the reverse is
+    /// rebuilt from it rather than the other way round.
+    ///
+    /// A domain that appears under two addresses (the forward map was updated
+    /// but the old reverse entry was not removed) keeps the last address the
+    /// forward map holds for it, which is the one the next allocation would
+    /// have used.
+    fn rebuild_reverse(&mut self) {
+        self.domain_to_ip = self
+            .ip_to_domain
+            .iter()
+            .map(|(ip, addr)| (addr.domain.clone(), *ip))
+            .collect();
+    }
 }
 
 impl Default for IpMapping {
@@ -398,14 +418,26 @@ impl IpMapping {
         self.len() == 0
     }
 
-    /// A poisoned lock still holds a consistent table, so recovering from one is
-    /// better than taking the whole tunnel down: every critical section here is
-    /// a handful of `HashMap` calls and nothing that can panic in between, so
-    /// there is no half-applied update for the poison flag to protect us from.
+    /// A poisoned lock still holds a usable table, so recovering from one is
+    /// better than taking the tunnel down. The critical sections are a handful
+    /// of `HashMap` calls, but a panic between the forward and reverse inserts
+    /// in [`Pool::alloc`] would leave the two maps out of sync: `ip_to_domain`
+    /// has the new entry but `domain_to_ip` does not (or vice versa), and a
+    /// later lookup could answer the wrong domain — routing traffic to the
+    /// wrong backend.
+    ///
+    /// On poison we rebuild `domain_to_ip` from `ip_to_domain`, which is the
+    /// direction the packet path reads: a destination address is looked up to
+    /// find its domain, so the forward map is the source of truth.
     fn locked(&self) -> MutexGuard<'_, Inner> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.inner.lock().unwrap_or_else(|poisoned| {
+            let mut inner = poisoned.into_inner();
+            inner.v4.rebuild_reverse();
+            if let Some(v6) = inner.v6.as_mut() {
+                v6.rebuild_reverse();
+            }
+            inner
+        })
     }
 }
 
@@ -835,5 +867,38 @@ mod tests {
             mapping.lookup_domain_v6(&third).as_deref(),
             Some("third.test")
         );
+    }
+
+    /// A panic while the table is locked leaves the two maps out of step.
+    ///
+    /// The forward one — the domain an address was handed out for — is the one
+    /// the packet path reads, so it is the one that survives a poison; the
+    /// reverse one is rebuilt from it when the lock is recovered. Without that
+    /// rebuild a name whose reverse entry was lost is handed a **new** address
+    /// on its next lookup, and the packets the application still sends to the
+    /// old one are answered with a name that is not there any more.
+    #[test]
+    fn a_poisoned_lock_rebuilds_the_map_the_allocator_reads() {
+        let mapping = IpMapping::new();
+        let first = mapping.allocate("a.test");
+        let second = mapping.allocate("b.test");
+        assert_ne!(first, second);
+
+        // The panic lands between the two inserts of an allocation: the
+        // forward map holds the new entry and the reverse one does not.
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let mut inner = mapping.inner.lock().expect("the lock is not poisoned yet");
+                    inner.v4.domain_to_ip.remove("b.test");
+                    panic!("a panic while the table is locked");
+                })
+                .join()
+                .ok();
+        });
+
+        // The recovery rebuilds the map the allocator reads, so the name still
+        // answers with the address it had.
+        assert_eq!(mapping.allocate("b.test"), second);
     }
 }
