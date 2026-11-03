@@ -162,6 +162,16 @@ impl PooledConnection {
         self.conn.close(0u32.into(), reason);
     }
 
+    /// Closes the connection without giving it up.
+    ///
+    /// [`Self::discard`] takes the connection by value, which is right for a
+    /// caller that is done with it and wrong for one that is not: a flow that
+    /// finds its tunnel was never answered still holds the connection, and
+    /// still has to give it back when it ends.
+    pub fn close(&self, reason: &'static [u8]) {
+        self.conn.close(0u32.into(), reason);
+    }
+
     /// Marks the connection as carrying as many flows as the server allows.
     ///
     /// The server refused a flow with `TooManyFlows`, which says something
