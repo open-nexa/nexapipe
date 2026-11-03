@@ -886,6 +886,15 @@ impl TunProxy {
         }
 
         // Stack → TUN pump (Stack Stream → writer).
+        //
+        // Unlike the Android fd pump this path does not retry on
+        // `WouldBlock`: this writer is the device's own `AsyncWrite`
+        // implementation, which handles EAGAIN internally, and the contract
+        // of `AsyncWrite::write_all` is to keep writing until every byte is
+        // written or an error occurs. A writer that returned `WouldBlock`
+        // from `write_all` without retrying would hang here — if such a
+        // writer is ever used, add the same retry loop the Android pump has
+        // above.
         {
             let stopped_clone = stopped.clone();
             tasks.push(tokio::spawn(async move {
