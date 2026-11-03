@@ -246,6 +246,22 @@ and its meaning.
 
 ### Fixed
 
+- **An invite cannot point at one endpoint while carrying another endpoint's
+  credential.** `--endpoint-id` published whatever endpoint it was given and
+  put this server's 2FA secret or its one-time enrollment token into the same
+  link — and a client that scans that link sends the credential to the
+  endpoint the link names. An endpoint ID that is not this server's therefore
+  handed this server's secret to whichever endpoint holds that ID, where a
+  one-time code can be captured and replayed here for as long as it is valid.
+  The endpoint an invite names and the credential it carries now have to
+  belong to the same server: when the configuration says who this server is
+  (`[iroh] secret_key`), an invite naming another endpoint is refused, and
+  warned about when it carries no credential — then it is a wrong address
+  rather than a leaked secret. The check runs before the credential is
+  touched, so a refused invite does not revoke the enrollment token the
+  operator still holds. `--endpoint-id` keeps its meaning where the
+  configuration names no identity at all: a server that generates its
+  identity at start-up has no other way to be published.
 - **The desktop does not act on one missed service read.** The service gate is
   read over the IPC port, and that read has deadlines of its own — half a
   second to connect and five to be answered. A busy machine misses them while

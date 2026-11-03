@@ -74,6 +74,17 @@ fn own_ticket() -> String {
     EndpointTicket::new(EndpointAddr::new(key.public())).to_string()
 }
 
+/// The Node ID of the endpoint the scratch configuration runs as.
+fn own_node_id() -> String {
+    let key: SecretKey = SERVER_SECRET.parse().expect("secret key");
+    key.public().to_string()
+}
+
+/// The Node ID of an endpoint that is not this one.
+fn other_node_id() -> String {
+    SecretKey::generate().public().to_string()
+}
+
 fn run(config: &Path, args: &[&str]) -> (bool, String) {
     let mut full = vec![
         "--config".to_string(),
@@ -192,5 +203,68 @@ fn a_ticket_for_another_endpoint_without_a_credential_only_warns() {
     assert!(
         output.contains("warning:") && output.contains("different endpoint"),
         "the operator has to be told that the ticket names another endpoint:\n{output}"
+    );
+}
+
+/// The same rule for the Node ID form: an endpoint the invite points at and a
+/// credential that belongs to another endpoint cannot travel together.
+#[test]
+fn an_endpoint_id_for_another_endpoint_cannot_carry_this_servers_credential() {
+    let (_dir, config) = scratch_config_with_client("config.toml");
+    let foreign = other_node_id();
+
+    let (ok, output) = run(
+        &config,
+        &["--generate-invite", "client-001", "--endpoint-id", &foreign],
+    );
+
+    assert!(
+        !ok,
+        "a foreign endpoint id was published together with this server's credential:\n{output}"
+    );
+    assert!(
+        output.contains("2FA credential") && output.contains("different endpoint"),
+        "the refusal has to say what would have leaked and where:\n{output}"
+    );
+    assert!(
+        !output.contains("nexapipe://endpoint/"),
+        "no link may be printed for a refused invite:\n{output}"
+    );
+}
+
+/// The same endpoint ID without a credential in the invite is a wrong address
+/// rather than a leaked secret, so it is a warning and not a refusal.
+#[test]
+fn an_endpoint_id_for_another_endpoint_without_a_credential_only_warns() {
+    let (_dir, config) = scratch_config("config.toml", None);
+    let foreign = other_node_id();
+
+    let (ok, output) = run(&config, &["--generate-invite", "--endpoint-id", &foreign]);
+
+    assert!(ok, "the invite was refused:\n{output}");
+    assert!(output.contains("nexapipe://endpoint/"), "{output}");
+    assert!(
+        output.contains("warning:") && output.contains("different endpoint"),
+        "the operator has to be told that the endpoint id names another endpoint:\n{output}"
+    );
+}
+
+/// The override the flag exists for: the endpoint this server runs as. It
+/// names the same server, so it is published as it is.
+#[test]
+fn an_endpoint_id_for_this_server_is_published() {
+    let (_dir, config) = scratch_config_with_client("config.toml");
+    let own = own_node_id();
+
+    let (ok, output) = run(
+        &config,
+        &["--generate-invite", "client-001", "--endpoint-id", &own],
+    );
+
+    assert!(ok, "the invite was refused:\n{output}");
+    assert!(output.contains("nexapipe://endpoint/"), "{output}");
+    assert!(
+        !output.contains("different endpoint"),
+        "the endpoint this server runs as is not another endpoint:\n{output}"
     );
 }

@@ -77,6 +77,13 @@ the endpoint the ticket names. A ticket naming another endpoint is therefore
 refused when the invite carries a credential, and warned about when it does
 not.
 
+The Node ID form answers to the same rule: `--endpoint-id` publishes the
+endpoint it is given, and an invite that publishes an endpoint other than
+this server's carries this server's credential to that endpoint. So the two
+are refused together whenever the configuration says who this server is
+(`[iroh] secret_key`), and only warned about when the invite carries no
+credential at all.
+
 ## 2. Relays
 
 Four modes, and what each one bounds:

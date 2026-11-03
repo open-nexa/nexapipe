@@ -66,52 +66,67 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
         }
     };
 
-    // A ticket names an endpoint by its identity *and* by its addresses, and
-    // the invite may carry this server's 2FA credential with it. A client that
-    // scans such a link sends that credential to the endpoint the ticket names
-    // — so a ticket naming a different endpoint would hand this server's
-    // secret to a third party, and a one-time code captured there can be
-    // replayed against this server for as long as the code is valid.
+    // The endpoint an invite points at and the credential it carries have to
+    // belong to the same server: a client that scans the link sends the
+    // credential to the endpoint the link names, and a one-time code captured
+    // there can be replayed against this server for as long as it is valid.
     //
     // The check is made here, before the credential is touched: writing a
     // pending enrollment token and then refusing would revoke the token the
     // operator still holds.
-    if let EndpointTarget::Ticket(ticket) = &target {
-        let ticket_id = ticket_node_id(ticket)?;
-        // Whether the invite carries a credential at all. Without a client id
-        // it carries none, and a ticket naming another endpoint is then a
-        // wrong address rather than a leaked secret.
-        let carries_credential = cli
-            .generate_invite
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|id| !id.is_empty());
-        match config_server_identity(proxy_config.as_ref())? {
-            Some(server_id) if server_id != ticket_id => {
-                if carries_credential {
-                    anyhow::bail!(
-                        "the ticket names endpoint {ticket_id}, but this server is {server_id}; \
-                         an invite built from it would carry this server's 2FA credential to a \
-                         different endpoint. Use the ticket this server printed at start-up."
-                    );
-                }
-                eprintln!(
-                    "warning: the ticket names endpoint {ticket_id}, but this server is \
-                     {server_id}: the invite points at a different endpoint"
-                );
-            }
-            // The configuration says nothing about this server's identity, so
-            // the ticket cannot be checked against it. The endpoint generates
-            // an identity at start-up and writes it back, so this is the state
-            // of a configuration whose server has never run.
-            None => {
-                eprintln!(
+    //
+    // Whether the invite carries a credential at all: without a client id it
+    // carries none, and an invite naming another endpoint is then a wrong
+    // address rather than a leaked secret.
+    let carries_credential = cli
+        .generate_invite
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|id| !id.is_empty());
+    let server_id = config_server_identity(proxy_config.as_ref())?;
+    match &target {
+        // A ticket names the endpoint inside it, next to its addresses: it
+        // claims to be this server's own ticket, so it is checked against the
+        // identity this server runs as.
+        EndpointTarget::Ticket(ticket) => {
+            let ticket_id = ticket_node_id(ticket)?;
+            match server_id.as_deref() {
+                // The configuration says nothing about this server's identity,
+                // so the ticket cannot be checked against it. The endpoint
+                // generates an identity at start-up and writes it back, so
+                // this is the state of a configuration whose server has never
+                // run — and a stale ticket points at another endpoint.
+                None => eprintln!(
                     "warning: the ticket names endpoint {ticket_id}, and this configuration has \
                      no [iroh] secret_key to check it against: the endpoint generates its \
                      identity at start-up, so a stale ticket would point at another endpoint"
-                );
+                ),
+                Some(server_id) if ticket_id != server_id => refuse_or_warn(
+                    &ticket_id,
+                    "ticket",
+                    server_id,
+                    carries_credential,
+                    Some("Use the ticket this server printed at start-up."),
+                )?,
+                Some(_) => {}
             }
-            _ => {}
+        }
+        // A Node ID names the endpoint the server runs as, unless
+        // `--endpoint-id` overrides it. The override is a deliberate one, so a
+        // mismatch is refused when it would carry a credential and warned
+        // about when it would not.
+        EndpointTarget::NodeId(id) => {
+            if let Some(server_id) = server_id.as_deref()
+                && id != server_id
+            {
+                refuse_or_warn(
+                    id,
+                    "endpoint ID",
+                    server_id,
+                    carries_credential,
+                    Some("Drop --endpoint-id to publish the endpoint this server runs as."),
+                )?;
+            }
         }
     }
 
@@ -498,6 +513,32 @@ async fn create_client_for_invite(
     println!();
 
     Ok(secret)
+}
+
+/// Refuses an invite that would carry this server's credential to another
+/// endpoint, and warns about one that would only point at the wrong address.
+///
+/// `named` is the endpoint the invite points at, `what` says in one word where
+/// it came from, and `hint` is what to do about it.
+fn refuse_or_warn(
+    named: &str,
+    what: &str,
+    server_id: &str,
+    carries_credential: bool,
+    hint: Option<&str>,
+) -> anyhow::Result<()> {
+    if carries_credential {
+        anyhow::bail!(
+            "the {what} names endpoint {named}, but this server is {server_id}; an invite built \
+             from it would carry this server's 2FA credential to a different endpoint.{}",
+            hint.map(|hint| format!(" {hint}")).unwrap_or_default()
+        );
+    }
+    eprintln!(
+        "warning: the {what} names endpoint {named}, but this server is {server_id}: the invite \
+         points at a different endpoint"
+    );
+    Ok(())
 }
 
 /// The Node ID a ticket names.
