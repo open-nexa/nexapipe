@@ -88,8 +88,8 @@ pub async fn run_local_proxy(
         let transport_tuning = nexapipe_client::transport::TransportTuning::from_env();
         tracing::info!("QUIC transport tuning: {}", transport_tuning.describe());
 
-        let mut builder = Endpoint::builder(presets::N0)
-            .transport_config(transport_tuning.transport_config());
+        let mut builder =
+            Endpoint::builder(presets::N0).transport_config(transport_tuning.transport_config());
         if let Some(relay) = &relay {
             builder = builder.relay_mode(relay.relay_mode());
         }

@@ -727,7 +727,8 @@ async fn run_local_proxy_mode(proxy_config: &ProxyConfig, shutdown_signal: &Arc<
 
     tracing::info!("Starting local proxy mode");
 
-    if let Err(e) = run_local_proxy(config, proxy_config.iroh.clone(), shutdown_signal.clone()).await
+    if let Err(e) =
+        run_local_proxy(config, proxy_config.iroh.clone(), shutdown_signal.clone()).await
     {
         tracing::error!("Local proxy failed: {}", e);
         std::process::exit(1);

@@ -20,13 +20,10 @@ use crate::jni_log;
 /// while a ticket carries only addresses and an identity inside them. This is
 /// how a ticket-backed node is found again when the node is removed.
 fn ticket_names_id(ticket: &str, node_id: &str) -> bool {
-    ticket
-        .parse::<EndpointTicket>()
-        .ok()
-        .is_some_and(|parsed| {
-            let addr: EndpointAddr = parsed.into();
-            addr.id.to_string() == node_id
-        })
+    ticket.parse::<EndpointTicket>().ok().is_some_and(|parsed| {
+        let addr: EndpointAddr = parsed.into();
+        addr.id.to_string() == node_id
+    })
 }
 
 /// Validates a node ID with the exact parser the connection path uses.
@@ -494,9 +491,10 @@ fn add_ticket_domain_mapping(env: &mut Env<'_>, domain: JString, ticket: JString
         Err(_) => return -1,
     };
 
-    let already_mapped = guard.domain_mappings.iter().any(|m| {
-        m.domain == domain_str && m.server_ticket.as_deref() == Some(ticket_str.as_str())
-    });
+    let already_mapped = guard
+        .domain_mappings
+        .iter()
+        .any(|m| m.domain == domain_str && m.server_ticket.as_deref() == Some(ticket_str.as_str()));
     if already_mapped {
         return 0;
     }

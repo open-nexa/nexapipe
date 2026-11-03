@@ -465,10 +465,9 @@ impl ProxyClient {
         // the services off this endpoint so it neither publishes to nor asks
         // n0, and a server then has to be named by a ticket. An empty value
         // means nothing was injected, which is the default everywhere else.
-        let discovery = DiscoveryMode::parse_or_default(
-            config.discovery_mode.as_deref().unwrap_or(""),
-        )
-        .map_err(|e| ClientError::InvalidConfig(e.to_string()))?;
+        let discovery =
+            DiscoveryMode::parse_or_default(config.discovery_mode.as_deref().unwrap_or(""))
+                .map_err(|e| ClientError::InvalidConfig(e.to_string()))?;
 
         // The QUIC transport tuning has to be applied here: this endpoint
         // carries every proxied stream, and without it each stream falls back
