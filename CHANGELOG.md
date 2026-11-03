@@ -86,6 +86,17 @@ and its meaning.
 
 ### Changed
 
+- **The shipped 2FA example says two things that are not true.** The secret in
+  `config.toml.2fa.example` is published — it is in a public repository, so
+  anybody can compute a valid code from it — and the README did not say so.
+  The Node ID is a reachability credential on its own, and the 2FA secret is
+  what closes it: a published secret is a published way in. The example now
+  says what it is for, and the README says the same.
+- **The example no longer claims the server refuses to start on a readable
+  configuration.** It did, and it has not since the v0.6.1 change that removed
+  the check: a `0644` bind mount has to start, so the server warns once in the
+  log and starts anyway. The mode is the operator's to set, and the warning
+  is the only thing that says so.
 - **A packet on the desktop's TUN costs one allocation, not an allocation and
   a copy.** The pump read every packet into a buffer and then copied it into
   a freshly allocated one for the stack, because the stack's sink owns what it
