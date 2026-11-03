@@ -117,7 +117,6 @@ bindings for Swift/Kotlin/Python. See
 | `crates/nexapipe/` | Server binary and library: CLI (`src/main.rs`), config, iroh stream handling (`src/conn/`), HTTP/WebSocket proxying (`src/http/`, `src/proxy/`), TLS passthrough, the L4 tunnel (`src/l4/`), routing (`src/routes/`, `src/lb/`), health checks, TOTP 2FA (`src/auth/`). |
 | `crates/nexapipe-client/` | Client library (`lib` + `cdylib`): pool, domain→node mapping, local proxy, L4 client, smoltcp TUN proxy, QUIC tuning, JNI, UniFFI. |
 | `crates/nexapipe-proto/` | The L4 wire format: `preface.rs` and `udp.rs`. No dependencies, so both sides link the same code. |
-| `third_party/smoltcp` | Vendored smoltcp 0.12 with a patch for the sequence-number underflow panic. Wired in through `[patch.crates-io]`. Do not edit. |
 | `ui-android/` | Android app (Kotlin + Compose). |
 | `ui-desktop/` | Tauri 2 desktop app (Vue 3 + TypeScript). |
 | `config.toml.example` | Example server + client configuration covering every section. It ships with 2FA **on** and no client enrolled, so a fresh install refuses every connection until one is enrolled. Copy it to `config.toml` — that name is gitignored, it is the operator's live config. The docker compose file uses `config/config.toml` instead, picked up via `NEXAPIPE_CONFIG_DIR=/app/config`. |
@@ -2094,10 +2093,10 @@ separate cargo project, so the workspace lint gate does not cover it either.
 
 Notes:
 
-- The workspace pins edition 2024 and vendors smoltcp through
-  `[patch.crates-io]`; keep `third_party/` in the build context (Docker already
-  does). Platform code stays behind cargo features (`jni`, `local-proxy`,
-  `tun-proxy`, `uniffi`).
+- The workspace pins edition 2024. The TUN proxy's user-space TCP/IP stack is
+  smoltcp, taken from crates.io: the client drives it directly, in
+  `crates/nexapipe-client/src/tun_proxy/netstack/`. Platform code stays behind
+  cargo features (`jni`, `local-proxy`, `tun-proxy`, `uniffi`).
 - CI (`.github/workflows/ci.yml`) runs the test suite on Linux and macOS; the
   desktop crate is `cargo check`ed on Linux, macOS and Windows. `release.yml`
   covers multi-platform builds on tags. A tag containing a hyphen (`v0.2.0-rc.1`) is a

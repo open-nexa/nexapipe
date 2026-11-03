@@ -22,7 +22,7 @@
 //! it touches.
 
 use futures_util::{SinkExt, StreamExt};
-use netstack_smoltcp::StackBuilder;
+use nexapipe_client::tun_proxy::netstack::StackBuilder;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicUsize, Ordering};

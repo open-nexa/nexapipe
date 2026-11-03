@@ -316,7 +316,7 @@ pub fn save(path: &Path, state: &RuntimeState) -> anyhow::Result<()> {
     let contents = toml::to_string_pretty(&file)
         .map_err(|e| anyhow::anyhow!("cannot render the 2FA state: {e}"))?;
 
-    crate::config::write_config_file(&path.to_string_lossy(), &contents)
+    crate::storage::file::write_file(path, &contents)
 }
 
 /// The counters of every client and device in `config`.

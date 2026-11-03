@@ -103,7 +103,6 @@ Android JNI 用的 `cdylib`，以及面向 Swift/Kotlin/Python 的 UniFFI 绑定
 | `crates/nexapipe/` | 服务端二进制与库：CLI（`src/main.rs`）、配置、iroh 流处理（`src/conn/`）、HTTP/WebSocket 代理（`src/http/`、`src/proxy/`）、TLS 透传、L4 隧道（`src/l4/`）、路由（`src/routes/`、`src/lb/`）、健康检查、TOTP 2FA（`src/auth/`）。 |
 | `crates/nexapipe-client/` | 客户端库（`lib` + `cdylib`）：连接池、域名→节点映射、本地代理、L4 客户端、smoltcp TUN 代理、QUIC 调优、JNI、UniFFI。 |
 | `crates/nexapipe-proto/` | L4 线格式：`preface.rs` 与 `udp.rs`。零依赖，因此服务端与客户端都能链接它。 |
-| `third_party/smoltcp` | 内置的 smoltcp 0.12，附带序列号下溢 panic 的补丁。通过 `[patch.crates-io]` 接入。不要改动。 |
 | `ui-android/` | Android 应用（Kotlin + Compose）。 |
 | `ui-desktop/` | Tauri 2 桌面应用（Vue 3 + TypeScript）。 |
 | `config.toml.example` | 覆盖全部配置项的示例（服务端 + 客户端）。它出厂即开启 2FA 且没有任何已 enrolled 的客户端，因此全新安装在 enrolled 第一个客户端之前会拒绝所有连接。复制成 `config.toml` —— 该文件名已被 gitignore，它是运维者的实际配置。Docker compose 用的是 `config/config.toml`，通过 `NEXAPIPE_CONFIG_DIR=/app/config` 让二进制默认读取。 |
@@ -1793,9 +1792,10 @@ TUN 栈由 Android 与桌面端共用，只有它基于 fd 的入口是 `cfg(tar
 
 说明：
 
-- workspace 锁定 edition 2024，并通过 `[patch.crates-io]` 内置 smoltcp；请把
-  `third_party/` 留在构建上下文中（Docker 已经这么做了）。平台相关代码始终放在
-  cargo feature 之后（`jni`、`local-proxy`、`tun-proxy`、`uniffi`）。
+- workspace 锁定 edition 2024。TUN 代理的用户态 TCP/IP 栈是 smoltcp，直接取自
+  crates.io，由客户端自行驱动：`crates/nexapipe-client/src/tun_proxy/netstack/`。
+  平台相关代码始终放在 cargo feature 之后（`jni`、`local-proxy`、`tun-proxy`、
+  `uniffi`）。
 - CI（`.github/workflows/ci.yml`）在 Linux 与 macOS 上跑测试；桌面端 crate 在
   Linux、macOS、Windows 上做 `cargo check`。`release.yml` 在打 tag 时覆盖多平台
   构建。含连字符的 tag（`v0.2.0-rc.1`）会作为 GitHub **pre-release** 发布，因此

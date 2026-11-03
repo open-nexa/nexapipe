@@ -14,6 +14,7 @@ use crate::health::HealthProbes;
 use crate::http;
 use crate::routes::RoutingTable;
 use crate::shutdown::{DRAIN_TIMEOUT, InFlight, ShutdownSignal};
+use crate::storage::Storage;
 use anyhow::Context;
 use iroh::endpoint::BindOpts;
 use iroh::endpoint::presets;
@@ -71,7 +72,7 @@ pub struct ProxyOptions {
 
 pub async fn run_proxy(
     config: Arc<RoutingTable>,
-    config_path: &str,
+    storage: Arc<dyn Storage>,
     shutdown_signal: Arc<ShutdownSignal>,
     options: ProxyOptions,
 ) -> anyhow::Result<()> {
@@ -158,10 +159,10 @@ pub async fn run_proxy(
     let auth_state = Some(match authenticator {
         Some(authenticator) => conn::AuthState::with_authenticator(
             auth_config.unwrap_or_default(),
-            config_path,
+            storage.clone(),
             authenticator,
         ),
-        None => conn::AuthState::new(auth_config.unwrap_or_default(), config_path),
+        None => conn::AuthState::new(auth_config.unwrap_or_default(), storage.clone()),
     });
 
     // The watcher needs three things to apply a reload: it rebuilds the routes,
@@ -176,7 +177,7 @@ pub async fn run_proxy(
     // one: `client revoke` edits the file, and the next pass has to tell the
     // connections already authenticated as what it removed to stop.
     let config_watcher = Arc::new(ConfigWatcher::new(
-        config_path.to_string(),
+        storage.clone(),
         config.clone(),
         clients.clone(),
         health_probes,
@@ -190,7 +191,7 @@ pub async fn run_proxy(
             config_watcher_clone.start_watch().await;
         }
     });
-    tracing::info!("Config watcher started, monitoring: {}", config_path);
+    tracing::info!("Config watcher started, monitoring: {}", storage.describe());
 
     // Whether 2FA gates the iroh listener *right now*. The value is live — a
     // reload can turn it on, taking effect for connections opened after it — so
@@ -507,7 +508,7 @@ pub async fn run_proxy(
         // Made here, and only because the listener is up: a deployment that
         // never binds it should not find a credential on disk next to its
         // config.
-        let token = admin::token::load_or_create(config_path);
+        let token = admin::token::load_or_create_from(storage.as_ref()).await;
         let state = Arc::new(admin::AdminState::new(
             config.clone(),
             in_flight.clone(),
