@@ -18,7 +18,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll, Waker};
 
 use futures_util::Stream;
-use smoltcp::storage::RingBuffer;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Notify, mpsc};
 
@@ -140,9 +139,9 @@ pub(super) struct SocketControl {
 /// The state of one flow.
 struct FlowState {
     /// What the peer sent, waiting for the application.
-    recv: RingBuffer<'static, u8>,
+    recv: ByteRing,
     /// What the application wrote, waiting for the peer.
-    send: RingBuffer<'static, u8>,
+    send: ByteRing,
     /// The peer closed its side.
     recv_closed: bool,
     /// The application closed its side.
@@ -179,13 +178,95 @@ impl FlowState {
     }
 }
 
+/// A queue of bytes that grows as it is used, up to a limit.
+///
+/// The limit is the flow-control window: the bytes that may be in flight in
+/// one direction. **The storage is not the limit.** A flow that carries
+/// nothing holds nothing, and a flow that carries a lot holds what it
+/// carries — which is the difference between a window that is an allocation
+/// and a window that is a credit.
+///
+/// The buffer this replaces was a fixed one of the window's size, so every
+/// flow paid for the whole window the moment it opened, whether it carried a
+/// byte or not. A phone opens dozens of flows and most of them are idle most
+/// of the time.
+struct ByteRing {
+    /// The bytes that are waiting.
+    bytes: Vec<u8>,
+    /// How far into `bytes` the next read starts.
+    ///
+    /// The bytes before it have been read and are waiting to be dropped: a
+    /// queue that is emptied often would otherwise grow for ever, and the
+    /// space before the head is reclaimed when the queue runs dry.
+    head: usize,
+    /// How many bytes may be waiting at once: the window.
+    limit: usize,
+}
+
+impl ByteRing {
+    /// A queue that holds at most `limit` bytes.
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            head: 0,
+            limit,
+        }
+    }
+
+    /// How many bytes are waiting.
+    fn len(&self) -> usize {
+        self.bytes.len() - self.head
+    }
+
+    /// How many bytes may still be added.
+    fn window(&self) -> usize {
+        self.limit - self.len()
+    }
+
+    /// Whether nothing is waiting.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Whether the window is full.
+    fn is_full(&self) -> bool {
+        self.len() >= self.limit
+    }
+
+    /// Adds what fits, and says how much was taken.
+    fn enqueue_slice(&mut self, data: &[u8]) -> usize {
+        let room = self.window();
+        let taken = room.min(data.len());
+        // The space the read bytes left is reclaimed first: a queue that is
+        // emptied and filled again would otherwise grow for ever.
+        if self.head > 0 && self.head == self.bytes.len() {
+            self.bytes.clear();
+            self.head = 0;
+        }
+        self.bytes.extend_from_slice(&data[..taken]);
+        taken
+    }
+
+    /// Takes what fits into `into`, and says how much was taken.
+    fn dequeue_slice(&mut self, into: &mut [u8]) -> usize {
+        let taken = into.len().min(self.len());
+        into[..taken].copy_from_slice(&self.bytes[self.head..self.head + taken]);
+        self.head += taken;
+        if self.head == self.bytes.len() {
+            self.bytes.clear();
+            self.head = 0;
+        }
+        taken
+    }
+}
+
 impl SocketControl {
     /// A flow with room for a window's worth of bytes in each direction.
     pub(super) fn new(recv_capacity: usize, send_capacity: usize, notify: Arc<Notify>) -> Self {
         Self {
             state: Mutex::new(FlowState {
-                recv: RingBuffer::new(vec![0u8; recv_capacity]),
-                send: RingBuffer::new(vec![0u8; send_capacity]),
+                recv: ByteRing::new(recv_capacity),
+                send: ByteRing::new(send_capacity),
                 recv_closed: false,
                 send_closed: false,
                 fin_sent: false,
@@ -346,5 +427,53 @@ impl SocketControl {
         // The runner closes the socket once the bytes are out.
         self.notify.notify_one();
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ByteRing;
+
+    /// The window is a credit, not an allocation.
+    ///
+    /// A queue that holds a window's worth of bytes from the moment it is
+    /// made costs every flow the whole window whether it carries anything or
+    /// not, and a phone opens dozens of flows that are idle most of the time.
+    /// This one holds what it is given, up to the window, and no more.
+    #[test]
+    fn the_window_is_a_credit_and_not_an_allocation() {
+        let mut ring = ByteRing::new(8);
+
+        assert!(ring.is_empty(), "a new queue holds nothing");
+        assert_eq!(ring.window(), 8, "the whole window is free");
+
+        // What fits, is taken; what does not, is left.
+        assert_eq!(ring.enqueue_slice(b"abc"), 3);
+        assert_eq!(ring.window(), 5);
+        assert_eq!(ring.enqueue_slice(b"defghij"), 5, "the window is the limit");
+        assert!(ring.is_full());
+        assert_eq!(ring.window(), 0);
+
+        // And the bytes come back out in the order they went in.
+        let mut out = [0u8; 8];
+        assert_eq!(ring.dequeue_slice(&mut out), 8);
+        assert_eq!(&out, b"abcdefgh");
+        assert!(ring.is_empty());
+    }
+
+    /// A queue that is emptied and filled again does not grow for ever.
+    #[test]
+    fn a_queue_that_is_drained_does_not_grow() {
+        let mut ring = ByteRing::new(64);
+        let mut out = [0u8; 16];
+
+        for _ in 0..100 {
+            ring.enqueue_slice(&[7u8; 16]);
+            assert_eq!(ring.dequeue_slice(&mut out), 16);
+            assert_eq!(&out, &[7u8; 16]);
+        }
+
+        assert!(ring.is_empty());
+        assert_eq!(ring.window(), 64, "the window is free again");
     }
 }

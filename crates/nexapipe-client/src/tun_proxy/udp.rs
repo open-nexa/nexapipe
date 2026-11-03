@@ -373,6 +373,26 @@ async fn run_udp_flow(
         port
     );
 
+    // The server's answer to the preface, read before the first datagram goes
+    // out. A UDP flow is refused as a whole — there is no half of it that can
+    // go on — so there is nothing to gain from sending a datagram into a
+    // tunnel the server is about to refuse, and a datagram is not something
+    // that can be sent twice.
+    if let Err(e) = l4::accept_tunnel(
+        &ctx.endpoint_group,
+        &pooled,
+        &mut tunnel_recv,
+        l4::L4Proto::Udp,
+        &domain,
+        port,
+    )
+    .await
+    {
+        jni_log!("[tun-proxy] UDP {}:{} refused: {}", domain, port, e);
+        release_flow(&table, &key, &mine);
+        return;
+    }
+
     // A UDP "flow" is one socket's traffic to one host: it lasts until either
     // side goes quiet, so for accounting it is one open flow for all that time
     // rather than one per datagram. That is deliberately not the same unit as

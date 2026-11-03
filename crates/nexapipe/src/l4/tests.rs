@@ -1071,6 +1071,7 @@ async fn a_udp_flow_pays_for_its_buffers_and_gives_them_back() {
     let flow_budget = budget.clone();
     let (mut client, server) = tokio::io::duplex(4096);
     let task = tokio::spawn(async move {
+        let mut cost = OpenCost::new();
         serve_udp_flow(
             server,
             backend_addr,
@@ -1079,6 +1080,8 @@ async fn a_udp_flow_pays_for_its_buffers_and_gives_them_back() {
             Duration::from_secs(30),
             Duration::from_secs(60),
             &flow_budget,
+            std::time::Instant::now(),
+            &mut cost,
         )
         .await
     });
@@ -1118,6 +1121,7 @@ async fn a_udp_flow_that_cannot_pay_for_its_buffers_is_refused() {
     let flow_budget = budget.clone();
     let (mut client, server) = tokio::io::duplex(64);
     let task = tokio::spawn(async move {
+        let mut cost = OpenCost::new();
         serve_udp_flow(
             server,
             "127.0.0.1:9".parse().unwrap(),
@@ -1126,6 +1130,8 @@ async fn a_udp_flow_that_cannot_pay_for_its_buffers_is_refused() {
             Duration::from_secs(30),
             Duration::from_secs(60),
             &flow_budget,
+            std::time::Instant::now(),
+            &mut cost,
         )
         .await
     });
