@@ -86,8 +86,8 @@ and its meaning.
   19.0 MiB to 12.0 MiB. The cost is build time, and it is measured too: two
   minutes became three and a half. `panic = "abort"` is deliberately not set —
   whether a panic in the data path should take the service down is a real
-  design question, and the vendored smoltcp patch is about a panic that must
-  not take the process down.
+  design question, and the panic that must not take the process down is the
+  one the vendored patch used to hold back and upstream smoltcp 0.13 now fixes.
 - **A native crash in the field can be debugged now.** The native library is
   built with its symbols, and the copy that goes into the APK is stripped —
   which is what the root workspace's release profile was already doing, so the
