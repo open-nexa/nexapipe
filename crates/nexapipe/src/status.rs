@@ -13,8 +13,7 @@
 //! can be found is the file the server wrote. This command never creates one:
 //! a `status` run is not a start, and a token minted by it would be a token the
 //! server does not know about.
-use crate::admin::token;
-use crate::config::ProxyConfig;
+use crate::storage::Storage;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client;
@@ -38,16 +37,17 @@ struct Answer {
 /// `json` picks the whole answer as one document rather than the grouped
 /// reading: the first is for a terminal, the second for anything that has to
 /// parse it.
-pub async fn status(config_path: &str, json: bool) -> anyhow::Result<()> {
-    let config = ProxyConfig::from_file(config_path)?;
+pub async fn status(storage: &dyn Storage, json: bool) -> anyhow::Result<()> {
+    let config = crate::config::load_config(storage).await?;
     let admin = config
         .admin
         .as_ref()
         .and_then(|admin| admin.listen_addr.as_ref());
     let Some(listen_addr) = admin else {
         anyhow::bail!(
-            "{config_path} has no [admin] listen_addr, so this instance is not answering \
-             questions about itself: add an [admin] section with a loopback address and restart"
+            "{} has no [admin] listen_addr, so this instance is not answering \
+             questions about itself: add an [admin] section with a loopback address and restart",
+            storage.describe()
         );
     };
 
@@ -59,13 +59,27 @@ pub async fn status(config_path: &str, json: bool) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("[admin] listen_addr is not an address: {listen_addr}"))?;
     let base = format!("http://{bound}");
 
-    let token = token::load_existing(config_path).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no admin token at {}; it is written when the server first starts with an [admin] \
+    // The token the server made, read from the store it keeps it in. This
+    // command never makes one: a `status` run is not a start, and a token
+    // minted by it would be one the server does not know about.
+    let token = storage
+        .admin_token()
+        .await
+        .map_err(|reason| {
+            anyhow::anyhow!(
+                "the admin token in {} could not be read ({reason}); it is written when the server \
+             first starts with an [admin] listener, so start the server once before asking it \
+             for its status",
+                storage.describe_token()
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no admin token in {}; it is written when the server first starts with an [admin] \
              listener, so start the server once before asking it for its status",
-            token::token_file_path(config_path)
-        )
-    })?;
+                storage.describe_token()
+            )
+        })?;
 
     let client = http_client();
     let mut answers = Vec::new();
