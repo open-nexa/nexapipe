@@ -26,11 +26,11 @@ internal class TunEstablish(private val service: NexaVpnService) {
     private val TAG = "NexaVpnService"
 
     // TUN interface MTU. Must match TUN_MTU in crates/nexapipe-client/src/tun_proxy.rs and
-    // ui-desktop/src-tauri/src/proxy/tun_proxy.rs. 1400 keeps one inner IP packet inside a
-    // single QUIC datagram (~1435 usable bytes after the short header + AEAD tag); at 1500
-    // every inner segment was split across two datagrams, roughly doubling the packet count
-    // and AEAD cost.
-    private val tunMtu = 1400
+    // ui-desktop/src-tauri/src/proxy/tun_proxy.rs. 1280 is the IPv6 minimum MTU, below every
+    // path MTU iroh's PLPMTUD can settle on, so an inner segment always fits in one QUIC
+    // datagram even while the probe is still running or has fallen back after loss. See the
+    // client crate's constant for why it is not tracked at runtime.
+    private val tunMtu = 1280
 
     /**
      * Establishes the VPN and the TUN proxy. Shared by the initial setup and

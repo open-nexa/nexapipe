@@ -20,7 +20,7 @@ The app is deliberately **not** a full-tunnel VPN:
  app (browser, …)
       │  DNS query for a proxied domain
       ▼
- VpnService TUN            Builder: setMtu(1400), addRoute(<virtual block>, 24),
+ VpnService TUN            Builder: setMtu(1280), addRoute(<virtual block>, 24),
       │                    addRoute(<virtual block v6>, 64), addDnsServer(<virtual DNS>)
       ▼
  Rust: smoltcp userspace TCP/IP stack   (crates/nexapipe-client, feature tun-proxy)
