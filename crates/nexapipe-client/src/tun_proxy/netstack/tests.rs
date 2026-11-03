@@ -62,6 +62,19 @@ fn syn_segment() -> Vec<u8> {
     segment(CLIENT, SERVER, CLIENT_PORT, SERVER_PORT, 1000, 0, 0x02, &[])
 }
 
+/// A segment that opens a connection, with a checksum that does not add up.
+///
+/// The stack refuses it — a segment whose checksum does not add up is not
+/// one it acts on — but the runner cannot tell that from the segment alone,
+/// so it opens a flow for it all the same.
+fn syn_segment_with_a_broken_checksum() -> Vec<u8> {
+    let mut frame = syn_segment();
+    // The TCP checksum sits after the ports, the sequence number and the
+    // acknowledgement number, and the IP header is twenty bytes.
+    frame[20 + 16] ^= 0xff;
+    frame
+}
+
 /// A segment that acknowledges the stack's answer.
 fn ack_segment(seq: u32, ack: u32) -> Vec<u8> {
     segment(
@@ -566,4 +579,87 @@ async fn a_connection_that_is_closed_cleanly_is_not_reset() {
         }
     }
     assert!(!reset, "a connection that was closed cleanly is not reset");
+}
+
+/// A flow the stack refused is told that it is over.
+#[tokio::test]
+async fn a_flow_the_stack_refused_is_told_that_it_is_over() {
+    let (stack, runner, _udp, listener) = tcp_stack();
+    tokio::spawn(async move {
+        let _ = runner.expect("a stack with TCP has a runner").await;
+    });
+    let (mut sink, _stream) = stack.split();
+    let mut listener = listener.expect("a stack with TCP has a listener");
+
+    // The stack does not act on a segment whose checksum does not add up.
+    sink.send(syn_segment_with_a_broken_checksum())
+        .await
+        .expect("the stack takes the segment");
+
+    // The flow is announced all the same: the runner reads the segment
+    // itself, and it cannot tell a broken checksum from a good one.
+    let (mut flow, _client, _server) = timeout(PATIENCE, listener.next())
+        .await
+        .expect("the stack opens the flow")
+        .expect("the listener has a flow");
+
+    // The socket is given up on, and the application is told: it is waiting
+    // for bytes that are never coming.
+    let mut buf = [0u8; 1];
+    let read = timeout(PATIENCE, flow.read(&mut buf))
+        .await
+        .expect("the application is told that the connection is over")
+        .expect("the read succeeds");
+    assert_eq!(read, 0, "the stream ends rather than waiting for ever");
+}
+
+/// A flow the application still holds is not given up on.
+#[tokio::test]
+async fn a_flow_the_application_still_holds_is_not_given_up_on() {
+    let (stack, runner, _udp, listener) = tcp_stack();
+    tokio::spawn(async move {
+        let _ = runner.expect("a stack with TCP has a runner").await;
+    });
+    let (mut sink, mut stream_out) = stack.split();
+    let mut listener = listener.expect("a stack with TCP has a listener");
+
+    sink.send(syn_segment())
+        .await
+        .expect("the stack takes the segment");
+    let (mut flow, _client, _server) = timeout(PATIENCE, listener.next())
+        .await
+        .expect("the stack opens the flow")
+        .expect("the listener has a flow");
+
+    let answer = timeout(PATIENCE, stream_out.next())
+        .await
+        .expect("the stack answers the handshake")
+        .expect("the stack has an answer")
+        .expect("the answer is not an error");
+    let (seq, ack) = seq_ack(&answer);
+    sink.send(ack_segment(ack, seq + 1))
+        .await
+        .expect("the stack takes the ack");
+
+    // The application writes its last bytes and closes its side, but keeps
+    // reading: a half-close is a request, not an ending.
+    flow.write_all(b"hello").await.expect("the write succeeds");
+    flow.shutdown().await.expect("the close succeeds");
+
+    // Longer than a flow nobody holds is given for, and longer than the
+    // stack's first retransmission: the runner only looks at its sockets when
+    // something wakes it, and a retransmission is what wakes it.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // The peer sends what it has, and the application still receives it.
+    sink.send(data_segment(ack, seq + 6, b"more"))
+        .await
+        .expect("the stack takes the data");
+
+    let mut buf = [0u8; 4];
+    timeout(PATIENCE, flow.read_exact(&mut buf))
+        .await
+        .expect("the application gets the bytes")
+        .expect("the read succeeds");
+    assert_eq!(&buf, b"more");
 }

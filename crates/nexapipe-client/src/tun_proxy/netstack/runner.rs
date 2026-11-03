@@ -51,7 +51,11 @@ const TCP_KEEP_ALIVE: Duration = Duration::from_secs(28);
 /// it was opened is one the stack refused — the segment's checksum did not
 /// add up — and a listening socket has no timeout of its own: it would wait
 /// for ever, holding a slot and a tunnel that nothing ever finishes.
+#[cfg(not(test))]
 const TCP_HANDSHAKE_GRACE: Duration = Duration::from_secs(10);
+/// The tests do not wait ten seconds for a handshake to be given up on.
+#[cfg(test)]
+const TCP_HANDSHAKE_GRACE: Duration = Duration::from_millis(300);
 
 /// How long the end of a connection may take.
 ///
@@ -59,7 +63,11 @@ const TCP_HANDSHAKE_GRACE: Duration = Duration::from_secs(10);
 /// are still in the socket's send buffer have to go out first, and the peer
 /// has to acknowledge them. A peer that never does must not hold the flow's
 /// slot for ever.
+#[cfg(not(test))]
 const TCP_FIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// The tests do not wait thirty seconds for a connection to end.
+#[cfg(test)]
+const TCP_FIN_TIMEOUT: Duration = Duration::from_millis(300);
 
 /// What the runner needs to run.
 pub(super) struct RunnerParts {
@@ -340,6 +348,10 @@ fn pump(
             && now >= flow.opened_at + TCP_HANDSHAKE_GRACE.into()
         {
             socket.abort();
+            // The application is holding the stream this flow was announced
+            // with, and it is waiting for bytes that will never come: it has
+            // to be told that the connection is over.
+            control.mark_socket_closed();
             finished.push(*handle);
             continue;
         }
@@ -360,8 +372,13 @@ fn pump(
         // The application is gone and the FIN is on its way out, but the peer
         // has not answered it. The wait is bounded: a peer that never answers
         // must not hold the flow's slot for ever.
+        //
+        // Only once the application has dropped its end of the flow: an
+        // application that is still attached is reading, and the reply it is
+        // waiting for is worth more than the slot this flow takes.
         if let Some(closed_at) = flow.closed_at
             && now >= closed_at + TCP_FIN_TIMEOUT.into()
+            && Arc::strong_count(control) == 1
         {
             socket.abort();
             finished.push(*handle);
