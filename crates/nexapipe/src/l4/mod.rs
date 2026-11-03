@@ -682,6 +682,11 @@ fn udp_bind_addr(target: &SocketAddr) -> String {
 /// is the one step of the flow that can fail for reasons of its own — a host
 /// with IPv6 disabled, an exhausted descriptor table — and a step that cannot
 /// be reached cannot be tested.
+//
+// The nine are the flow's own parameters — what it is, what it holds, and what
+// it costs. A struct for them would only be unpacked back into these names on
+// the first line of the function.
+#[allow(clippy::too_many_arguments)]
 async fn serve_udp_flow<S>(
     mut stream: S,
     target: SocketAddr,
