@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-10-24 (**v1.0.0 shipped** — the scope is in [§0](#0-the-v100-decision-2026-10-20) and the release notes are in [docs/releases/v1.0.0.md](releases/v1.0.0.md); the third-party boundary is closed: `relay_mode = "custom"` really excludes n0's relays and `[iroh] discovery` switches the address lookup off; a device's credential can be a key instead of a shared secret; a client can be held to the ports it may reach; the server's runtime state lives in a file of its own beside the configuration; both clients pick their address block and can bring the tunnel back by themselves; the host-pattern rule is one rule on both sides; R16 closes: the process-wide ceilings are configurable through `[limits]`, and every finding of the 2026-10-10 audit is now fixed — see [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and [§6](#hardening-sweep--after-v060); [§4.1](#41-backend-handling-p2) closes C3 and C4 — `https://` backends and HTTP/2, `[retry]`, `[circuit_breaker]`, and the `least_conn` lease; R18's supply-chain verification landed: `cargo deny` over both cargo workspaces, every action pinned to a commit SHA, the base images pinned by digest, `--locked` in the Dockerfiles, and a signed image with a provenance attestation — see [§6](#hardening-sweep--after-v060); [§4.3](#43-identity-and-authorization-p1) records R5's second half — per-device Ed25519 keys, TOTP demoted to the enrollment moment — landing in the server and the client library, with both UIs still to come) |
+| Last updated | 2026-11-04 (**v1.1.0 shipped** — the release notes are in [docs/releases/v1.1.0.md](releases/v1.1.0.md); it opens no new capability and makes three of the things around the proxy replaceable: the credential check is a seam (`Authenticator`), the access log is a record rather than a line (`AccessRecord` / `AccessSink`), and where the proxy keeps what it keeps is a store (`Storage`, with the file behind it); a client can carry a ticket instead of a Node ID; the tunnel's opening is measured in three phases; the path a device's traffic takes is cheaper and the inner MTU is pinned to 1280; the desktop app is 32% smaller. **Phase 4 is renumbered to v1.2**: the edge binary keeps its id and its gate, and v1.1.0 took the number Phase 4 had. v1.0.0 shipped on 24 October 2026 — the scope is in [§0](#0-the-v100-decision-2026-10-20) and the release notes are in [docs/releases/v1.0.0.md](releases/v1.0.0.md); the third-party boundary is closed: `relay_mode = "custom"` really excludes n0's relays and `[iroh] discovery` switches the address lookup off; a device's credential can be a key instead of a shared secret; a client can be held to the ports it may reach; the server's runtime state lives in a file of its own beside the configuration; both clients pick their address block and can bring the tunnel back by themselves; the host-pattern rule is one rule on both sides; R16 closes: the process-wide ceilings are configurable through `[limits]`, and every finding of the 2026-10-10 audit is now fixed — see [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and [§6](#hardening-sweep--after-v060); [§4.1](#41-backend-handling-p2) closes C3 and C4 — `https://` backends and HTTP/2, `[retry]`, `[circuit_breaker]`, and the `least_conn` lease; R18's supply-chain verification landed: `cargo deny` over both cargo workspaces, every action pinned to a commit SHA, the base images pinned by digest, `--locked` in the Dockerfiles, and a signed image with a provenance attestation — see [§6](#hardening-sweep--after-v060); [§4.3](#43-identity-and-authorization-p1) records R5's second half — per-device Ed25519 keys, TOTP demoted to the enrollment moment — landing in the server and the client library, with both UIs still to come) |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -814,7 +814,7 @@ competes with R13 for the same attention. What puts it ahead is that R13 is stil
 behind its own gate — the premise has not been validated — while this is what the
 tree says about itself today.
 
-### Phase 4 — v1.1, "reachable without our client" (exploratory)
+### Phase 4 — v1.2, "reachable without our client" (exploratory)
 
 | ID | Deliverable | Notes |
 |---|---|---|
@@ -863,6 +863,25 @@ them means a shrinker regression rolls back the free win too.
 **Done when:** every artifact `release.yml` publishes has a size recorded in CI,
 and a PR that adds a dependency says what it cost.
 
+### Phase 3.7 — v1.1.0, "replaceable"
+
+No new capability is opened for this release either, and the point is the one
+Phase 3.6 made, one level up: the things *around* the proxy are now pieces a
+deployment can replace, and the path a device's traffic takes is measured
+rather than assumed. Four items, none of them with an id of its own — they
+close gaps the seams opened rather than answering a roadmap question.
+
+| ID | Deliverable | Notes |
+|---|---|---|
+| — | **The credential check is a seam** | `Authenticator` is a trait: the handshake calls through it, the built-in implementation reads the client table in the configuration, and a deployment that keeps its credentials in an identity provider hands the server its own. The implementation owns the whole attempt — the verification, the counters it moves and the peer registration — because those three have to happen in one critical section. The trait is called without the auth lock held, so an implementation that has to reach an identity provider reaches before it takes the lock |
+| — | **The access record is a seam** | `AccessRecord` is the facts as values and `AccessSink` is what takes one: a deployment registers its own, and the core neither knows nor cares where the records end up. The redaction is the same on both sides, and a sink runs on a thread of its own, so one that reaches the network cannot hold up the log file |
+| — | **The store is a seam** | `Storage` says what a store has to be able to do — read the configuration, write a client's credential, count a lockout, hand out the admin token — and a backend says how it does it. `FileStorage` is the backend that exists today and behaves exactly as the code behaved before; the database backends arrive behind the `storage-sqlite` and `storage-postgres` features. The configuration is handed out as text and a write is by entity rather than by document, so an operator's comments and a route added while the server was running both survive |
+| — | **The path a device's traffic takes is measured, and cheaper** | The tunnel's opening is published in the three phases it is made of — the route lookup, the backend connection and the whole open around them — so "the tunnel is slow" can say whether the time went into this process or onto the network. A packet on the TUN costs one allocation rather than an allocation and a copy, the TCP window is a credit that grows with the traffic, the UDP flow table holds a hundred and twenty-eight flows, the application's first bytes no longer wait for the server's answer, the inner MTU is pinned to 1280, and a flow socket no longer waits to answer a small message. The client can carry a ticket instead of a Node ID, so a deployment with the address lookup switched off is reachable without n0 |
+
+**Done when:** a deployment can hand the server an authenticator, a sink and a
+store of its own without changing anything else, and the numbers a slow tunnel
+produces say which of the two ends the time was spent in.
+
 ### Dependencies
 
 ```text
@@ -894,7 +913,7 @@ R4 management ── R5 per-device ──┬── R6 distribution ──► v0.
                                               ├── secrets-file env + no gate ► v0.6.1
                                               ├── Android tun-proxy gate ────► v0.6.1
                                               │
-                              R13 edge (after validation) ──► v1.1
+                              R13 edge (after validation) ──► v1.2
 
         S1 measure (v1.0.0) ──┬── S2 desktop profile ──┐   (size-perf-roadmap.md)
                                └── S3 Android R8 ───────┴── S4 budget gate
