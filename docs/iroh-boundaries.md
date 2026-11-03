@@ -57,8 +57,18 @@ configured are untouched. Only the "ask somebody where they are" step goes
 away.
 
 The clients have the same switch: the desktop takes it as part of the proxy
-configuration, and the Android app has it next to the relay mode. Absent, both
-keep the default, which is `n0`.
+configuration, the Android app has it next to the relay mode, the embedded
+local proxy reads it from `[iroh]`, and a UniFFI caller passes it as
+`ClientConfig.discovery_mode`. Absent, every one of them keeps the default,
+which is `n0`.
+
+The ticket side is wired end to end to match: `--generate-invite
+--invite-ticket <TICKET>` puts the addresses in the invite link, the desktop
+takes a ticket per node, and the Android app accepts a `ticket/` invite
+(resolving it to its Node ID for storage, sealing the ticket as a credential,
+and refusing an ID edit on a ticket node). A Node ID invite generated while
+`discovery = "none"` is set prints a warning pointing at `--invite-ticket`,
+because without the lookup that link cannot be resolved by anyone.
 
 ## 2. Relays
 

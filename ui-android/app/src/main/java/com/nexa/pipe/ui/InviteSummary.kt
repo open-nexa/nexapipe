@@ -3,6 +3,7 @@ package com.nexa.pipe.ui
 import android.content.Context
 import com.nexa.pipe.R
 import com.nexa.pipe.provisioning.EndpointInvite
+import com.nexa.pipe.provisioning.InviteTarget
 import java.util.Locale
 
 /**
@@ -13,7 +14,13 @@ import java.util.Locale
  */
 internal fun inviteSummary(invite: EndpointInvite, localizedContext: Context): String =
     buildList<String> {
-        add(localizedContext.getString(R.string.invite_summary_node, invite.target.value))
+        val nodeLabel = when (val target = invite.target) {
+            is InviteTarget.NodeId -> target.id
+            // A ticket is a credential-sized string. A confirmation dialog
+            // read at a glance needs a fingerprint, not the whole thing.
+            is InviteTarget.Ticket -> "${target.ticket.take(12)}…"
+        }
+        add(localizedContext.getString(R.string.invite_summary_node, nodeLabel))
         invite.name?.let { add(localizedContext.getString(R.string.invite_summary_name, it)) }
         add(
             localizedContext.getString(

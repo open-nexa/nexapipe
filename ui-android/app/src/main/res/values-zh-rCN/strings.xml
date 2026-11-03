@@ -78,7 +78,7 @@
     <string name="invite_summary_enrollment">注册：%1$s（一次性令牌，首次连接时下发凭证）</string>
     <string name="invite_summary_relay">中继：%1$s</string>
     <string name="invite_value_none">无</string>
-    <string name="invite_ticket_unsupported">该邀请携带的是端点票据，无法保存在这里。请改用节点 ID 形式的邀请。</string>
+    <string name="invite_ticket_invalid">该邀请携带的端点票据无法解析。请换一张新票据，或改用节点 ID 形式的邀请。</string>
     <string name="invite_imported">已导入端点 %1$s</string>
     <string name="invite_paste_title">粘贴邀请链接</string>
     <string name="invite_paste_label">nexapipe:// 链接</string>
@@ -253,6 +253,8 @@
     <string name="error_vpn_permission">尚未授予代理权限，请先在权限引导中授予。</string>
     <string name="error_invalid_endpoint_id">端点 ID “%1$s”无效：%2$s。端点 ID 应为 64 个十六进制字符。</string>
     <string name="error_endpoint_id_empty">端点 ID 不能为空</string>
+    <string name="error_ticket_empty">端点票据不能为空</string>
+    <string name="error_ticket_node_rename">通过票据连接的端点不能改名：端点 ID 来自票据。请重新导入新票据。</string>
     <string name="error_endpoint_id_exists">端点 ID 已存在：%1$s</string>
     <string name="error_endpoint_not_found">找不到端点：%1$s</string>
     <string name="error_no_domain_mappings">尚未配置任何域名映射，请先添加带域名的端点。</string>

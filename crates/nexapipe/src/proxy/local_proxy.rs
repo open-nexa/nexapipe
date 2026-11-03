@@ -1,15 +1,57 @@
-use crate::config::LocalProxyConfig;
+use crate::config::{IrohConfig, LocalProxyConfig};
 use crate::shutdown::ShutdownSignal;
+use anyhow::Context;
 use iroh::Endpoint;
 use iroh::endpoint::presets;
 use nexapipe_client::auth::{TotpAlgorithm, TwoFactorAuth};
+use nexapipe_client::discovery::DiscoveryMode;
+use nexapipe_client::relay::RelayModeSpec;
 use nexapipe_client::{EndpointGroup, LoadBalancingStrategy, LocalProxy, NodeConfig};
 use std::sync::Arc;
 
+/// Resolves `[iroh]` for the client half of a local proxy, with the same
+/// rules the server uses: a value that is present but unknown refuses the
+/// start rather than quietly falling back to a different one.
+///
+/// This is the piece that was missing. The local proxy used to bind an N0
+/// endpoint of its own, so a server with `discovery = "none"` still had a
+/// client asking n0 where it was — and a `custom` relay was not applied to
+/// that client at all.
+fn resolve_network_options(
+    iroh: Option<&IrohConfig>,
+) -> anyhow::Result<(Option<RelayModeSpec>, DiscoveryMode)> {
+    let relay = RelayModeSpec::parse(
+        iroh.and_then(|c| c.relay_mode.as_deref()),
+        iroh.and_then(|c| c.relay_url.as_deref()),
+        iroh.and_then(|c| {
+            c.relay_auth_token
+                .as_ref()
+                .map(|token| token.expose_secret().as_str())
+        }),
+    )
+    .context("invalid [iroh] relay configuration")?;
+    let discovery = match iroh.and_then(|c| c.discovery.as_deref()) {
+        Some(value) => DiscoveryMode::parse(value)
+            .with_context(|| format!("invalid [iroh] discovery: {value:?}"))?,
+        None => DiscoveryMode::default(),
+    };
+    tracing::info!(
+        "Relay: {}",
+        relay
+            .as_ref()
+            .map(RelayModeSpec::describe)
+            .unwrap_or_else(|| "default (nothing configured)".to_string())
+    );
+    tracing::info!("Discovery: {}", discovery.describe());
+    Ok((relay, discovery))
+}
+
 pub async fn run_local_proxy(
     config: LocalProxyConfig,
+    iroh_config: Option<IrohConfig>,
     shutdown_signal: Arc<ShutdownSignal>,
 ) -> anyhow::Result<()> {
+    let (relay, discovery) = resolve_network_options(iroh_config.as_ref())?;
     let listen_addr = config.listen_addr.clone();
     let two_factor_config = config.two_factor.clone();
 
@@ -46,10 +88,16 @@ pub async fn run_local_proxy(
         let transport_tuning = nexapipe_client::transport::TransportTuning::from_env();
         tracing::info!("QUIC transport tuning: {}", transport_tuning.describe());
 
-        let ep = Endpoint::builder(presets::N0)
-            .transport_config(transport_tuning.transport_config())
-            .bind()
-            .await?;
+        let mut builder = Endpoint::builder(presets::N0)
+            .transport_config(transport_tuning.transport_config());
+        if let Some(relay) = &relay {
+            builder = builder.relay_mode(relay.relay_mode());
+        }
+        builder = discovery.apply(builder);
+        if let Some(restriction) = relay.as_ref().and_then(|r| r.dial_restriction(discovery)) {
+            builder = builder.hooks(restriction);
+        }
+        let ep = builder.bind().await?;
         tracing::info!("Shared iroh endpoint created, client node ID: {}", ep.id());
 
         let node_configs: Vec<NodeConfig> = nodes
@@ -86,7 +134,12 @@ pub async fn run_local_proxy(
 
         let endpoint_addr =
             nexapipe_client::connection_pool::parse_endpoint_addr(server_node_id, server_ticket)?;
-        let conn_pool = nexapipe_client::IrohConnectionPool::new(endpoint_addr).await?;
+        let conn_pool = nexapipe_client::IrohConnectionPool::new_with_options(
+            endpoint_addr,
+            relay.clone(),
+            discovery,
+        )
+        .await?;
 
         tracing::info!(
             "Iroh client endpoint started, node ID: {}",

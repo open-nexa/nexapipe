@@ -6,11 +6,28 @@
 
 use super::*;
 
+use iroh::EndpointAddr;
+use iroh_tickets::endpoint::EndpointTicket;
 use jni::EnvUnowned;
 use jni::objects::{JClass, JString};
 use jni::sys::{jint, jstring};
 
 use crate::jni_log;
+
+/// Whether a ticket names the endpoint with this Node ID.
+///
+/// Android keys everything — 2FA, device keys, link readings — by Node ID,
+/// while a ticket carries only addresses and an identity inside them. This is
+/// how a ticket-backed node is found again when the node is removed.
+fn ticket_names_id(ticket: &str, node_id: &str) -> bool {
+    ticket
+        .parse::<EndpointTicket>()
+        .ok()
+        .is_some_and(|parsed| {
+            let addr: EndpointAddr = parsed.into();
+            addr.id.to_string() == node_id
+        })
+}
 
 /// Validates a node ID with the exact parser the connection path uses.
 ///
@@ -111,6 +128,44 @@ fn preconnect() -> jint {
     count
 }
 
+/// Resolves an endpoint ticket to the Node ID it names.
+///
+/// The Android node list is keyed by Node ID — 2FA, device keys, domain
+/// mappings and link readings all meet on it — so a ticket invite has to be
+/// reduced to that ID before it can be stored. The addresses stay in the
+/// ticket; only the identity comes back here. Returns null for anything that
+/// is not a ticket.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeResolveTicket(
+    mut unowned_env: EnvUnowned,
+    _class: JClass,
+    ticket: JString,
+) -> jstring {
+    with_env_or(&mut unowned_env, std::ptr::null_mut(), |env| {
+        resolve_ticket(env, ticket)
+    })
+}
+
+fn resolve_ticket(env: &mut Env<'_>, ticket: JString) -> jstring {
+    if env.exception_check() {
+        jni_log!("JNI exception pending before nativeResolveTicket");
+        env.exception_clear();
+        return std::ptr::null_mut();
+    }
+    let ticket_str = match ticket.try_to_string(env) {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let Ok(parsed) = ticket_str.trim().parse::<EndpointTicket>() else {
+        return std::ptr::null_mut();
+    };
+    let addr: EndpointAddr = parsed.into();
+    match env.new_string(addr.id.to_string()) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddNode(
     mut unowned_env: EnvUnowned,
@@ -119,6 +174,23 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddNode(
     domains: JString,
 ) -> jint {
     with_env_or(&mut unowned_env, -1, |env| add_node(env, node_id, domains))
+}
+
+/// Adds a node named by a full ticket rather than a bare Node ID.
+///
+/// It is the ticket that goes into `NodeConfig.server_ticket`: handing iroh a
+/// Node ID *and* a ticket makes the address lookup take the ID and discard the
+/// addresses, which is precisely what `discovery = "none"` cannot afford.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddTicketNode(
+    mut unowned_env: EnvUnowned,
+    _class: JClass,
+    ticket: JString,
+    domains: JString,
+) -> jint {
+    with_env_or(&mut unowned_env, -1, |env| {
+        add_ticket_node(env, ticket, domains)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -169,6 +241,21 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddDomainMapping(
 ) -> jint {
     with_env_or(&mut unowned_env, -1, |env| {
         add_domain_mapping(env, domain, node_id)
+    })
+}
+
+/// Maps a domain to a peer named by a ticket. This is the path the app
+/// actually uses: the routing table is built from domain mappings, not from
+/// `nativeAddNode`, so a ticket-backed endpoint has to be reachable here too.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeAddTicketDomainMapping(
+    mut unowned_env: EnvUnowned,
+    _class: JClass,
+    domain: JString,
+    ticket: JString,
+) -> jint {
+    with_env_or(&mut unowned_env, -1, |env| {
+        add_ticket_domain_mapping(env, domain, ticket)
     })
 }
 
@@ -274,6 +361,62 @@ fn add_node(env: &mut Env<'_>, node_id: JString, domains: JString) -> jint {
     0
 }
 
+fn add_ticket_node(env: &mut Env<'_>, ticket: JString, domains: JString) -> jint {
+    if env.exception_check() {
+        jni_log!("JNI exception pending before nativeAddTicketNode");
+        env.exception_clear();
+        return -1;
+    }
+
+    let ticket_str = match ticket.try_to_string(env) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return -1,
+    };
+    let domains_str = match domains.try_to_string(env) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    // Refuse a string that is not a ticket here rather than at connect time:
+    // a bad ticket would otherwise be dialled as a (very long) Node ID.
+    if ticket_str.parse::<EndpointTicket>().is_err() {
+        jni_log!("nativeAddTicketNode: not a valid endpoint ticket");
+        return -1;
+    }
+
+    let domains_list: Vec<String> = domains_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let state = match get_state() {
+        Some(s) => s,
+        None => return -1,
+    };
+    let mut guard = match state.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+
+    if let Some(existing) = guard
+        .nodes
+        .iter_mut()
+        .find(|n| n.server_ticket.as_deref() == Some(ticket_str.as_str()))
+    {
+        if !domains_list.is_empty() {
+            existing.domains = domains_list;
+        }
+        return 0;
+    }
+
+    guard.nodes.push(NodeConfig {
+        server_node_id: None,
+        server_ticket: Some(ticket_str),
+        domains: domains_list,
+    });
+    0
+}
+
 fn add_domain_mapping(env: &mut Env<'_>, domain: JString, node_id: JString) -> jint {
     if env.exception_check() {
         jni_log!("JNI exception pending before nativeAddDomainMapping");
@@ -322,6 +465,50 @@ fn add_domain_mapping(env: &mut Env<'_>, domain: JString, node_id: JString) -> j
     0
 }
 
+fn add_ticket_domain_mapping(env: &mut Env<'_>, domain: JString, ticket: JString) -> jint {
+    if env.exception_check() {
+        jni_log!("JNI exception pending before nativeAddTicketDomainMapping");
+        env.exception_clear();
+        return -1;
+    }
+
+    let domain_str = match domain.try_to_string(env) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+    let ticket_str = match ticket.try_to_string(env) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return -1,
+    };
+    if ticket_str.parse::<EndpointTicket>().is_err() {
+        jni_log!("nativeAddTicketDomainMapping: not a valid endpoint ticket");
+        return -1;
+    }
+
+    let state = match get_state() {
+        Some(s) => s,
+        None => return -1,
+    };
+    let mut guard = match state.lock() {
+        Ok(g) => g,
+        Err(_) => return -1,
+    };
+
+    let already_mapped = guard.domain_mappings.iter().any(|m| {
+        m.domain == domain_str && m.server_ticket.as_deref() == Some(ticket_str.as_str())
+    });
+    if already_mapped {
+        return 0;
+    }
+
+    guard.domain_mappings.push(DomainMapping {
+        domain: domain_str,
+        server_node_id: None,
+        server_ticket: Some(ticket_str),
+    });
+    0
+}
+
 fn remove_node(env: &mut Env<'_>, node_id: JString) -> jint {
     if env.exception_check() {
         jni_log!("JNI exception pending before nativeRemoveNode");
@@ -344,9 +531,22 @@ fn remove_node(env: &mut Env<'_>, node_id: JString) -> jint {
         Err(_) => return -1,
     };
 
-    guard
-        .nodes
-        .retain(|n| n.server_node_id.as_deref() != Some(&node_id_str));
+    // A node can be named by a Node ID or by a ticket. Both spellings have to
+    // go, from the nodes and from the domain mappings the app actually
+    // routes through — a deleted endpoint must not keep routing traffic on a
+    // running tunnel.
+    guard.nodes.retain(|n| {
+        n.server_node_id.as_deref() != Some(node_id_str.as_str())
+            && n.server_ticket
+                .as_deref()
+                .is_none_or(|ticket| !ticket_names_id(ticket, &node_id_str))
+    });
+    guard.domain_mappings.retain(|m| {
+        m.server_node_id.as_deref() != Some(node_id_str.as_str())
+            && m.server_ticket
+                .as_deref()
+                .is_none_or(|ticket| !ticket_names_id(ticket, &node_id_str))
+    });
     0
 }
 

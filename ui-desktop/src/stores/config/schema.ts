@@ -36,6 +36,9 @@ export const defaultConfig: ProxyConfig = {
   relayUrl: '',
   relayAuthToken: '',
   relayAuthTokenRelay: '',
+  // An older build kept n0's address lookup without a setting. Keeping `n0`
+  // as the default means upgrading changes nothing until the operator asks.
+  discoveryMode: 'n0',
   deviceId: '',
 };
 
@@ -179,6 +182,12 @@ export function normalizeConfig(raw: Record<string, unknown>): ProxyConfig {
     raw.relayMode === 'custom'
   ) {
     config.relayMode = raw.relayMode;
+  }
+  // Only the two spellings the Rust side accepts. Anything else is a stale
+  // or hand-edited value: sending it to `DiscoveryMode::parse` would refuse
+  // the start, so it falls back to the default instead.
+  if (raw.discoveryMode === 'n0' || raw.discoveryMode === 'none') {
+    config.discoveryMode = raw.discoveryMode;
   }
   // 2FA used to be one global pair. It applied to every server, so the honest migration is to
   // copy it onto every node this payload had; a node that already carries its own keeps them.

@@ -137,7 +137,7 @@ src-tauri/
 
 | Command | Purpose |
 | --- | --- |
-| `start_proxy` | Start forwarding. Takes nodes, domains, `local_addr`, `dns_addr`, `upstream_dns`, `load_balancing`, `tun_name`, `use_service`, `use_tun`, relay settings and 2FA settings. |
+| `start_proxy` | Start forwarding. Takes nodes, domains, `local_addr`, `dns_addr`, `upstream_dns`, `load_balancing`, `tun_name`, `use_service`, `use_tun`, relay settings (`relay_mode`, `relay_url`, `relay_auth_token`), `discovery_mode` (`n0` or `none` — `none` turns off the `dns.iroh.link` lookup, so every node then needs a ticket) and 2FA settings. |
 | `stop_proxy` | Stop forwarding (service or in-process). |
 | `get_proxy_status` | `{ running, mode }` for the UI indicator. |
 | `get_node_id_display` | The local iroh Node ID, masked. What the UI prints. |

@@ -13,6 +13,8 @@ use tokio::sync::{Mutex, watch};
 use tracing;
 
 use crate::auth::{Enrollment, IssuedCredential, TwoFactorAuth};
+use crate::discovery::DiscoveryMode;
+use crate::relay::RelayModeSpec;
 use nexapipe_proto::protocol::Protocol;
 use nexapipe_proto::secret::SecretString;
 
@@ -226,7 +228,22 @@ pub(super) struct CachedLinkStatus {
 }
 
 impl IrohConnectionPool {
+    /// Binds a dedicated endpoint with iroh's defaults (N0 preset, n0 lookup).
     pub async fn new(endpoint_addr: EndpointAddr) -> Result<Self, crate::error::ClientError> {
+        Self::new_with_options(endpoint_addr, None, DiscoveryMode::default()).await
+    }
+
+    /// Binds a dedicated endpoint with the same relay and discovery settings
+    /// the server, the desktop and the Android client resolve from `[iroh]`.
+    ///
+    /// This is the path the CLI local proxy uses. An endpoint it binds itself
+    /// has to obey `discovery = "none"` too, or that client would still ask n0
+    /// where its peers are even though the server stopped publishing there.
+    pub async fn new_with_options(
+        endpoint_addr: EndpointAddr,
+        relay: Option<RelayModeSpec>,
+        discovery: DiscoveryMode,
+    ) -> Result<Self, crate::error::ClientError> {
         let (transport, tuning) = crate::transport::transport_config_with_tuning();
         #[cfg(feature = "tracing")]
         tracing::info!("QUIC transport tuning: {}", tuning.describe());
@@ -234,12 +251,20 @@ impl IrohConnectionPool {
         // when `tracing` is off so it is not reported as unused.
         #[cfg(not(feature = "tracing"))]
         let _ = &tuning;
-        let ep = Endpoint::builder(presets::N0)
+        let mut builder = Endpoint::builder(presets::N0)
             .alpns(alpns(Protocol::Legacy))
-            .transport_config(transport)
-            .bind()
-            .await
-            .map_err(|e| anyhow::anyhow!(e))?;
+            .transport_config(transport);
+        if let Some(relay) = &relay {
+            builder = builder.relay_mode(relay.relay_mode());
+        }
+        builder = discovery.apply(builder);
+        // `custom` is exclusive: refuse a peer naming another relay, and
+        // refuse a bare Node ID once the lookup is off. The JNI, Tauri and
+        // UniFFI clients install the same hook on their endpoints.
+        if let Some(restriction) = relay.as_ref().and_then(|r| r.dial_restriction(discovery)) {
+            builder = builder.hooks(restriction);
+        }
+        let ep = builder.bind().await.map_err(|e| anyhow::anyhow!(e))?;
         let inner = Arc::new(IrohConnectionPoolInner {
             connections: Mutex::new(Vec::new()),
             dialing: Mutex::new(HashMap::new()),

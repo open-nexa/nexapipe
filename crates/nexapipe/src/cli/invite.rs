@@ -29,9 +29,14 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
 
     let (proxy_config, auth_config, config_loaded) = load_config_pair(storage).await;
 
-    let target = match &cli.endpoint_id {
-        Some(id) => EndpointTarget::node_id_target(id)?,
-        None => {
+    // A ticket invite carries the addresses in the link itself, so it is the
+    // form that still works when the endpoint's address lookup is off. A Node
+    // ID invite needs somebody to resolve it — that is what `discovery = "n0"`
+    // does.
+    let target = match (&cli.invite_ticket, &cli.endpoint_id) {
+        (Some(ticket), _) => EndpointTarget::ticket_target(ticket)?,
+        (None, Some(id)) => EndpointTarget::node_id_target(id)?,
+        (None, None) => {
             let secret_key = proxy_config
                 .as_ref()
                 .and_then(|config| config.iroh.as_ref())
@@ -254,6 +259,22 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
 
     for warning in invite.client_warnings() {
         eprintln!("warning: {warning}");
+    }
+    // A Node ID is only useful while an address lookup can turn it into an
+    // address. With the lookup off, the invite has to carry the address —
+    // which is what `--invite-ticket` is for. Say it here rather than let the
+    // operator hand out a link that cannot resolve.
+    if matches!(&invite.target, EndpointTarget::NodeId(_))
+        && proxy_config
+            .as_ref()
+            .and_then(|config| config.iroh.as_ref())
+            .and_then(|iroh| iroh.discovery.as_deref())
+            .is_some_and(|value| value.trim() == "none")
+    {
+        eprintln!(
+            "warning: [iroh] discovery = \"none\" is set, so a Node ID invite cannot be \
+             resolved; pass --invite-ticket <TICKET> to put the addresses in the link"
+        );
     }
     // Both invite shapes, not just the one carrying a secret: with
     // `enabled = false` the server never runs the handshake, so an enrollment

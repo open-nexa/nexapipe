@@ -74,6 +74,11 @@ class SettingsManager internal constructor(
         // the only one there is. It never appears in the backed-up endpoint
         // list, and it never leaves the device.
         const val DEVICE_KEY_PREFIX = "device_key_"
+        // Prefix of the per-endpoint tickets. A ticket carries reachable
+        // addresses, so it is a credential like the seeds beside it: sealed
+        // into `secretPrefs`, which is the file backup excludes, and never
+        // written into the backed-up endpoint list.
+        const val TICKET_PREFIX = "ticket_"
         // The app-wide 2FA setting an older version kept: one pair for the
         // whole app, where 2FA now belongs to an endpoint. Read by
         // `migrateLegacyTwoFactor` and then deleted.
@@ -314,6 +319,13 @@ class SettingsManager internal constructor(
                     editor.remove(key)
                 }
             }
+            if (key.startsWith(TICKET_PREFIX)) {
+                val nodeId = key.removePrefix(TICKET_PREFIX)
+                val ticket = nodes.firstOrNull { it.nodeId == nodeId }?.ticket
+                if (ticket.isNullOrBlank()) {
+                    editor.remove(key)
+                }
+            }
         }
 
         var allSealed = true
@@ -351,7 +363,7 @@ class SettingsManager internal constructor(
                 }
             } ?: node
             val otp = stripped.twoFactor
-            if (otp == null || otp.secret.isBlank()) {
+            val withoutSecrets = if (otp == null || otp.secret.isBlank()) {
                 stripped
             } else {
                 val sealed = secrets.sealOrNull(otp.secret)
@@ -376,6 +388,30 @@ class SettingsManager internal constructor(
                         stripped.copy(twoFactor = otp.copy(secret = "", enabled = false))
                     }
                 }
+            }
+            // A ticket carries reachable addresses, so it is a credential:
+            // sealed into `secretPrefs` and stripped from the backed-up list,
+            // exactly like the seed and the enrollment token above.
+            val ticket = node.ticket
+            if (ticket.isNullOrBlank()) {
+                withoutSecrets.copy(ticket = null)
+            } else {
+                val sealedTicket = secrets.sealOrNull(ticket)
+                when {
+                    sealedTicket != null ->
+                        editor.putString(TICKET_PREFIX + node.nodeId, sealedTicket)
+                    allowPlaintext -> {
+                        allSealed = false
+                        editor.putString(TICKET_PREFIX + node.nodeId, secrets.seal(ticket))
+                    }
+                    else -> {
+                        // Refused. The ticket this endpoint already had stays
+                        // in the file rather than being replaced by one that
+                        // could not be protected.
+                        allSealed = false
+                    }
+                }
+                withoutSecrets.copy(ticket = null)
             }
         }
         editor.apply()
@@ -542,9 +578,15 @@ class SettingsManager internal constructor(
                 val token = secrets.unseal(secretPrefs.getString(ENROLLMENT_PREFIX + node.nodeId, ""))
                 node.copy(enrollment = enrollment.copy(token = token))
             } ?: node
-            val otp = withToken.twoFactor ?: return@map withToken
-            val secret = secrets.unseal(secretPrefs.getString(SECRET_PREFIX + node.nodeId, ""))
-            withToken.copy(twoFactor = otp.copy(secret = secret))
+            val withOtp = withToken.twoFactor?.let { otp ->
+                val secret = secrets.unseal(secretPrefs.getString(SECRET_PREFIX + node.nodeId, ""))
+                withToken.copy(twoFactor = otp.copy(secret = secret))
+            } ?: withToken
+            // The ticket is not in the persisted list: it was sealed into
+            // `secretPrefs` when the endpoints were saved. Attach it last, so
+            // an endpoint with no 2FA still gets its addresses back.
+            val ticket = secrets.unseal(secretPrefs.getString(TICKET_PREFIX + node.nodeId, ""))
+            if (ticket.isBlank()) withOtp else withOtp.copy(ticket = ticket)
         }
     }
 
@@ -781,6 +823,7 @@ internal fun isCredentialKey(key: String): Boolean =
         key == SettingsManager.KEY_DEVICE_KEY ||
         key.startsWith(SettingsManager.SECRET_PREFIX) ||
         key.startsWith(SettingsManager.ENROLLMENT_PREFIX) ||
+        key.startsWith(SettingsManager.TICKET_PREFIX) ||
         key.startsWith(SettingsManager.DEVICE_KEY_PREFIX)
 
 /**

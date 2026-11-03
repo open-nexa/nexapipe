@@ -652,7 +652,8 @@ pub async fn run_proxy(
 
 pub async fn run_local_proxy(
     local_proxy_config: LocalProxyConfig,
+    iroh_config: Option<IrohConfig>,
     shutdown_signal: Arc<ShutdownSignal>,
 ) -> anyhow::Result<()> {
-    local_proxy::run_local_proxy(local_proxy_config, shutdown_signal).await
+    local_proxy::run_local_proxy(local_proxy_config, iroh_config, shutdown_signal).await
 }

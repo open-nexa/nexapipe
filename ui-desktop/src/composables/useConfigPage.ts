@@ -14,7 +14,7 @@
  */
 import { ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import type { LoadBalancingStrategy, RelayMode } from "../types";
+import type { DiscoveryMode, LoadBalancingStrategy, RelayMode } from "../types";
 import { useConfigStore } from "../stores/config";
 import { defaultConfig } from "../stores/config/schema";
 import { useCredentialGate } from "../stores/gate";
@@ -129,6 +129,14 @@ export function useConfigPage() {
   }
 
   /**
+   * Another address lookup is in use. Nothing is bound to it the way a relay
+   * token is bound to its relay, so the store can take the value directly.
+   */
+  function updateDiscoveryMode(mode: DiscoveryMode): void {
+    updateConfig({ discoveryMode: mode });
+  }
+
+  /**
    * The relay URL as it is typed.
    *
    * The store keeps the raw text while the field is being typed into and trims it when the field
@@ -165,6 +173,7 @@ export function useConfigPage() {
     openInviteDialog,
     importInvite,
     updateRelayMode,
+    updateDiscoveryMode,
     updateRelayUrl,
     commitRelayUrl,
     updateRelayAuthToken,

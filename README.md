@@ -557,7 +557,8 @@ will name.
 | `--invite-domains <LIST>` | Domains to put in the invite, comma-separated (default: `[local_proxy] proxy_domains`, else the route hosts). |
 | `--invite-name <NAME>` | Label stored alongside the endpoint. |
 | `--invite-relay <URL>` | Relay URL in the invite (default: `[iroh] relay_url`). |
-| `--endpoint-id <NODE_ID>` | Endpoint to publish (default: derived from `[iroh] secret_key`). |
+| `--endpoint-id <NODE_ID>` | Endpoint to publish (default: derived from `[iroh] secret_key`). Requires lookup: the client resolves it through discovery. |
+| `--invite-ticket <TICKET>` | Publish a full endpoint ticket (as printed at server start) instead of a Node ID. The addresses ride in the link, so the invite works with `[iroh] discovery = "none"`. Requires `--generate-invite`; conflicts with `--endpoint-id`. |
 
 ### `nexapipe client`
 
@@ -1780,8 +1781,12 @@ credential is `nexapipe client add <id> --device <name> --force`.
   `IrohProxy.nativeTakeIssuedCredential()`.
 
 Scanning is implemented in the Android app (the "Scan Invite" button beside "Add
-Node"), which accepts the `endpoint/` form only — its stored nodes hold a Node ID
-and no addresses, so a ticket invite is refused.
+Node"), which accepts both forms. An `endpoint/` invite stores a Node ID that the
+client resolves through discovery; a `ticket/` invite carries the addresses in
+the link, so it also works when the server runs `[iroh] discovery = "none"`.
+The ticket is resolved to its Node ID for storage (that ID stays the node's
+primary key), sealed with the other credentials, and fed to the router on
+connect — a ticket node can therefore not have its ID edited.
 
 ---
 
@@ -1849,10 +1854,13 @@ use std::sync::Arc;
 use nexapipe_client::{EndpointGroup, LoadBalancingStrategy, LocalProxy, NodeConfig};
 
 // One node (a server Node ID or a full Ticket) plus the domains it serves.
+// A Node ID needs discovery (n0's dns.iroh.link by default); a ticket carries
+// the addresses itself and works with lookup disabled. Give only one of the
+// two — server_node_id wins when both are set.
 let group = EndpointGroup::new_with_nodes(
     vec![NodeConfig {
-        server_node_id: Some(server_node_id),
-        server_ticket: None,
+        server_node_id: None,
+        server_ticket: Some(ticket),
         domains: vec!["app.example.com".to_string()],
     }],
     None,
@@ -1879,7 +1887,7 @@ The `uniffi` feature builds the same client for an app that is not written in
 Rust — Swift, Kotlin, Python. It is one object and a local proxy:
 
 ```text
-ProxyClient::new(ClientConfig { servers, load_balancing, relay_mode, ... })
+ProxyClient::new(ClientConfig { servers, load_balancing, relay_mode, discovery_mode, ... })
     .node_id() .server_ids() .preconnect()
     .link_statuses() .traffic() .flows() .close_flow()
     .send_request(HttpRequest) .send_raw(host, bytes)

@@ -29,6 +29,7 @@
 //! server takes.
 
 use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
+use crate::discovery::DiscoveryMode;
 use crate::endpoint_group::{EndpointGroup, NodeConfig};
 use crate::error::ClientError;
 use crate::lb::LoadBalancingStrategy;
@@ -150,6 +151,10 @@ pub struct ClientConfig {
     pub relay_url: Option<String>,
     /// The token the relay asks for, if it asks for one.
     pub relay_auth_token: Option<String>,
+    /// Whether this endpoint may use n0's address lookup: `n0` (the default)
+    /// or `none`. With `none`, a bare Node ID cannot be resolved, so every
+    /// server has to be named by a ticket carrying its addresses.
+    pub discovery_mode: Option<String>,
 }
 
 /// How one server is reached right now.
@@ -456,17 +461,34 @@ impl ProxyClient {
         )?
         .unwrap_or(RelayModeSpec::Pinned);
 
+        // The address lookup is the other half of the boundary: `none` takes
+        // the services off this endpoint so it neither publishes to nor asks
+        // n0, and a server then has to be named by a ticket. An empty value
+        // means nothing was injected, which is the default everywhere else.
+        let discovery = DiscoveryMode::parse_or_default(
+            config.discovery_mode.as_deref().unwrap_or(""),
+        )
+        .map_err(|e| ClientError::InvalidConfig(e.to_string()))?;
+
         // The QUIC transport tuning has to be applied here: this endpoint
         // carries every proxied stream, and without it each stream falls back
         // to iroh's 1.25 MB default receive window, which caps a single
         // connection at roughly 50 Mbps on a 200 ms path.
         let tuning = TransportTuning::from_env();
-        let endpoint = Endpoint::builder(presets::N0)
+        let mut builder = Endpoint::builder(presets::N0)
             .alpns(crate::connection_pool::alpns(
                 nexapipe_proto::protocol::Protocol::Legacy,
             ))
             .transport_config(tuning.transport_config())
-            .relay_mode(relay.relay_mode())
+            .relay_mode(relay.relay_mode());
+        builder = discovery.apply(builder);
+        // A `custom` relay is exclusive: refuse a peer that names another
+        // relay, and refuse a bare Node ID once the lookup is off. The JNI and
+        // Tauri clients install the same hook.
+        if let Some(restriction) = relay.dial_restriction(discovery) {
+            builder = builder.hooks(restriction);
+        }
+        let endpoint = builder
             .bind()
             .await
             .map_err(|e| ClientError::Other(format!("cannot bind the iroh endpoint: {e}")))?;
@@ -585,6 +607,7 @@ mod tests {
             relay_mode: None,
             relay_url: None,
             relay_auth_token: None,
+            discovery_mode: None,
         }
     }
 

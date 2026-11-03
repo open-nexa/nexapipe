@@ -643,6 +643,9 @@ async function start(): Promise<void> {
         { token: config.relayAuthToken, relay: config.relayAuthTokenRelay },
         config.relayUrl,
       ),
+      // `none` takes n0's address lookup off the endpoint, so nothing here
+      // reaches dns.iroh.link. Nodes then have to carry a ticket.
+      discoveryMode: config.discoveryMode,
     });
 
     await waitForStart();

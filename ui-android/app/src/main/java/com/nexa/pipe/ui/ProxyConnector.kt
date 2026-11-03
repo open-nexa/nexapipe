@@ -410,7 +410,15 @@ class ProxyConnector(private val log: ConnectionLog) {
             if (node.domains.isNotEmpty()) {
                 for (domain in node.domains) {
                     log.log("Adding domain mapping: '$domain' -> nodeId: ${node.nodeId.take(8)}")
-                    val result = IrohProxy.nativeAddDomainMapping(domain, node.nodeId)
+                    val ticket = node.ticket
+                    val result = if (ticket.isNullOrBlank()) {
+                        IrohProxy.nativeAddDomainMapping(domain, node.nodeId)
+                    } else {
+                        // A ticket carries the addresses, so the mapping has
+                        // to be built from it. A bare Node ID would be dialled
+                        // with no address at all once discovery is off.
+                        IrohProxy.nativeAddTicketDomainMapping(domain, ticket)
+                    }
                     if (result != 0) {
                         log.log("Failed to add domain mapping: $domain")
                     } else {

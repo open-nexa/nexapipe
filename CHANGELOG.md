@@ -26,6 +26,26 @@ and its meaning.
 
 ### Added
 
+- **A deployment can drop n0's `dns.iroh.link`, and every client now carries
+  the ticket side of that trade.** `discovery = "none"` already took the
+  address lookup off the server; what was missing was everything a client
+  needs to connect without it, because a Node ID that nobody resolves is a
+  name and not an address.
+  The CLI accepts `--invite-ticket <TICKET>` with `--generate-invite`, so the
+  addresses ride in the `nexapipe://ticket/` link instead of being looked up —
+  and a Node ID invite generated while `discovery = "none"` is set prints a
+  warning saying so, because that link cannot be resolved by anyone. The
+  embedded local proxy reads the same `[iroh]` relay and discovery settings as
+  the server, so `--local-proxy` no longer quietly asks n0 where a peer is.
+  A UniFFI caller passes `discovery_mode` in its `ClientConfig`, and
+  `IrohConnectionPool` grows `new_with_options` so the pool's own endpoint can
+  carry the restriction too.
+  The desktop app takes a discovery setting next to the relay mode and hands it
+  to `start_proxy`. The Android app accepts a `ticket/` invite — the ticket is
+  resolved to its Node ID for storage, sealed with the other credentials rather
+  than sitting in the cloud-backed preferences, fed to the router on connect,
+  and a ticket node cannot have its ID edited, because editing the ID and
+  keeping the ticket would leave them naming different endpoints.
 - **Where a credential is checked is now a seam, and the built-in check is the
   one that reads the configuration.** Which credentials exist is the core's
   business — a shared secret, a TOTP seed, an Ed25519 key — but *what checks

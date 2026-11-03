@@ -13,7 +13,7 @@
  */
 import { useI18n } from "vue-i18n";
 import ConfigSection from "./ConfigSection.vue";
-import type { RelayMode } from "../types";
+import type { DiscoveryMode, RelayMode } from "../types";
 
 defineProps<{
   /** Which relay is in use. */
@@ -24,11 +24,15 @@ defineProps<{
   relayAuthToken: string;
   /** The relay the stored token was issued for, so the pairing is visible. */
   relayAuthTokenRelay: string;
+  /** Whether a Node ID may be resolved through n0's address lookup. */
+  discoveryMode: DiscoveryMode;
 }>();
 
 const emit = defineEmits<{
   /** Another relay is in use. */
   (e: "update:relayMode", mode: RelayMode): void;
+  /** Another address lookup is in use. */
+  (e: "update:discoveryMode", mode: DiscoveryMode): void;
   /** The URL as it is typed. */
   (e: "update:relayUrl", url: string): void;
   /** The URL field was left: the store trims it and rebinds the token to it. */
@@ -59,6 +63,20 @@ const { t } = useI18n();
           <option value="custom">{{ t("config.relayCustom") }}</option>
         </select>
         <p class="hint">{{ t("config.relayModeHint") }}</p>
+      </div>
+
+      <div class="form-group">
+        <label for="discoveryMode" class="form-label">{{ t("config.discoveryMode") }}</label>
+        <select
+          id="discoveryMode"
+          :value="discoveryMode"
+          class="form-select"
+          @change="emit('update:discoveryMode', ($event.target as HTMLSelectElement).value as DiscoveryMode)"
+        >
+          <option value="n0">{{ t("config.discoveryN0") }}</option>
+          <option value="none">{{ t("config.discoveryNone") }}</option>
+        </select>
+        <p class="hint">{{ t("config.discoveryModeHint") }}</p>
       </div>
 
       <div v-if="relayMode === 'custom'" class="form-group">

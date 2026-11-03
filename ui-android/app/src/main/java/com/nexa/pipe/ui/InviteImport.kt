@@ -4,6 +4,7 @@ import android.content.Context
 import android.widget.Toast
 import com.nexa.pipe.R
 import com.nexa.pipe.provisioning.EndpointInvite
+import com.nexa.pipe.provisioning.InviteTarget
 
 /**
  * Applies a scanned endpoint invite: the node, its domains, the relay it
@@ -22,12 +23,18 @@ internal fun applyInviteImport(
     localizedContext: Context,
     invite: EndpointInvite
 ): String? {
-    val nodeId = inviteNodeId(invite)
-        // A ticket bundles addresses the node list has no room for. The
-        // server can hand out a Node ID invite instead.
-        ?: return localizedContext.getString(R.string.invite_ticket_unsupported)
+    val nodeId = inviteNodeId(invite, setup.resolvedNodeId)
+        // A ticket that could not be reduced to its Node ID cannot be stored:
+        // every credential and reading in the app is keyed by that ID.
+        ?: return localizedContext.getString(R.string.invite_ticket_invalid)
 
-    if (setup.nodes.none { it.nodeId == nodeId }) {
+    val ticket = (invite.target as? InviteTarget.Ticket)?.ticket
+    if (ticket != null) {
+        // Re-importing a ticket replaces the addresses of the endpoint it
+        // names. A ticket is a snapshot, so this is how an operator refreshes
+        // one after the server's addresses move.
+        viewModel.addTicketNode(nodeId, ticket)?.let { return it }
+    } else if (setup.nodes.none { it.nodeId == nodeId }) {
         viewModel.addNode(nodeId)?.let { return it }
     }
     if (invite.domains.isEmpty()) {

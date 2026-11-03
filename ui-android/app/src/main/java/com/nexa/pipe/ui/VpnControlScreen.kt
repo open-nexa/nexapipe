@@ -19,12 +19,14 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.nexa.pipe.IrohProxy
 import com.nexa.pipe.R
 import com.nexa.pipe.SecretStore
 import com.nexa.pipe.locale.rememberLocalizedContext
 import com.nexa.pipe.provisioning.EndpointInvite
 import com.nexa.pipe.provisioning.EndpointInviteCodec
 import com.nexa.pipe.provisioning.InviteParseResult
+import com.nexa.pipe.provisioning.InviteTarget
 import com.nexa.pipe.vpn.VpnTakeoverChoice
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -86,6 +88,10 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
     // An endpoint invite rewrites shared settings, so it is confirmed when it
     // would overwrite something that already works.
     var pendingInviteImport by remember { mutableStateOf<EndpointInvite?>(null) }
+    // The Node ID a pending ticket invite was resolved to. It travels with the
+    // invite rather than being read again at confirmation time: the confirm
+    // dialog has to measure the same endpoint the scan did.
+    var pendingResolvedNodeId by remember { mutableStateOf<String?>(null) }
     // Another VPN app owns the single slot Android allows: whether to ask about
     // it, and whether the answer should be remembered.
     var showTakeoverDialog by remember { mutableStateOf(false) }
@@ -164,28 +170,55 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
      * from silently overwriting the relay or this endpoint's 2FA. A second code
      * path that skipped it would not be a shortcut, it would be a bug.
      */
-    fun handleInviteText(text: String): String? =
-        when (val result = EndpointInviteCodec.parse(text)) {
+    /**
+     * The Node ID an invite names. A ticket carries it inside, so it has to
+     * be resolved by the native side before the invite can be stored: the
+     * node list, its credentials and the routing table all key on that ID.
+     */
+    fun resolveInviteNodeId(invite: EndpointInvite): String? =
+        when (val target = invite.target) {
+            is InviteTarget.NodeId -> target.id
+            is InviteTarget.Ticket ->
+                if (IrohProxy.isNativeLoaded()) {
+                    try {
+                        IrohProxy.nativeResolveTicket(target.ticket)
+                    } catch (e: Throwable) {
+                        null
+                    }
+                } else {
+                    null
+                }
+        }
+
+    fun handleInviteText(text: String): String? {
+        return when (val result = EndpointInviteCodec.parse(text)) {
             is InviteParseResult.Failure -> result.message
             is InviteParseResult.Success -> {
+                // A ticket that cannot be read is refused here, with a reason,
+                // rather than stored as an endpoint nobody can dial.
+                val resolved = resolveInviteNodeId(result.invite)
+                    ?: return localizedContext.getString(R.string.invite_ticket_invalid)
+                val setup = inviteSetup.copy(resolvedNodeId = resolved)
                 // With nothing to overwrite the invite is applied straight
                 // away; otherwise replacing working settings needs a
-                // confirmation. A rejected import (e.g. a ticket invite) comes
-                // back as the status message instead of vanishing.
-                if (inviteConflicts(inviteSetup, localizedContext, result.invite).isEmpty()) {
+                // confirmation. A rejected import comes back as the status
+                // message instead of vanishing.
+                if (inviteConflicts(setup, localizedContext, result.invite).isEmpty()) {
                     applyInviteImport(
                         viewModel,
-                        inviteSetup,
+                        setup,
                         context,
                         localizedContext,
                         result.invite
                     )
                 } else {
                     pendingInviteImport = result.invite
+                    pendingResolvedNodeId = resolved
                     null
                 }
             }
         }
+    }
 
     // Asked before the credential is written, not reported after: once it is on
     // disk in the clear, telling the user about it does not put it back.
@@ -460,25 +493,30 @@ fun VpnControlScreen(viewModel: VpnViewModel = viewModel()) {
             CredentialUnavailableDialog(credentialUnlock)
         }
 
-        pendingInviteImport?.let { invite ->
-            InviteImportDialog(
-                summary = inviteSummary(invite, localizedContext),
-                conflicts = inviteConflicts(inviteSetup, localizedContext, invite),
-                onConfirm = {
-                    applyInviteImport(
-                        viewModel,
-                        inviteSetup,
-                        context,
-                        localizedContext,
-                        invite
-                    )?.let { failure ->
-                        Toast.makeText(context, failure, Toast.LENGTH_LONG).show()
-                    }
-                    pendingInviteImport = null
-                },
-                onDismiss = { pendingInviteImport = null }
-            )
-        }
+    pendingInviteImport?.let { invite ->
+        val confirmedSetup = inviteSetup.copy(resolvedNodeId = pendingResolvedNodeId)
+        InviteImportDialog(
+            summary = inviteSummary(invite, localizedContext),
+            conflicts = inviteConflicts(confirmedSetup, localizedContext, invite),
+            onConfirm = {
+                applyInviteImport(
+                    viewModel,
+                    confirmedSetup,
+                    context,
+                    localizedContext,
+                    invite
+                )?.let { failure ->
+                    Toast.makeText(context, failure, Toast.LENGTH_LONG).show()
+                }
+                pendingInviteImport = null
+                pendingResolvedNodeId = null
+            },
+            onDismiss = {
+                pendingInviteImport = null
+                pendingResolvedNodeId = null
+            }
+        )
+    }
 
     }
 }
