@@ -94,6 +94,17 @@ and its meaning.
 
 ### Changed
 
+- **The shipped 2FA example says two things that are not true.** The secret in
+  `config.toml.2fa.example` is published — it is in a public repository, so
+  anybody can compute a valid code from it — and the README did not say so.
+  The Node ID is a reachability credential on its own, and the 2FA secret is
+  what closes it: a published secret is a published way in. The example now
+  says what it is for, and the README says the same.
+- **The example no longer claims the server refuses to start on a readable
+  configuration.** It did, and it has not since the v0.6.1 change that removed
+  the check: a `0644` bind mount has to start, so the server warns once in the
+  log and starts anyway. The mode is the operator's to set, and the warning
+  is the only thing that says so.
 - **A packet on the desktop's TUN costs one allocation, not an allocation and
   a copy.** The pump read every packet into a buffer and then copied it into
   a freshly allocated one for the stack, because the stack's sink owns what it
@@ -147,6 +158,41 @@ and its meaning.
   What the device sees is the same — the same handshake, the same windows, the
   same UDP path — and the tests that drive it are new: a segment that opens a
   connection, the bytes that travel each way, and a datagram in and out.
+- **The Android app and the client library agree about which invite codes are
+  valid.** The Android codec says it mirrors `nexapipe_client::provisioning`
+  and that both must accept and reject the same codes, because one writes
+  what the other reads. They did not, in five places, and the Android side was
+  the permissive one in every one of them. A parameter's name decided whether
+  it was read at all, so a code that carried its secret under a
+  differently-cased name lost the secret: the desktop refused the code
+  outright, and the app kept the credential and authenticated with it. A
+  malformed escape sequence was kept as a literal `%`, where the desktop
+  refused the code and the app imported it as an endpoint with a name of `%ZZ`
+  in it. Bytes that were not UTF-8 became replacement characters, so the same
+  code named an endpoint on the desktop and named something else on the app. A
+  parameter with no name was dropped and the rest read, where the desktop
+  refuses the code. And a code past the hard limit was parsed in full, where
+  the desktop refuses it — work an attacker gets for free. The tests are on
+  both sides and they check the same codes, because the point of the change is
+  that the two halves agree, not that either is right.
+- **The node id stays out of the Android log panel.** The node id is the
+  reachability credential: on a server started with `[auth] enabled = false` —
+  the default, and what the shipped example config uses — anybody who learns
+  it completes the handshake and reaches every route. The log panel keeps the
+  last hundred lines, and a screenshot of it is a screenshot of the machine's
+  inventory, so nine call sites already truncate the id to its first eight
+  characters. Seven did not: adding, removing, renaming and re-mapping an
+  endpoint, the two lines the invite importer writes, and the domain mapping
+  the connector logs — the importer truncated the very same value for its
+  toast four lines after writing it in full. The rule is now checked over the
+  whole app rather than over the call sites this change touched, so the next
+  call site that forgets it is caught too.
+- **An issued credential is filed under the client it was issued for.** The
+  credential names the client it was issued for, and the client refuses an
+  answer that names a different one, so the client id is the whole of the
+  match. The positional fallback handed an endpoint a credential the server
+  never issued to it, while the endpoint the credential was issued for got
+  none.
 
 ### Fixed
 
@@ -252,6 +298,35 @@ and its meaning.
   route that named the same backend twice was failed twice by one probe and
   taken out of rotation by a single round's worth of noise. It is counted
   once.
+
+### Fixed
+
+- **The client does not record its own refusal as a backend failure.** A full
+  connection pool and a credential replaced mid-dial are refusals the client
+  made, not facts about the backend. Both reached the place where every
+  non-configuration error was folded into a health verdict, so a backend that
+  was answering — and holding ten live connections open — was written into
+  the health table as unreachable. The consequences were both about the wrong
+  thing: the health snapshot reported a healthy backend as down and could flip
+  the "any reachable" answer off, and with a multi-backend domain the marked
+  backend was dropped from the candidates, so the balancer steered every later
+  request to the other backends until the next probe round — 30 to 35 seconds
+  away. A pool refusal and a replaced credential now have their own errors,
+  and those pass through without a verdict. The verdict is written only by
+  evidence that the backend failed: a dial or handshake that did not come
+  about, or a probe.
+- **The client's first write is inside the attempt's budget.** The retry loop
+  documents one budget for every attempt and applies it to opening the
+  stream, but the payload write that followed was not under it. A stream
+  write waits for the peer to grant flow-control credit, so a peer that takes
+  the stream and then stops reading leaves the write pending for good: the
+  attempt's deadline never fires, and the request hangs instead of failing at
+  the budget. The payload is not small on the paths that use it — the HTTP
+  path sends the filtered head plus the body that came with it, and the TLS
+  path the whole ClientHello. The write is now under the same deadline as the
+  open, and a timeout is treated the way the open's timeout already is: the
+  connection is discarded and the attempt ends, within the same overall
+  budget.
 
 ## [1.0.1] — 2026-10-25
 
