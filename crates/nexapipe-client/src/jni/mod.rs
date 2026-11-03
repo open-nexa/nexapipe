@@ -28,6 +28,7 @@ use crate::{DomainMapping, EndpointGroup, IrohConnectionPool, LoadBalancingStrat
 use iroh::Endpoint;
 use iroh::dns::{DnsError, DnsResolver, NameserverConfig, Resolver, TxtRecordData};
 use iroh::endpoint::presets;
+use iroh_tickets::endpoint::EndpointTicket;
 use jni::objects::JString;
 use jni::sys::jint;
 use jni::{Env, EnvUnowned, Outcome};
@@ -280,6 +281,17 @@ pub(crate) fn first_invalid_node_id(
     nodes: &[NodeConfig],
 ) -> Option<String> {
     for mapping in domain_mappings {
+        // A ticket is not a Node ID, so the ID check below must not run on
+        // one. Refuse a malformed ticket here instead: without this it only
+        // fails later, inside the endpoint group, as a bind error.
+        if let Some(ticket) = mapping.server_ticket.as_deref()
+            && ticket.parse::<EndpointTicket>().is_err()
+        {
+            return Some(format!(
+                "Invalid endpoint ticket for domain '{}': the string is not an endpoint ticket.",
+                mapping.domain
+            ));
+        }
         if let Some(node_id) = mapping.server_node_id.as_deref()
             && let Some(reason) = node_id_error(node_id)
         {
@@ -291,6 +303,14 @@ pub(crate) fn first_invalid_node_id(
         }
     }
     for node in nodes {
+        if let Some(ticket) = node.server_ticket.as_deref()
+            && ticket.parse::<EndpointTicket>().is_err()
+        {
+            return Some(
+                "Invalid endpoint ticket on a node: the string is not an endpoint ticket."
+                    .to_string(),
+            );
+        }
         if let Some(node_id) = node.server_node_id.as_deref()
             && let Some(reason) = node_id_error(node_id)
         {

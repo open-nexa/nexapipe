@@ -29,5 +29,7 @@ internal data class SettingsWrite(
  */
 internal fun SettingsWrite.carriesCredential(): Boolean =
     nodes.any {
-        !it.enrollment?.token.isNullOrBlank() || !it.twoFactor?.secret.isNullOrBlank()
+        !it.enrollment?.token.isNullOrBlank() ||
+            !it.twoFactor?.secret.isNullOrBlank() ||
+            !it.ticket.isNullOrBlank()
     } || relayToken.isNotBlank()

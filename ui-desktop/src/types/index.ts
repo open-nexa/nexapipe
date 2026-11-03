@@ -2,6 +2,9 @@ export type ConnectionType = 'ticket' | 'endpoint_id';
 
 export type RelayMode = 'pinned' | 'default' | 'disabled' | 'custom';
 
+/** Whether a Node ID may be resolved through n0's dns.iroh.link. `none` means tickets only. */
+export type DiscoveryMode = 'n0' | 'none';
+
 export type LoadBalancingStrategy = 'round_robin' | 'random';
 
 export type TwoFactorAlgorithm = 'sha1' | 'sha256' | 'sha512';
@@ -163,6 +166,11 @@ export interface ProxyConfig {
   relayUrl: string;
   /** Bearer token for a custom relay that requires one. */
   relayAuthToken: string;
+  /**
+   * Address lookup: `n0` asks dns.iroh.link to turn a Node ID into an address,
+   * `none` switches the lookup off and every node has to carry a ticket.
+   */
+  discoveryMode: DiscoveryMode;
   /**
    * The relay the stored token was issued for.
    *

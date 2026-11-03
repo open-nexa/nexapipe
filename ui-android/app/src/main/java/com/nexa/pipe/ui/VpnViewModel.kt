@@ -1440,6 +1440,35 @@ class VpnViewModel : ViewModel() {
         return null
     }
 
+    /**
+     * Adds or refreshes an endpoint named by a full ticket.
+     *
+     * [nodeId] is the Endpoint ID the ticket was resolved to, not the ticket
+     * string: the node list, its credentials, the device keys and the native
+     * routing table all key on that ID. Keeping it as the primary key is what
+     * lets a ticket endpoint use 2FA, domain mappings and link readings
+     * unchanged.
+     */
+    fun addTicketNode(nodeId: String, ticket: String): String? {
+        val id = nodeId.trim()
+        val value = ticket.trim()
+        if (id.isEmpty()) return AppStrings.get(R.string.error_endpoint_id_empty)
+        if (value.isEmpty()) return AppStrings.get(R.string.error_ticket_empty)
+        nodeIdFormatError(id)?.let { return it }
+
+        val existing = nodes.value.firstOrNull { it.nodeId == id }
+        nodes.value = if (existing == null) {
+            nodes.value + NodeConfig(nodeId = id, ticket = value)
+        } else {
+            // The same endpoint re-imported with fresh addresses: replace the
+            // snapshot rather than refusing it as a duplicate.
+            nodes.value.map { if (it.nodeId == id) it.copy(ticket = value) else it }
+        }
+        saveSettings()
+        addLog("Added ticket node: ${id.take(8)}")
+        return null
+    }
+
     fun removeNode(nodeId: String) {
         if (nodes.value.none { it.nodeId == nodeId }) return
 
@@ -1477,6 +1506,12 @@ class VpnViewModel : ViewModel() {
         nodeIdFormatError(newId)?.let { return it }
 
         val node = nodes.value[index]
+        // A ticket node's ID is the identity inside its ticket. Renaming it
+        // would leave the addresses pointing at a different endpoint, and the
+        // rebuilt domain mappings would be plain Node IDs with no addresses.
+        if (node.ticket != null) {
+            return AppStrings.get(R.string.error_ticket_node_rename)
+        }
         nodes.value = nodes.value.toMutableList().apply { set(index, node.copy(nodeId = newId)) }
         saveSettings()
 

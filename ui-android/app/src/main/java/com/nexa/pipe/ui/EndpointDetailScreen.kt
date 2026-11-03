@@ -262,26 +262,31 @@ fun EndpointDetailScreen(
                                     )
                                 }
                             )
-                            DropdownMenuItem(
-                                text = { Text(stringResource(R.string.endpoint_edit_id)) },
-                                onClick = {
-                                    menuExpanded = false
-                                    // Changing the ID re-points every domain
-                                    // on this endpoint at another backend, so
-                                    // it is not a label edit.
-                                    credentialUnlock.requestIfLocked(
-                                        localizedContext,
-                                        R.string.credential_lock_edit_id_subtitle
-                                    ) { showEditDialog = true }
-                                },
-                                leadingIcon = {
-                                    Icon(
-                                        Icons.Default.Edit,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                }
-                            )
+                            // A ticket node's ID is the identity inside its
+                            // ticket, so there is nothing to rename. Editing
+                            // it would leave the addresses pointing elsewhere.
+                            if (node.ticket == null) {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.endpoint_edit_id)) },
+                                    onClick = {
+                                        menuExpanded = false
+                                        // Changing the ID re-points every domain
+                                        // on this endpoint at another backend, so
+                                        // it is not a label edit.
+                                        credentialUnlock.requestIfLocked(
+                                            localizedContext,
+                                            R.string.credential_lock_edit_id_subtitle
+                                        ) { showEditDialog = true }
+                                    },
+                                    leadingIcon = {
+                                        Icon(
+                                            Icons.Default.Edit,
+                                            contentDescription = null,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                    }
+                                )
+                            }
                             DropdownMenuItem(
                                 text = { Text(stringResource(R.string.endpoint_delete)) },
                                 onClick = {

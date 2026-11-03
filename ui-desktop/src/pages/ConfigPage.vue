@@ -55,6 +55,7 @@ const {
   openInviteDialog,
   importInvite,
   updateRelayMode,
+  updateDiscoveryMode,
   updateRelayUrl,
   commitRelayUrl,
   updateRelayAuthToken,
@@ -226,7 +227,9 @@ watch(activeTab, () => {
           :relay-url="config.relayUrl"
           :relay-auth-token="config.relayAuthToken"
           :relay-auth-token-relay="config.relayAuthTokenRelay"
+          :discovery-mode="config.discoveryMode"
           @update:relay-mode="updateRelayMode"
+          @update:discovery-mode="updateDiscoveryMode"
           @update:relay-url="updateRelayUrl"
           @commit:relay-url="commitRelayUrl"
           @update:relay-auth-token="updateRelayAuthToken"

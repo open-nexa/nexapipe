@@ -23,7 +23,8 @@ internal fun inviteConflicts(
     localizedContext: Context,
     invite: EndpointInvite
 ): List<String> {
-    val current = inviteNodeId(invite)?.let { id -> setup.nodes.firstOrNull { it.nodeId == id } }
+    val current = inviteNodeId(invite, setup.resolvedNodeId)
+        ?.let { id -> setup.nodes.firstOrNull { it.nodeId == id } }
     val conflicts = inviteConflictKinds(current, invite, setup.relayMode, setup.relayUrl).map { kind ->
         when (kind) {
             InviteConflict.TwoFactor -> {

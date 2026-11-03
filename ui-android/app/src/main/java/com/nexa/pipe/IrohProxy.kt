@@ -321,9 +321,26 @@ object IrohProxy {
 
     external fun nativeStopProxy(): Int
 
+    /**
+     * Reads the Node ID out of a full endpoint ticket.
+     *
+     * The app keys endpoints by Node ID, while a ticket carries addresses and
+     * an identity inside them. This is the bridge: the identity becomes the
+     * node's primary key, the ticket stays with it as its addresses.
+     *
+     * @return the Node ID, or null when the string is not a ticket.
+     */
+    external fun nativeResolveTicket(ticket: String): String?
+
     external fun nativeAddNode(nodeId: String, domains: String): Int
 
+    /** Adds a node named by a ticket rather than a bare Node ID. */
+    external fun nativeAddTicketNode(ticket: String, domains: String): Int
+
     external fun nativeAddDomainMapping(domain: String, nodeId: String): Int
+
+    /** Maps a domain to a peer named by a ticket, so its addresses travel with the route. */
+    external fun nativeAddTicketDomainMapping(domain: String, ticket: String): Int
 
     external fun nativeRemoveNode(nodeId: String): Int
 

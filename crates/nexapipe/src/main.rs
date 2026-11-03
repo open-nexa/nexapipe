@@ -229,6 +229,17 @@ struct Cli {
     )]
     endpoint_id: Option<String>,
 
+    #[arg(
+        long = "invite-ticket",
+        value_name = "TICKET",
+        requires = "generate_invite",
+        conflicts_with = "endpoint_id",
+        help = "Put a full endpoint ticket (Node ID + addresses) in the invite instead of a \
+                Node ID. Use it with [iroh] discovery = \"none\", where a Node ID alone cannot \
+                be resolved"
+    )]
+    invite_ticket: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -716,7 +727,9 @@ async fn run_local_proxy_mode(proxy_config: &ProxyConfig, shutdown_signal: &Arc<
 
     tracing::info!("Starting local proxy mode");
 
-    if let Err(e) = run_local_proxy(config, shutdown_signal.clone()).await {
+    if let Err(e) =
+        run_local_proxy(config, proxy_config.iroh.clone(), shutdown_signal.clone()).await
+    {
         tracing::error!("Local proxy failed: {}", e);
         std::process::exit(1);
     }

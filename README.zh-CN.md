@@ -493,7 +493,8 @@ relay 那份也是同样的声明。这些指令不是同一时期引入的，sy
 | `--invite-domains <LIST>` | 邀请码中的域名，逗号分隔（默认：`[local_proxy] proxy_domains`，否则取路由主机名）。 |
 | `--invite-name <NAME>` | 与端点一同保存的标签。 |
 | `--invite-relay <URL>` | 邀请码中的中继 URL（默认：`[iroh] relay_url`）。 |
-| `--endpoint-id <NODE_ID>` | 要对外公布的端点（默认：由 `[iroh] secret_key` 推导）。 |
+| `--endpoint-id <NODE_ID>` | 要对外公布的端点（默认：由 `[iroh] secret_key` 推导）。需要地址查找：客户端通过 discovery 解析它。 |
+| `--invite-ticket <TICKET>` | 用完整端点 ticket（服务端启动时打印的那个）代替 Node ID 对外公布。地址随链接携带，因此在 `[iroh] discovery = "none"` 下同样可用。需配合 `--generate-invite`；与 `--endpoint-id` 互斥。必须是本服务端自己的 ticket：会把本服务端的 2FA 凭据带到别的端点的邀请码会被拒绝。 |
 
 ### `nexapipe client`
 
@@ -1556,9 +1557,11 @@ nexapipe://endpoint/a612…7063?v=2&domains=app.example.com&client=client-001
   重启的应用无法注册两次。两个应用都做到了：桌面端调用 `take_issued_credential`，
   Android 从 `IrohProxy.nativeTakeIssuedCredential()` 读出同样的内容。
 
-扫码功能在 Android 应用中实现（"Add Node" 旁边的 "Scan Invite" 按钮），它只接受
-`endpoint/` 形式 —— 它存储的节点只持有 Node ID 而没有地址，所以 ticket 形式的邀请码
-会被拒绝。
+扫码功能在 Android 应用中实现（"Add Node" 旁边的 "Scan Invite" 按钮），两种形式都
+接受。`endpoint/` 邀请码存储一个 Node ID，由客户端通过 discovery 解析；`ticket/`
+邀请码把地址随链接携带，因此服务端运行 `[iroh] discovery = "none"` 时同样可用。
+ticket 会被解析出 Node ID 用于存储（该 ID 仍是节点的主键），与其他凭据一起密封保存，
+连接时交给路由 —— 因此 ticket 节点的 ID 不允许再编辑。
 
 ---
 
@@ -1589,10 +1592,12 @@ use std::sync::Arc;
 use nexapipe_client::{EndpointGroup, LoadBalancingStrategy, LocalProxy, NodeConfig};
 
 // 一个节点（服务端 Node ID 或完整 Ticket）加上它服务的域名。
+// Node ID 需要 discovery（默认是 n0 的 dns.iroh.link）才能解析成地址；ticket
+// 自带地址，关闭查找后依然可用。两者只填一个 —— 同时填时 server_node_id 优先。
 let group = EndpointGroup::new_with_nodes(
     vec![NodeConfig {
-        server_node_id: Some(server_node_id),
-        server_ticket: None,
+        server_node_id: None,
+        server_ticket: Some(ticket),
         domains: vec!["app.example.com".to_string()],
     }],
     None,
@@ -1618,7 +1623,7 @@ proxy.run().await?;   // run() 阻塞；从别处调用 stop() 来结束它
 Python。它是一个对象加一个本地代理：
 
 ```text
-ProxyClient::new(ClientConfig { servers, load_balancing, relay_mode, ... })
+ProxyClient::new(ClientConfig { servers, load_balancing, relay_mode, discovery_mode, ... })
     .node_id() .server_ids() .preconnect()
     .link_statuses() .traffic() .flows() .close_flow()
     .send_request(HttpRequest) .send_raw(host, bytes)
