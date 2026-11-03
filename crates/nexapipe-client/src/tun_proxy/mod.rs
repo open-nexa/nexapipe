@@ -311,7 +311,21 @@ const TUN_WRITE_QUEUE: usize = 1024;
 /// application could start: a peer that sent one datagram each from a few
 /// thousand source ports, or a leak of flows whose idle timer had not run out
 /// yet, was answered with as many tunnels as it cared to open.
-const MAX_UDP_FLOWS: usize = 32;
+///
+/// **A hundred and twenty-eight, and the number is about what a phone
+/// actually does.** Thirty-two was low enough that an ordinary device reached
+/// it: a browser's QUIC connections, a voice call, a game and a push service
+/// are four flows between them, and the fifth application to speak UDP found
+/// the table full. A flow that does not fit is **dropped rather than
+/// refused** — the datagram goes nowhere and the application sends it again,
+/// which costs a retransmission and shows up as a slow, lossy link rather
+/// than as an error.
+///
+/// The memory is not what bounds this: a flow's queue is bounded by
+/// [`UDP_FLOW_QUEUE_BYTES`] and is only as full as the traffic asks it to be,
+/// so a hundred and twenty-eight idle flows cost a hundred and twenty-eight
+/// tunnels and not a hundred and twenty-eight megabytes.
+const MAX_UDP_FLOWS: usize = 128;
 
 /// How many TCP flows may be open at once.
 ///

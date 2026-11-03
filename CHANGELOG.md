@@ -86,6 +86,15 @@ and its meaning.
 
 ### Changed
 
+- **The TUN proxy holds a hundred and twenty-eight UDP flows, not thirty-two.**
+  A flow that does not fit is dropped rather than refused: the datagram goes
+  nowhere and the application sends it again, which costs a retransmission
+  and shows up as a slow, lossy link rather than as an error.
+  Thirty-two was low enough that an ordinary device reached it — a browser's
+  QUIC connections, a voice call, a game and a push service are four flows
+  between them, and the fifth application to speak UDP found the table full.
+  The memory is not what bounds this: a flow's queue is bounded by the bytes
+  it holds and is only as full as the traffic asks it to be.
 - **The TUN proxy's application bytes no longer wait for the server's answer.**
   The status byte is the first byte the server sends on an L4 tunnel, so a
   client that waited for it before writing the application's first bytes put a
