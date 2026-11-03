@@ -328,6 +328,10 @@ jobs:
           Remove-Item -Recurse -Force $stage
           Get-ChildItem dist
 
+      - name: Record the artifact sizes
+        shell: bash
+        run: .github/scripts/record-sizes.sh "server archives" dist
+
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
         with:
@@ -887,6 +891,10 @@ jobs:
         run: |
           find release-artifact -type f | sort
 
+      - name: Record the artifact sizes
+        shell: bash
+        run: .github/scripts/record-sizes.sh "desktop bundles" ui-desktop/release-artifact
+
       - name: Upload build artifacts
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
         with:
@@ -1137,12 +1145,39 @@ jobs:
               build --release \
               -p nexapipe-client \
               --features "jni local-proxy tun-proxy" \
-              --config "target.${TRIPLE}.linker='${LINKER}'"
+              --config "target.${TRIPLE}.linker='${LINKER}'" \
+              --config 'profile.release.strip=false'
 
             mkdir -p "ui-android/app/src/main/jniLibs/${ABI}"
             cp "target/${TRIPLE}/release/libnexapipe_client.so" \
                "ui-android/app/src/main/jniLibs/${ABI}/libnexapipe_client.so"
-            ls -lh "ui-android/app/src/main/jniLibs/${ABI}/libnexapipe_client.so"
+
+            # The symbol table is stripped before the .so is packaged.
+            #
+            # The build was told **not** to strip, because the symbols are
+            # worth keeping: a native crash in the field is debugged with the
+            # symbols that were there when it happened, and a stripped build
+            # has none. The copy with them is kept **outside** `jniLibs`,
+            # because everything in there is packaged into the APK, and it is
+            # uploaded beside the APKs as an artifact.
+            #
+            # The size this saves is what the package pays anyway: the root
+            # workspace's release profile already strips the library, and
+            # stripping it here instead lands on the same figure — 11 088 200
+            # bytes against the 11 087 976 the cargo build produces, which is
+            # 224 bytes, or 0.002%. The APK is no bigger for having the
+            # symbols kept.
+            #
+            # The **exported** symbols are not among the ones removed — those
+            # are the JNI entry points the JVM looks up by name, and the check
+            # below is what proves they survived.
+            mkdir -p "ui-android/debug-symbols/${ABI}"
+            cp "ui-android/app/src/main/jniLibs/${ABI}/libnexapipe_client.so" \
+               "ui-android/debug-symbols/${ABI}/libnexapipe_client.so"
+            "${NDK_BIN}/llvm-strip" --strip-unneeded \
+               "ui-android/app/src/main/jniLibs/${ABI}/libnexapipe_client.so"
+            ls -lh "ui-android/app/src/main/jniLibs/${ABI}/libnexapipe_client.so" \
+                  "ui-android/debug-symbols/${ABI}/libnexapipe_client.so"
           done
 
       - name: Verify native library exports
@@ -1338,6 +1373,17 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           done
 
+      # What the APKs and the native library weigh. The APK is what a phone
+      # downloads and the library is most of it, so the two are recorded
+      # together.
+      - name: Record the artifact sizes
+        if: steps.opts.outputs.skip_rust != 'true'
+        shell: bash
+        run: |
+          .github/scripts/record-sizes.sh "android apks and the native library" \
+            ui-android/*.apk \
+            ui-android/app/src/main/jniLibs
+
       - name: Upload APK artifact
         if: steps.opts.outputs.skip_rust != 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
@@ -1348,6 +1394,21 @@ jobs:
             ui-android/nexa-${{ steps.opts.outputs.version_name }}-android-arm64.apk.sha256
             ui-android/nexa-${{ steps.opts.outputs.version_name }}-android-x86_64.apk
             ui-android/nexa-${{ steps.opts.outputs.version_name }}-android-x86_64.apk.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+      # The symbols of the .so that went into the APKs, for a crash that
+      # happens in the field.
+      #
+      # They are not published as a release asset: a release is what people
+      # download, and these are what a crash report is read with. They are an
+      # artifact of the run, kept for as long as the artifacts are.
+      - name: Upload the native symbols
+        if: steps.opts.outputs.skip_rust != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7 @ 2026-10-07
+        with:
+          name: android-native-symbols
+          path: ui-android/debug-symbols/**
           if-no-files-found: error
           retention-days: 7
 

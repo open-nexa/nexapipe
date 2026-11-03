@@ -34,14 +34,17 @@ All figures from this working tree on 2026-10-10. Reproduce with
 |---|---|---|
 | Desktop frontend (`ui-desktop/dist`) | 444 KB | the whole web payload; small enough not to matter |
 | Android debug APK | 16.5 MB | `assembleDebug` — unminified, unsigned, and **not** what ships. The release APK is built only by `build-apk` (`release.yml:939`) and has never been weighed |
-| Desktop Rust binary | **not measured** | this is itself the finding |
+| Desktop Rust binary (`nexa`) | **26.5 MiB** | measured 2026-10-30 on an Apple M4 (16 GB, macOS 27.0.1) with `rustc 1.99.1`, by `cargo build --release` in `ui-desktop/src-tauri` after the frontend was built into `ui-desktop/dist`. It was **39.1 MiB** before the desktop was given a release profile — see [S2](#s2--give-the-desktop-a-release-profile-p0) |
+| Desktop service binary (`nexa-service`) | **12.0 MiB** | the same build, the same measurement: **19.0 MiB** before |
 | Server binary | **not measured** | same |
-| Android `.so` per ABI | **not measured** | same |
+| Android `.so` per ABI | **10.6 MiB** | measured 2026-10-30 on an Apple M4 with `rustc 1.99.1`, by `cargo ndk --target arm64-v8a --platform 26 build --release -p nexapipe-client --features "jni local-proxy tun-proxy"`: 11 087 976 bytes. It is **already stripped** by the root workspace's release profile — see [§1.3](#13-what-is-turned-off) |
 
-Three of the four shipped artifacts have never had their size written down
-anywhere, and no CI job records it (§2). **We are therefore optimizing blind.**
-Everything in §4 is written with a confidence level attached, and one of the
-first deliverables is measuring properly rather than guessing.
+Two of the four shipped artifacts now have their size written down, and the
+release weighs what it publishes: `record-sizes.sh` runs in each of the three
+build jobs and puts the numbers in the job's step summary, so the next release
+is compared against this one rather than against nothing. The server binary and
+the Android `.so` are still unwritten down, and no CI job records the size of
+an artifact a pull request *would* produce — that is the rest of [S1](#s1--measure-everything-p0).
 
 ### 1.1 Where the desktop binary's size is decided
 
@@ -92,13 +95,32 @@ Worth recording, because it is easy to "fix" these and lose ground:
   untouched template — every rule still commented out. R8 is available and
   doing nothing.
 - **Android resources are not shrunk.** `isShrinkResources` is not set at all.
-- **The Android `.so` is probably not stripped.** It is built by `build-apk`
-  (`release.yml:757-793`) from the root workspace, so it inherits
-  `strip = true` from `Cargo.toml:35` — but whether that reaches an ELF shared
-  object in the NDK toolchain is not something this document verified, and a
-  `.so` carrying a symbol table is the largest single thing in the APK either
-  way. **This is a hypothesis for S1 to settle, not a finding** — which is
-  exactly why §1 lists the `.so` size as unmeasured.
+- **The Android `.so` *is* stripped.** This document used to say it was
+  probably not, and that the question was a hypothesis for S1 to settle. It is
+  settled: the library is built by `build-apk` (`release.yml:757-793`) from the
+  root workspace, and `strip = true` at `Cargo.toml:35` does reach the ELF
+  shared object.
+
+  Measured on 2026-10-30, on an Apple M4 with `rustc 1.99.1`, by
+  `cargo ndk --target arm64-v8a --platform 26 build --release -p
+  nexapipe-client --features "jni local-proxy tun-proxy"`:
+
+  | Build | Size | Sections |
+  |---|---|---|
+  | the root profile, `strip = true` | **11 087 976 B** (10.6 MiB) | `.dynsym` only — no `.symtab`, no debug info |
+  | `--config 'profile.release.strip=false'` | 20 716 856 B (19.8 MiB) | `.symtab` and seven `.debug_*` sections |
+  | the second, after `llvm-strip --strip-unneeded` | 11 088 200 B (10.6 MiB) | `.dynsym` only |
+
+  So the two routes to a stripped library land on the same figure — 224 bytes
+  apart, which is 0.002% — and the symbol table is worth **9.6 MiB** on its
+  own. That is what makes the debug symbols free: the build is told not to
+  strip, the copy that goes into the APK is stripped, and the copy with the
+  symbols is kept for a crash in the field. The APK pays the same size either
+  way.
+
+  The exported symbols are not among the ones the strip removes: all 33 of the
+  `Java_com_nexa_pipe_IrohProxy_*` entries are still there afterwards, which
+  is what the release's own check asserts.
 
 ### 1.4 The web assets are fine
 
@@ -175,6 +197,18 @@ opposite, and bundling them means an R8 regression rolls back the free win too.
 - **Deliverable:** a table in this file, filled in, with the command that
   produced each row. Replacing the blanks in §1.
 
+**Half of it has landed.** `.github/scripts/record-sizes.sh` runs in each of
+the three build jobs of the release workflow and weighs what that job
+produced — the server archives, the desktop bundles, the APKs and the native
+library — writing the numbers into the job's step summary, so a reader of a
+release can see them. The desktop binaries are now in the table in §1, with
+the command that produced the row.
+
+What has **not** landed: the `cargo bloat` attribution, and a size recorded on
+a pull request rather than on a release. The second is the expensive half —
+weighing what a pull request *would* produce means building the artifacts
+again on every push, and the release weighs the real ones.
+
 ### S2 — Give the desktop a release profile (P0)
 
 - Add `[profile.release]` to `ui-desktop/src-tauri/Cargo.toml`: `opt-level = 3`,
@@ -198,6 +232,29 @@ opposite, and bundling them means an R8 regression rolls back the free win too.
   path should take the service down is a real design question, and answering it
   by accident through a size optimisation is exactly the trade this document
   refuses to make. Revisit under F2, with evidence.
+
+**Landed, and the figure is measured.** `ui-desktop/src-tauri/Cargo.toml` has
+the profile now, with `panic = "unwind"` written down for the reason above —
+the vendored smoltcp patch is about a panic that must not take the process
+down, and `nexa-service` runs as a long-lived elevated process that links it.
+
+Measured on 2026-10-30, on an Apple M4 (16 GB, macOS 27.0.1) with `rustc
+1.99.1`, by `cargo build --release` in `ui-desktop/src-tauri` after the
+frontend was built into `ui-desktop/dist`:
+
+| Binary | Before | After | |
+|---|---|---|---|
+| `nexa` | 41 017 520 B (39.1 MiB) | 27 836 928 B (26.5 MiB) | **−32.1%** |
+| `nexa-service` | 19 874 304 B (19.0 MiB) | 12 565 184 B (12.0 MiB) | **−36.8%** |
+
+That is inside the predicted band and a little past it for the service. The
+build cost is real and measured too: **2m00s → 3m24s** on the same machine,
+for the same tree.
+
+One of the two consequences above turned out not to apply: the profile is a
+`[profile.release]`, and `tauri dev` builds with the `dev` profile, so local
+iteration is unchanged and no escape hatch is needed. The other one stands —
+the CI desktop jobs build the same tree and get slower.
 
 ### S3 — Turn on Android shrinking (P1)
 
@@ -227,6 +284,37 @@ opposite, and bundling them means an R8 regression rolls back the free win too.
   it cannot assert the app works. **A device run through VPN start, a proxied
   request, a 2FA gate and the QR scanner is required before release**, and that
   is a manual step this document makes explicit rather than assumes.
+
+**Both halves have landed, and the first one before this document was written.**
+`isMinifyEnabled` and `isShrinkResources` are on, and the proguard rules carry
+48 lines of content rather than the untouched template.
+
+The second half — the `.so` — turned out to be a different question than the
+one this section asked. It is **already stripped**: the root workspace's
+release profile strips it, and the APK has been paying the smaller size all
+along (see [§1.3](#13-what-is-turned-off)). So there was no size to win here.
+
+What was missing was the other half of the same line: the symbols were thrown
+away at build time, and a native crash in the field had nothing to be read
+with. The build is now told **not** to strip
+(`--config 'profile.release.strip=false'`), the copy that goes into the APK is
+stripped with `llvm-strip --strip-unneeded`, and the copy carrying the symbols
+is kept **outside** `jniLibs` — everything in there is packaged into the APK —
+and uploaded beside the APKs as an artifact.
+
+The APK pays the same size either way: 11 088 200 bytes against the 11 087 976
+the cargo build produces, which is 224 bytes, or 0.002%. The symbols are
+worth 9.6 MiB and cost nothing.
+
+The **exported** symbols are not among the ones the strip removes: all 33 of
+the `Java_com_nexa_pipe_IrohProxy_*` entries are still there afterwards, and
+the check that asserts the fourteen the release names runs over the stripped
+file — so the strip cannot quietly take one of them away without the release
+failing.
+
+What is still missing is the figure for the APK as a whole: the release now
+weighs the APK and the library it contains, but the number they came to is not
+written down here yet.
 
 ### S4 — A size budget (P1, after S1–S3 have landed)
 
