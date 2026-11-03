@@ -73,9 +73,72 @@ and its meaning.
   already do it, rather than a `license-file` pointing at the repository root
   — which is what keeps the manifest free of the warning cargo gives for
   naming both.
+- **Opening a tunnel is measured in the three phases it is made of.** A slow
+  tunnel used to be one number — the flow took a long time — which cannot say
+  whether the time went into this process or onto the network. The server now
+  publishes `nexapipe_l4_open_duration_ms`, `nexapipe_l4_route_duration_ms` and
+  `nexapipe_l4_backend_duration_ms`: the whole open, the route lookup inside
+  it, and the backend connection (or, for a UDP flow, the resolution) the rest
+  of it is.
+  The client logs the same split from its own side — the time the stream took
+  to open and the time the status byte took to come back — so the two ends can
+  be compared against each other.
 
 ### Changed
 
+- **The shipped 2FA example says two things that are not true.** The secret in
+  `config.toml.2fa.example` is published — it is in a public repository, so
+  anybody can compute a valid code from it — and the README did not say so.
+  The Node ID is a reachability credential on its own, and the 2FA secret is
+  what closes it: a published secret is a published way in. The example now
+  says what it is for, and the README says the same.
+- **The example no longer claims the server refuses to start on a readable
+  configuration.** It did, and it has not since the v0.6.1 change that removed
+  the check: a `0644` bind mount has to start, so the server warns once in the
+  log and starts anyway. The mode is the operator's to set, and the warning
+  is the only thing that says so.
+- **A packet on the desktop's TUN costs one allocation, not an allocation and
+  a copy.** The pump read every packet into a buffer and then copied it into
+  a freshly allocated one for the stack, because the stack's sink owns what it
+  is given. Reading straight into that buffer leaves one allocation per
+  packet instead of two and a memcpy of every byte of it.
+  The Android pump keeps the copy: it reads from a file descriptor, and the
+  stable standard library has no way to fill a vector from one. The copy is
+  1,400 bytes per packet, which at the rate a full link carries them is a
+  fraction of a percent of a core.
+- **The TUN proxy's TCP window is a credit, not an allocation.** Every socket
+  the stack opened took four buffers of the window's size — two for the
+  protocol and two for the application's side of the tunnel — so a flow cost
+  four times the window whether it carried a byte or not. The two on the
+  application's side now grow as the flow carries bytes, and a flow that
+  carries nothing holds nothing.
+  Measured with the `tun_flow_memory` example: at a 128 KiB window a flow is
+  257 KiB of address space rather than 512 KiB, and the sixty-four flows a
+  phone may have open cost 16 MiB rather than 32 MiB. The window is still
+  what a flow's steady speed is made of, so raising it is still the way to
+  carry more — but it now costs what the traffic asks for rather than what
+  the window allows.
+- **The TUN proxy holds a hundred and twenty-eight UDP flows, not thirty-two.**
+  A flow that does not fit is dropped rather than refused: the datagram goes
+  nowhere and the application sends it again, which costs a retransmission
+  and shows up as a slow, lossy link rather than as an error.
+  Thirty-two was low enough that an ordinary device reached it — a browser's
+  QUIC connections, a voice call, a game and a push service are four flows
+  between them, and the fifth application to speak UDP found the table full.
+  The memory is not what bounds this: a flow's queue is bounded by the bytes
+  it holds and is only as full as the traffic asks it to be.
+- **The TUN proxy's application bytes no longer wait for the server's answer.**
+  The status byte is the first byte the server sends on an L4 tunnel, so a
+  client that waited for it before writing the application's first bytes put a
+  round trip between the application and the backend that the tunnel does not
+  need — and the server spends that round trip dialling the backend.
+  The client's first bytes now go out while the dial is still running, and the
+  answer is read as part of the first read of the reply.
+  Nothing is lost when the server refuses the tunnel: it refuses before it
+  forwards anything, so the bytes are dropped rather than delivered, and the
+  application opens another connection. The desktop's local proxy still waits
+  for the answer, because it answers its own client "200 Connection
+  Established" and may not promise a tunnel the server is about to refuse.
 - **The TUN proxy's user-space TCP/IP stack is ours now, and smoltcp comes
   from crates.io.** The client used to link a wrapper crate that pinned
   smoltcp 0.12 — the release with a TCP sequence-number underflow panic — and
@@ -87,6 +150,152 @@ and its meaning.
   What the device sees is the same — the same handshake, the same windows, the
   same UDP path — and the tests that drive it are new: a segment that opens a
   connection, the bytes that travel each way, and a datagram in and out.
+- **The Android app and the client library agree about which invite codes are
+  valid.** The Android codec says it mirrors `nexapipe_client::provisioning`
+  and that both must accept and reject the same codes, because one writes
+  what the other reads. They did not, in five places, and the Android side was
+  the permissive one in every one of them. A parameter's name decided whether
+  it was read at all, so a code that carried its secret under a
+  differently-cased name lost the secret: the desktop refused the code
+  outright, and the app kept the credential and authenticated with it. A
+  malformed escape sequence was kept as a literal `%`, where the desktop
+  refused the code and the app imported it as an endpoint with a name of `%ZZ`
+  in it. Bytes that were not UTF-8 became replacement characters, so the same
+  code named an endpoint on the desktop and named something else on the app. A
+  parameter with no name was dropped and the rest read, where the desktop
+  refuses the code. And a code past the hard limit was parsed in full, where
+  the desktop refuses it — work an attacker gets for free. The tests are on
+  both sides and they check the same codes, because the point of the change is
+  that the two halves agree, not that either is right.
+- **The node id stays out of the Android log panel.** The node id is the
+  reachability credential: on a server started with `[auth] enabled = false` —
+  the default, and what the shipped example config uses — anybody who learns
+  it completes the handshake and reaches every route. The log panel keeps the
+  last hundred lines, and a screenshot of it is a screenshot of the machine's
+  inventory, so nine call sites already truncate the id to its first eight
+  characters. Seven did not: adding, removing, renaming and re-mapping an
+  endpoint, the two lines the invite importer writes, and the domain mapping
+  the connector logs — the importer truncated the very same value for its
+  toast four lines after writing it in full. The rule is now checked over the
+  whole app rather than over the call sites this change touched, so the next
+  call site that forgets it is caught too.
+- **An issued credential is filed under the client it was issued for.** The
+  credential names the client it was issued for, and the client refuses an
+  answer that names a different one, so the client id is the whole of the
+  match. The positional fallback handed an endpoint a credential the server
+  never issued to it, while the endpoint the credential was issued for got
+  none.
+
+### Fixed
+
+- **A UDP flow is charged to the process byte budget.** The L4 UDP flow
+  allocated a 64 KiB receive buffer, a 4 KiB send buffer and a frame buffer
+  per flow, and took no reservation — unlike the TCP path, whose copy buffers
+  are charged by the same budget. The ceiling in `[limits] max_body_bytes`
+  documents that the per-stream copy buffers are charged there too, so the
+  largest per-stream buffer in the L4 path was the one the ceiling never saw:
+  with the defaults, one authenticated peer could hold about a gigabyte of
+  uncharged buffers, plus a socket per flow. The flow now takes one
+  reservation for all four buffers it holds before the first of them is
+  allocated, and a flow that cannot pay is refused with `BackendFailed`
+  rather than running anyway. The budget exists to refuse, not to warn.
+- **A UDP flow that cannot bind its socket is answered with a status.** The
+  bind is the one step of a flow that can fail for reasons that have nothing
+  to do with the backend — an exhausted descriptor table, a host with IPv6
+  disabled. It was raised as an error and the client was left with a closed
+  tunnel and no answer. It is now answered the way the other failures are: one
+  status byte, so the client can tell a backend it could not reach from a
+  server that closed the tunnel without answering.
+- **A route's own flow bounds are held to the deadline ceiling.**
+  `flow_timeout_secs` and `idle_timeout_secs` on a route were checked against
+  zero and nothing else, while the server-wide equivalents in `[timeouts]` are
+  refused above 86 400 s — precisely because a bound that long never fires
+  within a process lifetime. A route's own bound overrides the server-wide
+  one, so a route could carry a century and make the flow effectively
+  unbounded. Both keys are now refused above the same ceiling, with a message
+  naming the key and the ceiling.
+- **A WebSocket upgrade the backend refuses carries the backend's body.** A
+  backend that answers an upgrade request with a refusal — a 403, a 401 —
+  had its body dropped, and the client was handed an empty answer that said
+  nothing about why the upgrade was refused. The body is forwarded now, with
+  a length of its own, so the framing never disagrees with the bytes.
+- **That refusal body is read under the response budget.** Reading the
+  backend's refusal body was a read with no deadline on it, so a backend that
+  sent a head and then went quiet held the request — and the connection — open
+  for as long as it liked. It is now read under the same response deadline as
+  every other body.
+- **A WebSocket upgrade does not carry a header the client nominated.** The
+  `Connection` header lists the names that are hop-by-hop for that message, so
+  `Connection: X-Internal` means `X-Internal` is for this hop only and must
+  not be forwarded. The ordinary request path already dropped those names,
+  and so does the client's own local proxy — but the upgrade path had only the
+  fixed hop-by-hop list, so a header the client had explicitly marked as
+  hop-by-hop was handed to the third-party backend. A header that one path
+  drops and another forwards is a header whose presence depends on the path
+  the request took. `Connection` and `Upgrade` are the two that stay: the
+  upgrade is what the request is for, and a backend that does not see them
+  does not switch protocols.
+- **A client that refuses gzip is not answered with it.** The negotiation was
+  a substring test: `Accept-Encoding: gzip;q=0` contains "gzip", so the proxy
+  compressed the body and the client — which had just said it cannot decode
+  gzip — was handed bytes it had no way to read. `gzip;q=0` is the client
+  saying no (RFC 9110 §12.5.3), and the answer now reads the header as the
+  list it is: a coding with a quality of zero is refused, a coding with no
+  quality is asked for at full weight, and `br, gzip;q=0.5` accepts gzip at
+  half a weight while the rest of the list stands.
+- **A backend's stale content-length does not cut the answer.** A message that
+  arrives with both a `Transfer-Encoding` and a `Content-Length` has its
+  length overridden by the encoding (RFC 9112 §6.1, rule 3). The
+  `Transfer-Encoding` was dropped as a hop-by-hop header and the
+  `Content-Length` was kept, so the client was served a body cut to a length
+  that described a framing the forwarded body did not have. The length goes
+  with the header that overrode it.
+- **A partial answer is not compressed.** A `Content-Range` names bytes of a
+  representation, and a content coding is a property of the whole
+  representation: the gzip stream of one range is not the encoding of that
+  representation, and two ranges cannot be put back together afterwards. A
+  `206`, or any answer carrying a `Content-Range`, is now sent as the backend
+  framed it.
+- **A body the plaintext listener refuses is refused with its own status.** A
+  body over the limit, a body that did not arrive in time and a body that
+  could not be read were all answered with a 502 — which blames the backend,
+  for a request that never reached one. A client that reads a 502 that way
+  may send the same body again. The three failures are now answered the way
+  the tunnel path already answers them: 413, 408 and 400.
+- **A duplicated backend is counted once per health round.** The health
+  checker counted the same backend once per entry it appeared under, so a
+  route that named the same backend twice was failed twice by one probe and
+  taken out of rotation by a single round's worth of noise. It is counted
+  once.
+
+### Fixed
+
+- **The client does not record its own refusal as a backend failure.** A full
+  connection pool and a credential replaced mid-dial are refusals the client
+  made, not facts about the backend. Both reached the place where every
+  non-configuration error was folded into a health verdict, so a backend that
+  was answering — and holding ten live connections open — was written into
+  the health table as unreachable. The consequences were both about the wrong
+  thing: the health snapshot reported a healthy backend as down and could flip
+  the "any reachable" answer off, and with a multi-backend domain the marked
+  backend was dropped from the candidates, so the balancer steered every later
+  request to the other backends until the next probe round — 30 to 35 seconds
+  away. A pool refusal and a replaced credential now have their own errors,
+  and those pass through without a verdict. The verdict is written only by
+  evidence that the backend failed: a dial or handshake that did not come
+  about, or a probe.
+- **The client's first write is inside the attempt's budget.** The retry loop
+  documents one budget for every attempt and applies it to opening the
+  stream, but the payload write that followed was not under it. A stream
+  write waits for the peer to grant flow-control credit, so a peer that takes
+  the stream and then stops reading leaves the write pending for good: the
+  attempt's deadline never fires, and the request hangs instead of failing at
+  the budget. The payload is not small on the paths that use it — the HTTP
+  path sends the filtered head plus the body that came with it, and the TLS
+  path the whole ClientHello. The write is now under the same deadline as the
+  open, and a timeout is treated the way the open's timeout already is: the
+  connection is discarded and the attempt ends, within the same overall
+  budget.
 
 ### Fixed
 

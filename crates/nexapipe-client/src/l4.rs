@@ -27,7 +27,6 @@
 use crate::ClientError;
 use crate::endpoint_group::{EndpointGroup, PooledConnection};
 use crate::local_proxy::open_stream_with_retry_until;
-use iroh::EndpointId;
 use iroh::endpoint::{RecvStream, SendStream};
 use nexapipe_proto::protocol::Protocol;
 use std::sync::Arc;
@@ -53,12 +52,47 @@ const FLOW_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90
 /// can last minutes, so it cannot be given back as soon as the first
 /// response arrives. The pool keeps the connection either way: the flow
 /// borrowed it.
+///
+/// **The server's status byte is not read here.** It is the first byte the
+/// server sends, so it is read as part of the first read of the reply — see
+/// [`TunnelReader::read_status`]. A caller that waits for it before sending
+/// its first payload bytes puts a round trip between the application and the
+/// backend that the tunnel does not need.
 pub async fn open_tcp(
     endpoint_group: &Arc<EndpointGroup>,
     host: &str,
     port: u16,
-) -> Result<(PooledConnection, SendStream, RecvStream), ClientError> {
+) -> Result<(PooledConnection, SendStream, TunnelReader), ClientError> {
     open(endpoint_group, L4Proto::Tcp, host, port).await
+}
+
+/// Opens a TCP flow to `host:port` **and waits for the server's answer**.
+///
+/// Use this when the answer has to come before the flow starts. A caller that
+/// answers its own client "200 Connection Established" has to know that the
+/// far side is up before it says so — the answer promises something the
+/// tunnel cannot deliver if the server refuses it.
+///
+/// A caller that has nothing to promise can use [`open_tcp`] and read the
+/// answer as part of the flow: the answer is the first byte the server sends,
+/// and waiting for it before the first payload bytes go out puts a round trip
+/// between the application and the backend that the tunnel does not need.
+pub async fn open_tcp_checked(
+    endpoint_group: &Arc<EndpointGroup>,
+    host: &str,
+    port: u16,
+) -> Result<(PooledConnection, SendStream, TunnelReader), ClientError> {
+    let (pooled, send, mut reader) = open(endpoint_group, L4Proto::Tcp, host, port).await?;
+    accept_tunnel(
+        endpoint_group,
+        &pooled,
+        &mut reader,
+        L4Proto::Tcp,
+        host,
+        port,
+    )
+    .await?;
+    Ok((pooled, send, reader))
 }
 
 /// Open a UDP flow to `host:port`.
@@ -68,8 +102,98 @@ pub async fn open_udp(
     endpoint_group: &Arc<EndpointGroup>,
     host: &str,
     port: u16,
-) -> Result<(PooledConnection, SendStream, RecvStream), ClientError> {
+) -> Result<(PooledConnection, SendStream, TunnelReader), ClientError> {
     open(endpoint_group, L4Proto::Udp, host, port).await
+}
+
+/// The payload half of a tunnel, with the server's status taken off the front.
+///
+/// The status byte is the first byte the server sends, so the first read of
+/// the stream carries it — and may carry the first payload bytes with it.
+/// Those bytes are kept and handed to the reads below, because dropping them
+/// would truncate the first request of every client that pipelines its
+/// payload behind the preface.
+pub struct TunnelReader {
+    recv: RecvStream,
+    /// The bytes that came after the status byte, waiting to be read.
+    leftover: Vec<u8>,
+    /// How far into `leftover` the next read starts.
+    offset: usize,
+}
+
+impl TunnelReader {
+    fn new(recv: RecvStream) -> Self {
+        Self {
+            recv,
+            leftover: Vec::new(),
+            offset: 0,
+        }
+    }
+
+    /// Reads the server's status byte — the answer to the preface.
+    ///
+    /// It is read here, as part of the first read of the stream, rather than
+    /// before the stream is used: a caller that waits for it before sending
+    /// its first payload bytes puts a round trip between the application and
+    /// the backend that the tunnel does not need. The server is dialling the
+    /// backend during that round trip, and the payload can be on the wire
+    /// while it does.
+    ///
+    /// The cost of that is that a refusal arrives **after** the payload has
+    /// gone out, so a caller has to be ready to end the flow on one. Nothing
+    /// is lost when it does: the server refuses before it forwards anything,
+    /// so the bytes are dropped rather than delivered.
+    ///
+    /// The answer has to come inside the flow's budget: a server that never
+    /// answers the preface must not hold the flow open for a timeout of its
+    /// own.
+    pub async fn read_status(
+        &mut self,
+        proto: L4Proto,
+        host: &str,
+        port: u16,
+    ) -> Result<Status, ClientError> {
+        let deadline = tokio::time::Instant::now() + FLOW_OPEN_TIMEOUT;
+        let unannounced = |detail: String| {
+            ClientError::ReceiveError(format!(
+                "the server closed the {} tunnel to {host}:{port} before answering{detail}",
+                proto.name()
+            ))
+        };
+
+        // One read, and it may carry the first payload bytes as well: the
+        // status byte is the first byte, and the rest of what arrived is
+        // payload that has to be kept.
+        let mut buf = vec![0u8; 4096];
+        let n = match tokio::time::timeout_at(deadline, self.recv.read(&mut buf)).await {
+            Ok(Ok(Some(n))) => n,
+            // Zero bytes: the peer finished the stream without saying anything
+            // about the flow.
+            Ok(Ok(_)) => return Err(unannounced(String::new())),
+            Ok(Err(e)) => return Err(unannounced(format!(": {e}"))),
+            Err(_) => return Err(ClientError::TimeoutError),
+        };
+        let status = Status::from_byte(buf[0]);
+        self.leftover.extend_from_slice(&buf[1..n]);
+        Ok(status)
+    }
+
+    /// Reads the payload: what came with the status first, then the stream.
+    ///
+    /// The shape is the one the copy loops expect from a stream: `Ok(None)`
+    /// when the stream ended, `Ok(Some(n))` with the bytes that were read.
+    pub async fn read(&mut self, buf: &mut [u8]) -> Result<Option<usize>, ClientError> {
+        if self.offset < self.leftover.len() {
+            let n = buf.len().min(self.leftover.len() - self.offset);
+            buf[..n].copy_from_slice(&self.leftover[self.offset..self.offset + n]);
+            self.offset += n;
+            return Ok(Some(n));
+        }
+        self.recv
+            .read(buf)
+            .await
+            .map_err(|e| ClientError::ReceiveError(e.to_string()))
+    }
 }
 
 /// Write the preface and wait for the server's answer, on a stream the caller opened.
@@ -111,88 +235,75 @@ async fn open(
     proto: L4Proto,
     host: &str,
     port: u16,
-) -> Result<(PooledConnection, SendStream, RecvStream), ClientError> {
+) -> Result<(PooledConnection, SendStream, TunnelReader), ClientError> {
     let preface = Preface::new(proto, host, port).to_bytes().map_err(|e| {
         ClientError::InvalidConfig(format!("cannot ask the server for {host}:{port}: {e}"))
     })?;
 
-    let mut last_err: Option<ClientError> = None;
     // **One budget for the whole flow.** The outer attempts and the inner
     // ones shared nothing: each of the nine dials had a timeout of its own,
     // and the answer had another, so a flow that could not be opened could
     // take six minutes to say so.
     let deadline = tokio::time::Instant::now() + FLOW_OPEN_TIMEOUT;
-    // Whose health each attempt is spent on: see `open_stream_with_retry`, which
-    // keeps the same list for the failures it discards on its own. Both lists
-    // are writable only once every attempt has failed, so neither can condemn a
-    // backend for having been idle.
-    let mut tried: Vec<EndpointId> = Vec::new();
 
-    // The retry exists for the same reason it does on the HTTP path: a pooled connection
-    // may have been closed by the peer without anything noticing, and the failure only
-    // shows up on the first write or read. A refusal is final and breaks out early.
-    for _attempt in 1..=crate::local_proxy::OPEN_ATTEMPTS {
-        // `send` stays untouched: the caller writes the payload once the server has
-        // accepted the flow, so nothing is pipelined behind the preface.
-        let (pooled, send, mut recv) = match open_stream_with_retry_until(
-            endpoint_group,
-            host,
-            Some(&preface),
-            Protocol::L4,
-            deadline,
-        )
-        .await
-        {
-            Ok(streams) => streams,
-            Err(e) => {
-                // The helper has already said what it knows about the
-                // attempts it spent. This reports the earlier ones recorded
-                // above, which would otherwise leave no trace: `tried` is
-                // dropped the moment this function returns, and a backend
-                // that never answered the preface has every later request
-                // dialling it again first.
-                endpoint_group.record_request_failures(&tried);
-                return Err(e);
-            }
-        };
+    // The stream is opened with the preface on it, and the helper retries on
+    // a fresh connection when the stream cannot be opened or the preface
+    // cannot be written — which is the case a stale pooled connection looks
+    // like.
+    //
+    // **The server's answer is not waited for here.** It is the first byte
+    // the server sends, so it is read as part of the first read of the reply
+    // — see [`accept_tunnel`]. Waiting for it here would put a round trip
+    // between the application and the backend that the tunnel does not need:
+    // the server is dialling the backend during that round trip, and the
+    // application's first bytes could be on the wire while it does.
+    let (pooled, send, recv) =
+        open_stream_with_retry_until(endpoint_group, host, Some(&preface), Protocol::L4, deadline)
+            .await?;
 
-        match read_status_until(&mut recv, proto, host, port, deadline).await {
-            Ok(status) if status.is_ok() => return Ok((pooled, send, recv)),
-            Ok(status) if status == Status::TooManyFlows => {
-                // The server is carrying as many flows on this connection as
-                // it allows. That is a statement about the **connection**,
-                // not about this flow, and another connection can carry it:
-                // the connection is marked as full so that the pool stops
-                // handing it out, and the flow is tried again on another
-                // one.
-                pooled.saturate();
-                last_err = Some(status_error(status, proto, host, port));
+    Ok((pooled, send, TunnelReader::new(recv)))
+}
+
+/// Reads the server's answer to a tunnel that was just opened, and says what
+/// it means.
+///
+/// A refusal is a statement about the flow, and the connection it came on is
+/// marked so the pool stops handing it out. A tunnel the server never
+/// answered is a connection that is not one to hand back: it is closed, and
+/// the backend it reached is recorded as one that did not answer.
+///
+/// **Nothing is lost when a flow ends here.** The server refuses before it
+/// forwards anything, so the bytes that went out with the preface are
+/// dropped rather than delivered, and the application opens another
+/// connection.
+pub async fn accept_tunnel(
+    endpoint_group: &Arc<EndpointGroup>,
+    pooled: &PooledConnection,
+    reader: &mut TunnelReader,
+    proto: L4Proto,
+    host: &str,
+    port: u16,
+) -> Result<(), ClientError> {
+    match reader.read_status(proto, host, port).await {
+        Ok(status) if status.is_ok() => Ok(()),
+        Ok(Status::TooManyFlows) => {
+            // The connection is carrying as many flows as it allows: the pool
+            // stops handing it out, and the next flow gets another one.
+            pooled.saturate();
+            Err(status_error(Status::TooManyFlows, proto, host, port))
+        }
+        Ok(status) => Err(status_error(status, proto, host, port)),
+        Err(e) => {
+            // The server never answered. Whatever the connection was carrying
+            // is gone with it, and the backend it reached is one that did not
+            // answer.
+            pooled.close(b"the server never answered the preface");
+            if let Some(node) = pooled.node() {
+                endpoint_group.record_request_failures(&[node]);
             }
-            Ok(status) => {
-                // The server understood us and said no. Retrying the same request on a
-                // fresh connection cannot change the answer.
-                return Err(status_error(status, proto, host, port));
-            }
-            Err(e) => {
-                // Discarded, not returned: the server did not answer the
-                // preface, which is what a connection whose path died looks
-                // like. Handing it back would put it straight on top of the
-                // pool (it is last-in-first-out), so every remaining attempt
-                // would ask the same dead connection.
-                //
-                // Closed, not dropped: a watcher task holds another handle to
-                // it, so dropping this one would leave the connection open
-                // until that task noticed — holding a slot in the meantime.
-                tried.extend(pooled.node());
-                pooled.discard(b"the server never answered the preface");
-                last_err = Some(e);
-            }
+            Err(e)
         }
     }
-
-    endpoint_group.record_request_failures(&tried);
-
-    Err(last_err.unwrap_or(ClientError::TimeoutError))
 }
 
 /// Read the single status byte, mapping a missing or late one to a readable error.
@@ -349,15 +460,23 @@ mod tests {
         }
     }
 
-    /// A flow the server refuses for carrying too many flows is tried on
-    /// another connection.
+    /// A flow the server refuses for carrying too many flows is told to the
+    /// caller, and the next flow goes to another connection.
     ///
     /// "Too many flows" says something about the connection, not about the
     /// flow: the server counts the flows on one connection and refuses the
     /// one that does not fit. Another connection can carry it, so the flow is
     /// not lost to a ceiling the client cannot see.
+    ///
+    /// The refusal is **read by the caller** rather than waited for by the
+    /// open: a client that waits for the answer before it writes its payload
+    /// puts a round trip between the application and the backend that the
+    /// tunnel does not need. The cost of that is that the caller has to end
+    /// the flow on a refusal — and nothing is lost when it does, because the
+    /// server refuses before it forwards anything.
     #[tokio::test]
-    async fn a_flow_refused_for_too_many_flows_is_tried_on_another_connection() {
+    async fn a_flow_refused_for_too_many_flows_is_reported_and_the_next_one_does_not_share_the_connection()
+     {
         let server = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
             .alpns(vec![ALPN.to_vec()])
             .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
@@ -382,15 +501,138 @@ mod tests {
         let pool = IrohConnectionPool::new_with_endpoint(client, server_addr);
         let group = Arc::new(EndpointGroup::new_with_single_pool(pool).await);
 
-        let flow = open_tcp(&group, "db.test", 5432)
+        // The first flow is the one the server refuses.
+        let (pooled, _send, mut reader) = open_tcp(&group, "db.test", 5432)
             .await
-            .expect("the flow opens on another connection");
+            .expect("the tunnel opens");
+        let refused =
+            accept_tunnel(&group, &pooled, &mut reader, L4Proto::Tcp, "db.test", 5432).await;
+        assert!(
+            refused.is_err(),
+            "the server refused the flow, and the caller has to hear about it"
+        );
+        // The flow ends, and the connection goes back to the pool — marked, so
+        // that the pool does not hand it out again.
+        drop(pooled);
+
+        // The next flow does not go to the connection the server said was full.
+        let (_next, _send, mut reader) = open_tcp(&group, "db.test", 5432)
+            .await
+            .expect("the next flow opens");
+        let accepted_by_the_server =
+            accept_tunnel(&group, &_next, &mut reader, L4Proto::Tcp, "db.test", 5432).await;
+        assert!(
+            accepted_by_the_server.is_ok(),
+            "the second connection carries the flow"
+        );
         assert_eq!(
             accepted.load(Ordering::Relaxed),
             2,
-            "the refused flow was tried on a second connection"
+            "the refused flow was not tried on the connection that was full"
         );
-        drop(flow);
+    }
+
+    /// The application's first bytes go out **before** the server's answer
+    /// comes back.
+    ///
+    /// The status byte is the first byte the server sends, so a client that
+    /// waits for it before writing its payload puts a round trip between the
+    /// application and the backend — and the server is dialling the backend
+    /// during that round trip, so the wait is pure overhead.
+    ///
+    /// The far side here is what makes the difference visible: it holds its
+    /// answer back until it has read the payload. A client that waited for
+    /// the answer first would wait for ever, so this test fails by hanging
+    /// rather than by an assertion — the timeout below turns that into a
+    /// failure.
+    #[tokio::test]
+    async fn the_payload_goes_out_before_the_answer_comes_back() {
+        let server = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("the far side binds");
+        let server_addr = server.addr();
+        tokio::spawn(serve_answering_after_the_payload(server));
+
+        let client = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .alpns(vec![ALPN.to_vec()])
+            .bind_addr(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .unwrap()
+            .bind()
+            .await
+            .expect("this side binds");
+        let pool = IrohConnectionPool::new_with_endpoint(client, server_addr);
+        let group = Arc::new(EndpointGroup::new_with_single_pool(pool).await);
+
+        let (pooled, mut send, mut reader) = open_tcp(&group, "db.test", 5432)
+            .await
+            .expect("the tunnel opens");
+
+        // The payload goes out first: the far side is waiting for it.
+        send.write_all(b"payload")
+            .await
+            .expect("the payload goes out");
+
+        // And the answer comes after it.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            accept_tunnel(&group, &pooled, &mut reader, L4Proto::Tcp, "db.test", 5432),
+        )
+        .await
+        .expect("the answer arrives once the payload has been read")
+        .expect("the server accepted the flow");
+    }
+
+    /// The far side that answers only after it has read the payload.
+    ///
+    /// The order is the point: a client that waits for the answer before it
+    /// writes its payload would wait for ever, and this is what would catch
+    /// it.
+    async fn serve_answering_after_the_payload(endpoint: iroh::Endpoint) {
+        while let Some(incoming) = endpoint.accept().await {
+            tokio::spawn(async move {
+                let Ok(accepting) = incoming.accept() else {
+                    return;
+                };
+                let Ok(connection) = accepting.await else {
+                    return;
+                };
+                let Ok((mut send, mut recv)) = connection.accept_bi().await else {
+                    return;
+                };
+                // The preface: its length is known once the fourth byte has
+                // been read.
+                let mut header = [0u8; 4];
+                if recv.read_exact(&mut header).await.is_err() {
+                    return;
+                }
+                let mut rest = vec![0u8; usize::from(header[3]) + 2];
+                if recv.read_exact(&mut rest).await.is_err() {
+                    return;
+                }
+                // The payload, which the client must not wait for the answer
+                // to send.
+                let mut payload = [0u8; 7];
+                if recv.read_exact(&mut payload).await.is_err() {
+                    return;
+                }
+                // And only now the answer.
+                let _ = send.write_all(&[Status::Ok.as_byte()]).await;
+                // Finished, not dropped: a QUIC send stream that is dropped
+                // without being finished resets the stream, and the answer
+                // would be discarded on its way to the client.
+                let _ = send.finish();
+                // And the connection is held open until the client has read
+                // it: dropping the connection's last handle closes it, and a
+                // client that is still waiting for the answer would see the
+                // close rather than the answer.
+                let mut sink = [0u8; 1];
+                let _ = recv.read(&mut sink).await;
+            });
+        }
     }
 
     #[test]
