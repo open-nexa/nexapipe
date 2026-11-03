@@ -86,6 +86,18 @@ and its meaning.
 
 ### Changed
 
+- **The TUN proxy's application bytes no longer wait for the server's answer.**
+  The status byte is the first byte the server sends on an L4 tunnel, so a
+  client that waited for it before writing the application's first bytes put a
+  round trip between the application and the backend that the tunnel does not
+  need — and the server spends that round trip dialling the backend.
+  The client's first bytes now go out while the dial is still running, and the
+  answer is read as part of the first read of the reply.
+  Nothing is lost when the server refuses the tunnel: it refuses before it
+  forwards anything, so the bytes are dropped rather than delivered, and the
+  application opens another connection. The desktop's local proxy still waits
+  for the answer, because it answers its own client "200 Connection
+  Established" and may not promise a tunnel the server is about to refuse.
 - **The TUN proxy's user-space TCP/IP stack is ours now, and smoltcp comes
   from crates.io.** The client used to link a wrapper crate that pinned
   smoltcp 0.12 — the release with a TCP sequence-number underflow panic — and
