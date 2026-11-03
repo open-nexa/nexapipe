@@ -122,6 +122,11 @@ async fn open(
     // and the answer had another, so a flow that could not be opened could
     // take six minutes to say so.
     let deadline = tokio::time::Instant::now() + FLOW_OPEN_TIMEOUT;
+    // The clock of this opening: from here to the status byte is what the
+    // application is waiting for, and it is the number a slow tunnel is
+    // measured by. The phases are logged with it, because the total alone
+    // cannot say whether the time went into the network or into the server.
+    let open_started = std::time::Instant::now();
     // Whose health each attempt is spent on: see `open_stream_with_retry`, which
     // keeps the same list for the failures it discards on its own. Both lists
     // are writable only once every attempt has failed, so neither can condemn a
@@ -134,6 +139,7 @@ async fn open(
     for _attempt in 1..=crate::local_proxy::OPEN_ATTEMPTS {
         // `send` stays untouched: the caller writes the payload once the server has
         // accepted the flow, so nothing is pipelined behind the preface.
+        let attempt_started = std::time::Instant::now();
         let (pooled, send, mut recv) = match open_stream_with_retry_until(
             endpoint_group,
             host,
@@ -155,9 +161,21 @@ async fn open(
                 return Err(e);
             }
         };
+        // The stream is open and the preface is on it: what is left is the
+        // round trip the status byte takes.
+        let stream_ms = attempt_started.elapsed().as_millis() as u64;
 
+        let status_started = std::time::Instant::now();
         match read_status_until(&mut recv, proto, host, port, deadline).await {
-            Ok(status) if status.is_ok() => return Ok((pooled, send, recv)),
+            Ok(status) if status.is_ok() => {
+                tracing::debug!(
+                    "L4 {}: {host}:{port} opened in {} ms (stream {stream_ms} ms, status {} ms)",
+                    proto.name(),
+                    open_started.elapsed().as_millis(),
+                    status_started.elapsed().as_millis()
+                );
+                return Ok((pooled, send, recv));
+            }
             Ok(status) if status == Status::TooManyFlows => {
                 // The server is carrying as many flows on this connection as
                 // it allows. That is a statement about the **connection**,

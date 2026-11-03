@@ -73,6 +73,16 @@ and its meaning.
   already do it, rather than a `license-file` pointing at the repository root
   — which is what keeps the manifest free of the warning cargo gives for
   naming both.
+- **Opening a tunnel is measured in the three phases it is made of.** A slow
+  tunnel used to be one number — the flow took a long time — which cannot say
+  whether the time went into this process or onto the network. The server now
+  publishes `nexapipe_l4_open_duration_ms`, `nexapipe_l4_route_duration_ms` and
+  `nexapipe_l4_backend_duration_ms`: the whole open, the route lookup inside
+  it, and the backend connection (or, for a UDP flow, the resolution) the rest
+  of it is.
+  The client logs the same split from its own side — the time the stream took
+  to open and the time the status byte took to come back — so the two ends can
+  be compared against each other.
 
 ### Changed
 

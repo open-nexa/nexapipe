@@ -142,6 +142,37 @@ impl Drop for FlowGuard {
     }
 }
 
+/// What one flow's opening cost, in the phases it is made of.
+///
+/// The three are what a slow tunnel is made of: the route lookup, the backend
+/// connection (or resolution), and the whole open around them. They are kept
+/// apart because the whole open also contains the round trip to the client,
+/// and a number that mixes the two cannot say whether the time was spent in
+/// this process or on the network.
+#[derive(Debug)]
+struct OpenCost {
+    /// When the preface was read: the clock every phase is measured against.
+    started: std::time::Instant,
+    /// From the preface being read to the status byte being written.
+    total_ms: u64,
+    /// The route lookup.
+    route_ms: u64,
+    /// The backend connection (TCP) or resolution (UDP).
+    backend_ms: u64,
+}
+
+impl OpenCost {
+    /// A cost that starts counting now.
+    fn new() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            total_ms: 0,
+            route_ms: 0,
+            backend_ms: 0,
+        }
+    }
+}
+
 /// Serve an L4 connection that arrived over an iroh bi-stream.
 ///
 /// `initial` holds the bytes already read from `recv` (at least the first).
@@ -216,6 +247,10 @@ where
         Err(PrefaceFailure::Io(e)) => return Err(e.into()),
     };
 
+    // The clock of this flow's opening starts here: the preface is in, and
+    // everything the flow costs from now on is what the client is waiting for.
+    let mut cost = OpenCost::new();
+
     // A client whose allowlist does not name this host is refused exactly the
     // way an unconfigured one is — `NoRoute`, not a distinct status, so the
     // answer cannot be used to probe which hosts exist behind the tunnel.
@@ -233,6 +268,7 @@ where
             preface.host,
             preface.port
         );
+        metrics::METRICS.record_l4_open(cost.total_ms, 0, 0);
         return Ok(());
     }
 
@@ -250,9 +286,11 @@ where
     // in the log with it.
     crate::log::record_request_on_span(&span, preface.proto.name(), &target);
 
+    let lookup_started = std::time::Instant::now();
     let lookup = config
         .get_l4_backend(&preface.host, preface.port, mode)
         .await;
+    let route_ms = lookup_started.elapsed().as_millis() as u64;
 
     let unhealthy = matches!(lookup, BackendLookup::Unavailable);
     let Some(route) = lookup.backend() else {
@@ -285,6 +323,7 @@ where
         // counted alongside requests — a rate made of both would be a rate of
         // two different things.
         metrics::METRICS.record_l4_flow(preface.proto.name(), logged_as);
+        metrics::METRICS.record_l4_open(cost.total_ms, route_ms, 0);
         span.record("status", logged_as as u64);
         crate::log::log_access_flow(
             request_id,
@@ -313,6 +352,7 @@ where
             target
         );
         metrics::METRICS.record_l4_flow(preface.proto.name(), 429);
+        metrics::METRICS.record_l4_open(cost.total_ms, route_ms, 0);
         span.record("status", 429u64);
         crate::log::log_access_flow(
             request_id,
@@ -347,6 +387,10 @@ where
     // One sniffer for the whole flow, shared by its two ends: what the client
     // said and what the origin answered are one answer between them.
     let sniffer = Arc::new(FlowSniffer::new());
+    // What this flow's opening cost. The phases are filled in as they happen —
+    // the backend one by the function that connects, the total once the status
+    // byte is on the wire — and recorded when the flow ends.
+    cost.route_ms = route_ms;
     let result = match preface.proto {
         L4Proto::Tcp => {
             let flow_timeout = route.flow_timeout.unwrap_or(deadlines.l4_flow);
@@ -357,15 +401,39 @@ where
                 connect_timeout,
                 flow_timeout,
                 &sniffer,
+                &mut cost,
             )
             .await
         }
         L4Proto::Udp => {
             let idle = route.idle_timeout.unwrap_or(deadlines.l4_idle);
             let flow_timeout = route.flow_timeout.unwrap_or(deadlines.l4_flow);
-            serve_udp(stream, &route.backend, leftover, idle, flow_timeout).await
+            serve_udp(
+                stream,
+                &route.backend,
+                leftover,
+                idle,
+                flow_timeout,
+                &mut cost,
+            )
+            .await
         }
     };
+
+    // What the flow's opening cost, now that it is over. A flow that failed
+    // before it reached a backend has no backend phase, and says so with a
+    // zero rather than with a number nobody measured.
+    metrics::METRICS.record_l4_open(cost.total_ms, cost.route_ms, cost.backend_ms);
+    if cost.total_ms > 0 {
+        tracing::debug!(
+            "L4 {}: {} opened in {} ms (route {} ms, backend {} ms)",
+            preface.proto.name(),
+            target,
+            cost.total_ms,
+            cost.route_ms,
+            cost.backend_ms
+        );
+    }
 
     // What the flow said about itself, now that it has said it. `None` for a
     // flow that said nothing this proxy can read, which is most of them.
@@ -426,6 +494,7 @@ async fn serve_tcp<S>(
     connect_timeout: Duration,
     flow_timeout: Duration,
     sniffer: &Arc<FlowSniffer>,
+    cost: &mut OpenCost,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -435,16 +504,23 @@ where
         anyhow::bail!("cannot parse backend address {backend:?} as host:port");
     };
 
+    let backend_started = std::time::Instant::now();
     let mut backend_stream = match crate::backend_conn::connect(&host, port, connect_timeout).await
     {
         Ok(s) => s,
         Err(e) => {
             let _ = write_status(&mut stream, Status::BackendFailed).await;
+            cost.backend_ms = backend_started.elapsed().as_millis() as u64;
+            cost.total_ms = cost.started.elapsed().as_millis() as u64;
             return Err(e);
         }
     };
+    cost.backend_ms = backend_started.elapsed().as_millis() as u64;
 
     write_status(&mut stream, Status::Ok).await?;
+    // The open is over the moment the status byte is on the wire: everything
+    // after this is the flow itself, which the access log times separately.
+    cost.total_ms = cost.started.elapsed().as_millis() as u64;
 
     // The client may have written payload in the same segment as the preface. Those
     // bytes were read off the wire before the backend existed, and dropping them would
@@ -502,6 +578,7 @@ async fn serve_udp<S>(
     leftover: Vec<u8>,
     idle: Duration,
     flow_timeout: Duration,
+    cost: &mut OpenCost,
 ) -> anyhow::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
@@ -511,10 +588,15 @@ where
         anyhow::bail!("cannot parse backend address {backend:?} as host:port");
     };
 
+    // A UDP flow has no dial to make: what it costs is the resolution of the
+    // backend's name, which is the same phase under another name.
+    let backend_started = std::time::Instant::now();
     let target = match resolve_udp_target(&host, port).await {
         Ok(addr) => addr,
         Err(e) => {
             let _ = write_status(&mut stream, Status::BackendFailed).await;
+            cost.backend_ms = backend_started.elapsed().as_millis() as u64;
+            cost.total_ms = cost.started.elapsed().as_millis() as u64;
             return Err(e);
         }
     };
@@ -532,12 +614,16 @@ where
     // off-path attacker from injecting replies into the tunnel.
     if let Err(e) = socket.connect(target).await {
         let _ = write_status(&mut stream, Status::BackendFailed).await;
+        cost.backend_ms = backend_started.elapsed().as_millis() as u64;
+        cost.total_ms = cost.started.elapsed().as_millis() as u64;
         return Err(anyhow::anyhow!(
             "failed to connect UDP socket to {target}: {e}"
         ));
     }
+    cost.backend_ms = backend_started.elapsed().as_millis() as u64;
 
     write_status(&mut stream, Status::Ok).await?;
+    cost.total_ms = cost.started.elapsed().as_millis() as u64;
 
     tracing::debug!("L4 UDP: {} tunnel open (idle timeout {:?})", target, idle);
 
