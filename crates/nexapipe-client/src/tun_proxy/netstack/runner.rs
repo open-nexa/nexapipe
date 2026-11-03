@@ -194,6 +194,25 @@ fn take_frame(
     parts.device.push(frame);
 }
 
+/// A socket for one flow, with the interactive defaults taken off.
+///
+/// The peer is the device's own kernel on the TUN fd, so an acknowledgement
+/// costs a local round trip, not a network one. smoltcp otherwise holds a
+/// small downlink segment behind an unacknowledged one (Nagle) and waits
+/// 10 ms before acknowledging an uplink segment (delayed ACK). Neither buys
+/// anything here and both add latency to small messages.
+fn new_flow_socket(recv_size: usize, send_size: usize) -> tcp::Socket<'static> {
+    let mut socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0u8; recv_size]),
+        tcp::SocketBuffer::new(vec![0u8; send_size]),
+    );
+    socket.set_keep_alive(Some(TCP_KEEP_ALIVE.into()));
+    socket.set_timeout(Some(TCP_IDLE_TIMEOUT.into()));
+    socket.set_nagle_enabled(false);
+    socket.set_ack_delay(None);
+    socket
+}
+
 /// Open a flow for a connection the device started.
 ///
 /// The socket plays the server's part: it listens on the address the device
@@ -217,12 +236,10 @@ fn open_flow(
         return;
     }
 
-    let mut socket = tcp::Socket::new(
-        tcp::SocketBuffer::new(vec![0u8; parts.tcp_recv_buffer_size as usize]),
-        tcp::SocketBuffer::new(vec![0u8; parts.tcp_send_buffer_size as usize]),
+    let mut socket = new_flow_socket(
+        parts.tcp_recv_buffer_size as usize,
+        parts.tcp_send_buffer_size as usize,
     );
-    socket.set_keep_alive(Some(TCP_KEEP_ALIVE.into()));
-    socket.set_timeout(Some(TCP_IDLE_TIMEOUT.into()));
     if socket.listen(syn.dst).is_err() {
         // The address cannot be listened on, so the connection cannot be
         // answered. The device will see the handshake time out.
@@ -393,5 +410,23 @@ fn pump(
             handshaking.remove(&key);
         }
         sockets.remove(handle);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_flow_socket_does_not_delay_small_messages() {
+        let socket = new_flow_socket(4096, 4096);
+        assert!(
+            !socket.nagle_enabled(),
+            "Nagle would hold a small segment behind an unacknowledged one"
+        );
+        assert!(
+            socket.ack_delay().is_none(),
+            "the default delayed ACK waits 10 ms before answering an uplink segment"
+        );
     }
 }
