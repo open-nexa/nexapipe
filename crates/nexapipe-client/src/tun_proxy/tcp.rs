@@ -166,6 +166,9 @@ async fn serve_tcp_flow(
     });
     let count_to_tunnel = flow.counter();
     let count_from_tunnel = flow.counter();
+    // How the half that reads the reply tells the half that writes the
+    // application's bytes that the tunnel is not going to carry anything.
+    let cancel = flow.cancel_handle();
 
     let (mut app_read, mut app_write) = tokio::io::split(stream);
 
@@ -192,6 +195,33 @@ async fn serve_tcp_flow(
     };
 
     let tunnel_to_app = async {
+        // **The server's answer is read here, in the half that reads the
+        // reply** — and not before the flow started. The status byte is the
+        // first byte the server sends, so the first read of the reply carries
+        // it, and the application's own bytes (which the other half is
+        // writing right now) go out while the server is still dialling the
+        // backend.
+        //
+        // Waiting for it before the flow started would put a round trip
+        // between the application and the backend that the tunnel does not
+        // need.
+        if let Err(e) = l4::accept_tunnel(
+            &ctx.endpoint_group,
+            &pooled,
+            &mut tunnel_recv,
+            l4::L4Proto::Tcp,
+            &domain,
+            port,
+        )
+        .await
+        {
+            jni_log!("[tun-proxy] TCP {}:{} refused: {}", domain, port, e);
+            // The tunnel is not going to carry anything, so the other half
+            // stops too: it would otherwise sit on a tunnel the server has
+            // already closed.
+            cancel.cancel();
+            return;
+        }
         let mut buf = vec![0u8; COPY_BUF_SIZE];
         loop {
             match tunnel_recv.read(&mut buf).await {

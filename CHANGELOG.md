@@ -73,9 +73,61 @@ and its meaning.
   already do it, rather than a `license-file` pointing at the repository root
   — which is what keeps the manifest free of the warning cargo gives for
   naming both.
+- **Opening a tunnel is measured in the three phases it is made of.** A slow
+  tunnel used to be one number — the flow took a long time — which cannot say
+  whether the time went into this process or onto the network. The server now
+  publishes `nexapipe_l4_open_duration_ms`, `nexapipe_l4_route_duration_ms` and
+  `nexapipe_l4_backend_duration_ms`: the whole open, the route lookup inside
+  it, and the backend connection (or, for a UDP flow, the resolution) the rest
+  of it is.
+  The client logs the same split from its own side — the time the stream took
+  to open and the time the status byte took to come back — so the two ends can
+  be compared against each other.
 
 ### Changed
 
+- **A packet on the desktop's TUN costs one allocation, not an allocation and
+  a copy.** The pump read every packet into a buffer and then copied it into
+  a freshly allocated one for the stack, because the stack's sink owns what it
+  is given. Reading straight into that buffer leaves one allocation per
+  packet instead of two and a memcpy of every byte of it.
+  The Android pump keeps the copy: it reads from a file descriptor, and the
+  stable standard library has no way to fill a vector from one. The copy is
+  1,400 bytes per packet, which at the rate a full link carries them is a
+  fraction of a percent of a core.
+- **The TUN proxy's TCP window is a credit, not an allocation.** Every socket
+  the stack opened took four buffers of the window's size — two for the
+  protocol and two for the application's side of the tunnel — so a flow cost
+  four times the window whether it carried a byte or not. The two on the
+  application's side now grow as the flow carries bytes, and a flow that
+  carries nothing holds nothing.
+  Measured with the `tun_flow_memory` example: at a 128 KiB window a flow is
+  257 KiB of address space rather than 512 KiB, and the sixty-four flows a
+  phone may have open cost 16 MiB rather than 32 MiB. The window is still
+  what a flow's steady speed is made of, so raising it is still the way to
+  carry more — but it now costs what the traffic asks for rather than what
+  the window allows.
+- **The TUN proxy holds a hundred and twenty-eight UDP flows, not thirty-two.**
+  A flow that does not fit is dropped rather than refused: the datagram goes
+  nowhere and the application sends it again, which costs a retransmission
+  and shows up as a slow, lossy link rather than as an error.
+  Thirty-two was low enough that an ordinary device reached it — a browser's
+  QUIC connections, a voice call, a game and a push service are four flows
+  between them, and the fifth application to speak UDP found the table full.
+  The memory is not what bounds this: a flow's queue is bounded by the bytes
+  it holds and is only as full as the traffic asks it to be.
+- **The TUN proxy's application bytes no longer wait for the server's answer.**
+  The status byte is the first byte the server sends on an L4 tunnel, so a
+  client that waited for it before writing the application's first bytes put a
+  round trip between the application and the backend that the tunnel does not
+  need — and the server spends that round trip dialling the backend.
+  The client's first bytes now go out while the dial is still running, and the
+  answer is read as part of the first read of the reply.
+  Nothing is lost when the server refuses the tunnel: it refuses before it
+  forwards anything, so the bytes are dropped rather than delivered, and the
+  application opens another connection. The desktop's local proxy still waits
+  for the answer, because it answers its own client "200 Connection
+  Established" and may not promise a tunnel the server is about to refuse.
 - **The TUN proxy's user-space TCP/IP stack is ours now, and smoltcp comes
   from crates.io.** The client used to link a wrapper crate that pinned
   smoltcp 0.12 — the release with a TCP sequence-number underflow panic — and

@@ -156,7 +156,7 @@ where
         // error when it is not — which is why the answer comes after the L4 handshake
         // and not before it.
         let (pooled_conn, mut send, mut recv) =
-            match crate::l4::open_tcp(&endpoint_group, &host, port).await {
+            match crate::l4::open_tcp_checked(&endpoint_group, &host, port).await {
                 Ok(tunnel) => tunnel,
                 Err(e) => {
                     jni_log!(
