@@ -4,12 +4,12 @@
 //! The TCP/IP stack itself is NOT implemented here any more: the hand-written
 //! packet-level TCP state machine (no MSS segmentation, a fixed 65535 window,
 //! one iroh connection per TCP flow, never returned to the pool) was replaced by
-//! the netstack-smoltcp core in `nexapipe-client`'s `tun_proxy` — the same code
+//! the user-space stack in `nexapipe-client`'s `tun_proxy` — the same code
 //! the Android client runs. This module feeds the device's IP packets into that
 //! stack and back:
 //!
 //! ```text
-//! APP → TUN device → shared TunProxy (netstack-smoltcp)
+//! APP → TUN device → shared TunProxy (the client's own user-space stack)
 //!                      ├─ TCP: reverse-lookup the destination virtual IP
 //!                      │        → l4::open_tcp(domain, port) → iroh → server route
 //!                      │        (pooled connections, returned after the flow ends)

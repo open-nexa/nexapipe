@@ -3,7 +3,9 @@
 
 use crate::Cli;
 
-use nexapipe::config::{ClientSecretWrite, ProxyConfig};
+use nexapipe::config::ClientSecretWrite;
+use nexapipe::storage::{DeviceCredential, Storage};
+use nexapipe_proto::secret::SecretString;
 
 use super::config::{load_auth_config, load_auth_or_none, toml_key};
 use super::qr::render_qr;
@@ -43,12 +45,15 @@ pub(super) fn seconds_of(value: &str) -> Option<i64> {
 /// see what is configured, and a terminal's scrollback, a paste into a ticket
 /// and a screenshot are all places a secret printed once ends up living;
 /// `--show-2fa` draws the code for one client for the one time it is needed.
-pub(crate) fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
-    let Some(auth) = load_auth_or_none(&cli.config)? else {
+pub(crate) async fn list_clients(storage: &dyn Storage, json: bool) -> anyhow::Result<()> {
+    let Some(auth) = load_auth_or_none(storage).await? else {
         if json {
             println!("[]");
         } else {
-            println!("{} has no [auth] section, so no clients", cli.config);
+            println!(
+                "{} has no [auth] section, so no clients",
+                storage.describe()
+            );
         }
         return Ok(());
     };
@@ -101,7 +106,7 @@ pub(crate) fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
         "{} {} in {} ([auth] enabled = {})",
         ids.len(),
         if ids.len() == 1 { "client" } else { "clients" },
-        cli.config,
+        storage.describe(),
         auth.enabled
     );
     if ids.is_empty() {
@@ -245,8 +250,9 @@ pub(crate) fn list_clients(cli: &Cli, json: bool) -> anyhow::Result<()> {
 /// as a QR code — is skipped whole. Nothing is generated, because the private
 /// half is already on the device; what is written is the public half the
 /// operator pasted.
-pub(crate) fn add_client(
+pub(crate) async fn add_client(
     cli: &Cli,
+    storage: &dyn Storage,
     client_id: &str,
     device: Option<&str>,
     public_key: Option<&str>,
@@ -280,7 +286,7 @@ pub(crate) fn add_client(
         );
     }
 
-    let (auth_config, config_loaded) = load_auth_config(&cli.config);
+    let (auth_config, config_loaded) = load_auth_config(storage).await;
 
     // A device cannot be the first thing a client gets: a device table under a
     // client with no secret of its own is a config that will not load, and
@@ -291,7 +297,7 @@ pub(crate) fn add_client(
             "client \"{client_id}\" has no [auth.clients.{}] secret in {}; add the client first \
              with `nexapipe client add {client_id}`",
             toml_key(client_id),
-            cli.config
+            storage.describe()
         );
     }
     let already = match device {
@@ -304,12 +310,12 @@ pub(crate) fn add_client(
                 "device \"{name}\" of client \"{client_id}\" already has a credential in {}; \
                  pass --force to issue it another one, which enrolls the device using the \
                  current one out",
-                cli.config
+                storage.describe()
             ),
             None => anyhow::bail!(
                 "client \"{client_id}\" already has a secret in {}; pass --force to rotate it, \
                  which enrolls out every device using it",
-                cli.config
+                storage.describe()
             ),
         }
     }
@@ -343,13 +349,14 @@ pub(crate) fn add_client(
         println!();
 
         return write_issued_credential(
-            cli,
+            storage,
             client_id,
             Some(name),
             nexapipe::auth::DeviceMaterial::PublicKey(&key),
             auth_config.enabled,
             force,
-        );
+        )
+        .await;
     }
 
     let issuer = match &cli.issuer {
@@ -412,13 +419,14 @@ pub(crate) fn add_client(
     println!();
 
     write_issued_credential(
-        cli,
+        storage,
         client_id,
         device,
         nexapipe::auth::DeviceMaterial::Secret(uri.secret.expose_secret()),
         auth_config.enabled,
         force,
     )
+    .await
 }
 
 /// Puts the credential that was just printed into the config, so the server
@@ -428,8 +436,8 @@ pub(crate) fn add_client(
 /// `force` is passed through rather than assumed: whether the credential is
 /// already there is decided under the config lock by the writer, which is the
 /// only place that can answer it without racing a second writer.
-fn write_issued_credential(
-    cli: &Cli,
+async fn write_issued_credential(
+    storage: &dyn Storage,
     client_id: &str,
     device: Option<&str>,
     material: nexapipe::auth::DeviceMaterial<'_>,
@@ -440,32 +448,59 @@ fn write_issued_credential(
     // Spelled the way the file is written: a device goes under the client's
     // `devices` table as an inline entry rather than as a section of its own,
     // because that table may be one an operator wrote inline.
-    let (section, entry, noun, outcome) = match (device, material) {
-        (None, nexapipe::auth::DeviceMaterial::Secret(secret)) => {
-            let section = format!("[auth.clients.{}]", toml_key(client_id));
-            (
-                section.clone(),
-                format!("secret = \"{secret}\""),
-                "secret",
-                ProxyConfig::write_client_secret(&cli.config, client_id, secret, force),
-            )
-        }
+    let (section, entry, noun) = match (device, material) {
+        (None, nexapipe::auth::DeviceMaterial::Secret(secret)) => (
+            format!("[auth.clients.{}]", toml_key(client_id)),
+            format!("secret = \"{secret}\""),
+            "secret",
+        ),
         (Some(name), nexapipe::auth::DeviceMaterial::Secret(secret)) => (
             format!("[auth.clients.{}.devices]", toml_key(client_id)),
             format!("{} = {{ secret = \"{secret}\" }}", toml_key(name)),
             "secret",
-            ProxyConfig::write_device_credential(&cli.config, client_id, name, material, force),
         ),
         (Some(name), nexapipe::auth::DeviceMaterial::PublicKey(key)) => (
             format!("[auth.clients.{}.devices]", toml_key(client_id)),
             format!("{} = {{ public_key = \"{key}\" }}", toml_key(name)),
             "public key",
-            ProxyConfig::write_device_credential(&cli.config, client_id, name, material, force),
         ),
         // A key is one device's, and the unnamed slot — the client's own
         // `secret` — is a string a key cannot live in. The CLI refuses this
         // spelling twice before it gets here; the arm keeps the writer from
         // being the one place that would write such a key nowhere.
+        (None, nexapipe::auth::DeviceMaterial::PublicKey(_)) => {
+            anyhow::bail!("a public key is issued to a named device; pass --device with it")
+        }
+    };
+
+    // The write is the store's: the credential goes into the configuration the
+    // server reads, wherever that configuration is kept.
+    let outcome = match (device, material) {
+        (None, nexapipe::auth::DeviceMaterial::Secret(secret)) => {
+            storage
+                .write_client_secret(client_id, &SecretString::new(secret.to_string()), force)
+                .await
+        }
+        (Some(name), nexapipe::auth::DeviceMaterial::Secret(secret)) => {
+            storage
+                .write_device_credential(
+                    client_id,
+                    name,
+                    DeviceCredential::Secret(SecretString::new(secret.to_string())),
+                    force,
+                )
+                .await
+        }
+        (Some(name), nexapipe::auth::DeviceMaterial::PublicKey(key)) => {
+            storage
+                .write_device_credential(
+                    client_id,
+                    name,
+                    DeviceCredential::PublicKey(key.to_string()),
+                    force,
+                )
+                .await
+        }
         (None, nexapipe::auth::DeviceMaterial::PublicKey(_)) => {
             anyhow::bail!("a public key is issued to a named device; pass --device with it")
         }
@@ -477,11 +512,11 @@ fn write_issued_credential(
 
     let written = match outcome {
         Ok(ClientSecretWrite::Added) => {
-            println!("Wrote the {noun} to {} as {}.", cli.config, what);
+            println!("Wrote the {noun} to {} as {}.", storage.describe(), what);
             false
         }
         Ok(ClientSecretWrite::Replaced) => {
-            println!("Replaced the {noun} of {} in {}.", what, cli.config);
+            println!("Replaced the {noun} of {} in {}.", what, storage.describe());
             true
         }
         // Fatal rather than a warning. The credential is on screen either way,
@@ -496,7 +531,7 @@ fn write_issued_credential(
                 "the {noun} was not written to {}; add it by hand:\n\
                  {section}\n\
                  {entry}",
-                cli.config
+                storage.describe()
             ));
         }
     };
@@ -506,7 +541,7 @@ fn write_issued_credential(
         eprintln!(
             "warning: [auth] enabled is not true in {}, so the server will not ask for this \
              credential; add enabled = true under [auth]",
-            cli.config
+            storage.describe()
         );
     }
     println!(
@@ -541,8 +576,8 @@ fn write_issued_credential(
 /// so a config that no longer parses — an `allow_hosts` that is not a list, say
 /// — must still be revocable. Refusing it would leave the one operator remedy
 /// for a bad hand edit behind the very edit that broke it.
-pub(crate) fn revoke_client(
-    cli: &Cli,
+pub(crate) async fn revoke_client(
+    storage: &dyn Storage,
     client_id: &str,
     device: Option<&str>,
 ) -> anyhow::Result<()> {
@@ -573,18 +608,18 @@ pub(crate) fn revoke_client(
         );
     }
     // Counts are for the message only; a config that fails to load must still be revocable.
-    let auth = load_auth_or_none(&cli.config).ok().flatten();
+    let auth = load_auth_or_none(storage).await.ok().flatten();
     let client = auth.as_ref().and_then(|auth| auth.clients.get(client_id));
 
     match device {
         Some(name) => {
             let others = client.map(|client| client.devices.len()).unwrap_or(0);
-            ProxyConfig::remove_device(&cli.config, client_id, name)?;
+            storage.remove_device(client_id, name).await?;
             println!(
                 "Removed [auth.clients.{}.devices.{}] from {}.",
                 toml_key(client_id),
                 toml_key(name),
-                cli.config
+                storage.describe()
             );
             match others {
                 // The shared secret is the credential of the peer that names no
@@ -616,11 +651,11 @@ pub(crate) fn revoke_client(
         }
         None => {
             let devices = client.map(|client| client.devices.len()).unwrap_or(0);
-            ProxyConfig::remove_client(&cli.config, client_id)?;
+            storage.remove_client(client_id).await?;
             println!(
                 "Removed [auth.clients.{}] from {}.",
                 toml_key(client_id),
-                cli.config
+                storage.describe()
             );
             match devices {
                 0 => {}

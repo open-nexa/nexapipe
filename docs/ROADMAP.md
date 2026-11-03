@@ -352,7 +352,8 @@ already holds a TOTP secret keeps it. The library API (`Enrollment::with_key`,
   that only surfaces in a running test reached a tag before CI saw one. It is
   `windows-test` now and runs the same `cargo test --workspace --locked` the
   other two do; the Android lint baseline still pins 32 historical findings; no
-  fuzzing, no benchmarks; the vendored smoltcp patch needs long-term tracking.
+  fuzzing, no benchmarks; the TUN stack follows smoltcp's releases, so its
+  behaviour is not ours to pin.
 
 ### 4.5 Protocols and transport (P1/P2)
 
@@ -509,9 +510,10 @@ tracked. The server has no `unsafe` and no `unwrap` on a production path. The
 authentication, 2FA and ACL work holds up under reading: constant-time
 comparison, a per-handshake nonce that makes a captured response unreplayable,
 lockout accounting held under the same write lock as the verification it counts,
-and a refusal that is indistinguishable from having no route. The vendored
-smoltcp patch is minimal, documented, and still load-bearing — upstream has not
-fixed what it works around.
+and a refusal that is indistinguishable from having no route. The TUN stack
+needed a vendored fork of smoltcp once, because 0.12 panicked on a
+sequence-number subtraction; upstream fixed the cause in 0.13, so the fork is
+gone and the client drives the crates.io release itself.
 
 The second is that **most of what it did find is defects, and defects are not
 scheduled.** They are listed below so the audit stays reproducible; each one is
@@ -527,7 +529,7 @@ and those are in
 
 | P | Defect, open as of the audit | Where |
 |---|---|---|
-| P0 | **The desktop build never gets the smoltcp patch.** `ui-desktop/src-tauri` is its own workspace — the root `Cargo.toml` excludes it — so `[patch.crates-io]` does not reach it and its lockfile resolves smoltcp 0.12.0 from crates.io. `tun-proxy` is precisely the feature that runs the patched transmit path, so the panic `third_party/smoltcp/PATCHES.md` exists to prevent is reachable on the one client that ships a desktop TUN. | `Cargo.toml:7`, `:24-25`; `ui-desktop/src-tauri/Cargo.lock` (`source = registry`) — fixed on `fix/desktop-smoltcp-patch` |
+| P0 | **The desktop build never gets the smoltcp patch.** `ui-desktop/src-tauri` is its own workspace — the root `Cargo.toml` excludes it — so `[patch.crates-io]` does not reach it and its lockfile resolves smoltcp 0.12.0 from crates.io. `tun-proxy` is precisely the feature that runs the patched transmit path, so the panic `third_party/smoltcp/PATCHES.md` exists to prevent is reachable on the one client that ships a desktop TUN. | `Cargo.toml:7`, `:24-25`; `ui-desktop/src-tauri/Cargo.lock` (`source = registry`) — fixed on `fix/desktop-smoltcp-patch`, and the fork it was about is gone: the client drives smoltcp from crates.io |
 | P0 | **The macOS build deletes the CSP.** Platform configs merge as JSON Merge Patch, where `null` means *remove*, so `"csp": null` drops the baseline policy — on the build whose webview holds 35 command permissions, `put_credential` and `clear_credentials` among them. The other two platforms keep it. | `ui-desktop/src-tauri/tauri.macos.conf.json:28-30`, `tauri.conf.json:29`, `capabilities/default.json:22-58` — fixed on `fix/desktop-macos-csp` |
 | P0 | **No global ceiling on connections or streams.** The only limit is per `EndpointId`, and an endpoint id is a public key: 64 connections × 256 streams, times as many peers as an attacker cares to generate, is unbounded tasks and memory taken from every tenant on the process. The comment in `limits.rs` says so — per-peer is what it is for. | `crates/nexapipe/src/conn/limits.rs:1-21`, `conn/mod.rs:1596-1597` — fixed in #161: a global ceiling on connections and streams beside the per-peer one, and a global budget for the bytes held in request bodies; configurable through `[limits]`, see [R16](#hardening-sweep--after-v060) |
 | P0 | **TUN flows have no budget on the client.** The UDP reassembly buffer has no stated bound: `decode_frame` accepts any `u16` length, so a frame can announce 65 535 bytes and then arrive at whatever pace the far side chooses. TCP flows have no cap at all, though UDP has `MAX_UDP_FLOWS`. On Android the TUN is system-wide, so any installed application can exhaust the device. | `crates/nexapipe-client/src/tun_proxy.rs:1211`, `:765`; `crates/nexapipe-proto/src/udp.rs:50` — fixed on `fix/tun-flow-budgets` |

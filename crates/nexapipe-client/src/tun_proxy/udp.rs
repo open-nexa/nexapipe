@@ -164,7 +164,7 @@ where
 /// through the channel in [`TunContext::tun_out`].
 pub(super) async fn run_tun_udp_writer(
     mut writer: UdpWriteHalf,
-    mut queue: mpsc::Receiver<UdpMsg>,
+    mut queue: mpsc::Receiver<UdpDatagram>,
 ) {
     while let Some(datagram) = queue.recv().await {
         // Note: the stack's sink drops a zero-length payload silently. A
@@ -185,10 +185,11 @@ pub(super) async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
     let warned_full = AtomicBool::new(false);
 
     while !ctx.stopped.load(Ordering::Acquire) {
-        let Some((payload, client_addr, dst_addr)) = socket.next().await else {
+        let Some(datagram) = socket.next().await else {
             jni_log!("[tun-proxy] UDP stream ended");
             break;
         };
+        let (payload, client_addr, dst_addr) = (datagram.payload, datagram.src, datagram.dst);
 
         // The system resolver is pointed at the DNS address (Kotlin: addDnsServer;
         // the desktop: the TUN interface address), and the virtual /24 is the only
@@ -226,7 +227,13 @@ pub(super) async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
                 };
                 if ctx
                     .tun_out
-                    .send((response, dst_addr, client_addr))
+                    .send(UdpDatagram {
+                        payload: response,
+                        // The answer comes from the address the query went
+                        // to, and goes back to the one it came from.
+                        src: dst_addr,
+                        dst: client_addr,
+                    })
                     .await
                     .is_err()
                 {
@@ -501,7 +508,11 @@ async fn run_udp_flow(
                     // application's bytes rather than the frame's.
                     if ctx
                         .tun_out
-                        .send((payload.to_vec(), virtual_dst, client_addr))
+                        .send(UdpDatagram {
+                            payload: payload.to_vec(),
+                            src: virtual_dst,
+                            dst: client_addr,
+                        })
                         .await
                         .is_err()
                     {

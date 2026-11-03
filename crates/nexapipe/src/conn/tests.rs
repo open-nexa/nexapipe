@@ -9,7 +9,7 @@ use super::auth::enrollment::{
     EnrollmentSlot, EnrollmentVerdict, IssuedCredential, device_taken_hint, enrollment_verdict,
     issue_enrolled_secret, undo_enrolled_secret,
 };
-use super::auth::state::{blocking_config_write, persist_auth_state};
+use super::auth::state::{persist_auth_state, storage_write};
 use super::stream::{StreamBudgets, StreamKind, classify, read_first_bytes};
 use super::{AuthState, count_enrollment_failure, find_headers_end};
 use crate::auth::{AuthConfig, ClientAuth, DeviceAuth};
@@ -41,7 +41,7 @@ async fn the_state_file_carries_the_counters_as_of_the_write() {
         .expect("the config loads");
     let auth = AuthState::new(
         config.expect("the config declares an [auth] section"),
-        path.to_str().unwrap(),
+        std::sync::Arc::new(crate::storage::file::FileStorage::new(path)),
     );
 
     // Two failures, recorded in two separate critical sections — the
@@ -250,9 +250,13 @@ async fn an_abandoned_write_still_lands_before_the_next_one() {
     let fast_path = slow_path.clone();
 
     let abandoned = tokio::spawn(async move {
-        let _ = blocking_config_write(slow_path, |path| {
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            std::fs::write(path, "slow\n").map_err(|e| anyhow::anyhow!("{e}"))
+        let _ = storage_write("the slow write".to_string(), async move {
+            tokio::task::spawn_blocking(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                std::fs::write(&slow_path, "slow\n").map_err(|e| anyhow::anyhow!("{e}"))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("the slow write did not run: {e}"))?
         })
         .await;
     });
@@ -261,8 +265,8 @@ async fn an_abandoned_write_still_lands_before_the_next_one() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     abandoned.abort();
 
-    blocking_config_write(fast_path, |path| {
-        std::fs::write(path, "fast\n").map_err(|e| anyhow::anyhow!("{e}"))
+    storage_write("the fast write".to_string(), async move {
+        std::fs::write(&fast_path, "fast\n").map_err(|e| anyhow::anyhow!("{e}"))
     })
     .await
     .expect("the second write runs");
