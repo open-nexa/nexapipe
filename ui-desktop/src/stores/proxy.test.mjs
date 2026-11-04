@@ -27,6 +27,9 @@ import assert from 'node:assert/strict';
 /** What the backend answers for each command. */
 const answers = new Map();
 
+/** Every command the store asked for, in order, for tests about what was called. */
+const calls = [];
+
 /**
  * The browser globals the store expects.
  *
@@ -42,6 +45,7 @@ globalThis.localStorage = {
 globalThis.window = {
   __TAURI_INTERNALS__: {
     invoke: async (cmd, args) => {
+      calls.push(cmd);
       const answer = answers.get(cmd);
       if (typeof answer === 'function') return await answer(args);
       return answer === undefined ? null : answer;
@@ -222,6 +226,41 @@ test('a service that is stopped turns TUN off without claiming an outdated build
     false,
     'a stopped service is not an outdated one: the drift banner would offer a reinstall for a ' +
       'service that is not running',
+  );
+});
+
+/**
+ * A start that fails *after* an enrollment may have spent its token still collects the
+ * credential.
+ *
+ * The token is spent by the first connection, and a TUN start connects before it creates the
+ * device — so a start that dies on the device has already bought a credential only this read
+ * can keep. Collecting on the success path alone is how the spent token's only copy went down
+ * with the instance.
+ */
+test('a failed start still reads the credential its enrollment may have bought', async () => {
+  const store = await freshStore();
+
+  answers.set('start_proxy', null);
+  answers.set('get_startup_error', { code: 'proxy.start_failed', detail: 'wintun.dll not found' });
+  // One poll sees the start in progress, the next sees it given up — the shape
+  // `waitForStart` reads as "it was starting and is not any more".
+  let polls = 0;
+  answers.set('get_proxy_status', () =>
+    ++polls === 1 ? { running: false, mode: 'starting' } : { running: false, mode: 'stopped' },
+  );
+  calls.length = 0;
+
+  await store.start();
+
+  assert.equal(
+    store.status.value.running,
+    false,
+    'the start is reported as failed, so this is the failure path under test',
+  );
+  assert.ok(
+    calls.includes('take_issued_credential'),
+    'the credential a spent token bought is read even though the start failed',
   );
 });
 

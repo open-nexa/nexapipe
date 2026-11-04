@@ -10,7 +10,7 @@ use crate::error::{codes, AppError};
 use crate::service::ipc::IssuedCredentialPayload;
 use crate::service::IpcClient;
 
-use nexapipe_client::auth::DeviceKey;
+use nexapipe_client::auth::{DeviceKey, IssuedCredential};
 use nexapipe_client::provisioning::{EndpointInvite, EndpointTarget};
 
 use serde::Serialize;
@@ -340,27 +340,33 @@ pub(crate) async fn take_issued_credential(
         return Ok(credential);
     }
 
+    // A start that failed unregisters its manager before the failure is polled, so what that
+    // start kept for this read is checked before the manager that may no longer be there.
+    if let Some(credential) = crate::proxy::take_stashed_issued() {
+        return Ok(Some(issued_payload(credential)));
+    }
+
     // Cloned out of the lock first: the guard must not be held across the await below.
     let manager = PROXY_MANAGER.read().await.as_ref().cloned();
     Ok(match manager {
-        Some(manager) => {
-            manager
-                .take_issued_credential()
-                .await
-                .map(|credential| IssuedCredentialPayload {
-                    client_id: credential.client_id,
-                    // The credential is on its way to the keychain, which is
-                    // outside this process: the copy handed over is a plain
-                    // string, and the one that stays behind is wiped with the
-                    // credential.
-                    secret: credential.secret.expose_secret().to_string(),
-                    algorithm: credential.algorithm,
-                    public_key: credential.public_key,
-                    device: credential.device,
-                })
-        }
+        Some(manager) => manager.take_issued_credential().await.map(issued_payload),
         None => None,
     })
+}
+
+/// The credential in the shape the renderer reads.
+///
+/// The secret is read out of its `SecretString` here, the one place it leaves the credential:
+/// what crosses to the renderer is a plain string, and the copy that stays behind is wiped with
+/// the credential when it is dropped.
+fn issued_payload(credential: IssuedCredential) -> IssuedCredentialPayload {
+    IssuedCredentialPayload {
+        client_id: credential.client_id,
+        secret: credential.secret.expose_secret().to_string(),
+        algorithm: credential.algorithm,
+        public_key: credential.public_key,
+        device: credential.device,
+    }
 }
 
 #[cfg(test)]

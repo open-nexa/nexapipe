@@ -669,6 +669,11 @@ async function start(): Promise<void> {
       toast.error(recorded ?? { code: 'proxy.start_failed' }, 'error.proxy.start_failed');
       // The tray says so too: a start nobody watched has only the tray to say so.
       void queueTrayStatus();
+      // A start can fail after the token has been spent — the TUN device is created after the
+      // first connection, and a backend refusal comes from one. The credential it bought is the
+      // only copy, and the failure is exactly when the user is about to fix something and retry,
+      // so it is read here as well rather than only on the success path.
+      await collectIssuedCredential();
       return;
     }
 

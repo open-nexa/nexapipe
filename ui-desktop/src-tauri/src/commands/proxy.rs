@@ -42,6 +42,12 @@ pub(crate) async fn start_proxy(
     let use_service = use_service.unwrap_or(false);
     let use_tun = use_tun.unwrap_or(false);
 
+    // A new attempt owns the process's slots. Whatever a failed attempt before it kept is
+    // history: it belongs to the configuration this call is replacing, and the caller is about
+    // to be handed this start's answer. Cleared on both paths, because a service start may
+    // replace an earlier process-mode attempt and the same read command serves both.
+    proxy::clear_stashed_issued();
+
     // Before anything is probed or spawned, and only when a tunnel is actually being asked for.
     // The stale-hijack cleanup resets every adapter still pointing at a TUN address, and on
     // Windows there is no "is that tunnel still alive" guard (`address_is_held` is macOS and
@@ -248,6 +254,11 @@ pub(crate) async fn start_proxy(
                 StartError::Other(_) => codes::PROXY_START_FAILED,
             };
             *startup_error_clone.write().await = Some(AppError::with_detail(code, e.to_string()));
+
+            // The manager is unregistered below and dropped with the last reference to it, and a
+            // token that was spent during this start will not produce another credential: keep
+            // what it bought where `take_issued_credential` can still find it.
+            proxy::stash_issued_from_failed_start(&manager_cleanup).await;
 
             // A manager that failed to start reports `None` as its mode, which `get_proxy_status`
             // renders as "starting" — but nothing is starting: the tunnel or the listen socket was
