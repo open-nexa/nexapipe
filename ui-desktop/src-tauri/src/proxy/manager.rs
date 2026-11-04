@@ -255,6 +255,13 @@ pub struct ProxyManager {
     config: ProxyManagerConfig,
     mode: parking_lot::Mutex<Option<ProxyMode>>,
     instance: parking_lot::Mutex<Option<ProxyInstance>>,
+    /// A credential an enrollment issued during a start that then failed.
+    ///
+    /// A token is spent by the connection that presents it, and the credential it bought is
+    /// the only copy left. The instance that carried it is dropped when the start fails, and
+    /// the process that owns this manager drops the manager right after — so the credential
+    /// is moved here before either happens, where the caller can still collect it.
+    issued: parking_lot::Mutex<Option<IssuedCredential>>,
 }
 
 impl ProxyManager {
@@ -263,6 +270,7 @@ impl ProxyManager {
             config,
             mode: parking_lot::Mutex::new(None),
             instance: parking_lot::Mutex::new(None),
+            issued: parking_lot::Mutex::new(None),
         }
     }
 
@@ -579,6 +587,7 @@ impl ProxyManager {
                 "Backend(s) require 2FA, but no credentials are configured: {}",
                 report.unreachable_ids()
             );
+            self.remember_issued(&endpoint_group).await;
             return Err(StartError::TwoFactorRequired {
                 unreachable_ids: report.unreachable_ids(),
             });
@@ -588,6 +597,7 @@ impl ProxyManager {
                 "No reachable backend out of {} probed node(s)",
                 report.total()
             );
+            self.remember_issued(&endpoint_group).await;
             return Err(StartError::NoReachableBackend {
                 total: report.total(),
                 unreachable_ids: report.unreachable_ids(),
@@ -656,6 +666,9 @@ impl ProxyManager {
             match tun_proxy.run().await {
                 Ok(()) => {
                     tracing::info!("TUN proxy stopped successfully");
+                    // An enrollment outlives the tunnel that carried it: keep it before the
+                    // group that holds it is dropped.
+                    self.remember_issued_from_instance().await;
                     // Properly close endpoints before clearing instance
                     let instance = self.instance.lock().take();
                     if let Some(instance) = instance {
@@ -669,6 +682,9 @@ impl ProxyManager {
                     // answered with a local proxy: the caller surfaces it as a startup failure
                     // (`proxy.start_failed` with this detail) and the mode goes back to stopped.
                     tracing::error!("TUN proxy failed: {}", e);
+                    // The token that bought the credential is spent whether or not the tunnel
+                    // came up, so the credential has to survive the teardown.
+                    self.remember_issued_from_instance().await;
                     let instance = self.instance.lock().take();
                     if let Some(instance) = instance {
                         instance.stop().await;
@@ -688,14 +704,26 @@ impl ProxyManager {
         // The proxy runs on the group built above, not on a fresh one: it is what carries the relay
         // mode, the transport tuning and the 2FA credentials, and it is what the reachability probe
         // just validated. Building a second group here used to silently drop all three.
-        let local_proxy = Arc::new(
-            LocalProxyWrapper::new(
-                &self.config.local_proxy_addr,
-                all_domains,
-                endpoint_group.clone(),
-            )
-            .await?,
-        );
+        let local_proxy = match LocalProxyWrapper::new(
+            &self.config.local_proxy_addr,
+            all_domains,
+            endpoint_group.clone(),
+        )
+        .await
+        {
+            Ok(local_proxy) => Arc::new(local_proxy),
+            Err(e) => {
+                // The probe above connected to every backend, so an enrollment may have
+                // happened; the listen socket is the first thing that can fail afterwards.
+                self.remember_issued(&endpoint_group).await;
+                // The mode was set before the socket existed, and a mode of "running" with
+                // nothing listening is a lie the status reports and the frontend believes:
+                // it reads as a live proxy, so the failure is never read and never shown.
+                // The TUN branch puts it back to nothing for the same reason.
+                *self.mode.lock() = None;
+                return Err(StartError::Other(e));
+            }
+        };
 
         *self.instance.lock() = Some(ProxyInstance {
             tun_proxy: None,
@@ -726,13 +754,45 @@ impl ProxyManager {
     /// Read once, right after a start: the token cannot be spent twice, so this is the only
     /// chance to persist what it bought. `None` means nothing enrolled — either no node
     /// carried a token, or the credential has already been taken.
+    ///
+    /// A credential kept from a start that failed comes first: the instance that carried it
+    /// is gone by the time the failure is reported, and that credential is the only copy the
+    /// spent token will ever produce.
     pub async fn take_issued_credential(&self) -> Option<IssuedCredential> {
+        let kept = self.issued.lock().take();
+        if let Some(issued) = kept {
+            return Some(issued);
+        }
         let group = self
             .instance
             .lock()
             .as_ref()
             .and_then(|instance| instance.endpoint_group.clone())?;
         group.take_issued_credential().await
+    }
+
+    /// Moves a credential the group issued during this start out of the group.
+    ///
+    /// Called on the error paths, while the group is still alive: the token it came from is
+    /// spent, so a start that fails after enrolling without keeping this would leave the
+    /// device with nothing to authenticate with.
+    async fn remember_issued(&self, group: &EndpointGroup) {
+        if let Some(issued) = group.take_issued_credential().await {
+            *self.issued.lock() = Some(issued);
+        }
+    }
+
+    /// The same, for a start whose group is already in the instance.
+    async fn remember_issued_from_instance(&self) {
+        // Cloned out of the lock before the await: a parking_lot guard must not cross one.
+        let group = self
+            .instance
+            .lock()
+            .as_ref()
+            .and_then(|instance| instance.endpoint_group.clone());
+        if let Some(group) = group {
+            self.remember_issued(&group).await;
+        }
     }
 
     /// Our own endpoint id, or `None` when nothing is running.
@@ -1033,5 +1093,97 @@ impl ProxyManager {
             .and_then(|node| backend_addr(&node.connection))?;
 
         Some(group.close_node_flows(&node.id).await)
+    }
+}
+
+/// A credential an enrollment issued during a start that then failed.
+///
+/// Both start paths clear the slot that holds the manager as soon as `start()` reports its
+/// failure, and the token that bought the credential has already been spent by then. The
+/// credential is moved here before that happens, so the read command can still hand it to the
+/// config store — the only thing that keeps this device able to authenticate on a later start.
+///
+/// One slot per process: the proxy is run either by the app or by the service, and each process
+/// collects the credential its own start produced.
+static STASHED_ISSUED: parking_lot::Mutex<Option<IssuedCredential>> = parking_lot::Mutex::new(None);
+
+/// Keeps what an enrollment issued before a start failed, for [`take_stashed_issued`].
+///
+/// Called from the failure task, which is the last place that still holds the manager: the
+/// instance is already gone by then, and the credential lives in the manager only because
+/// `start()` moved it there before returning the error.
+pub(crate) async fn stash_issued_from_failed_start(manager: &ProxyManager) {
+    if let Some(issued) = manager.take_issued_credential().await {
+        *STASHED_ISSUED.lock() = Some(issued);
+    }
+}
+
+/// The credential a failed start left behind, taken out of the slot.
+pub(crate) fn take_stashed_issued() -> Option<IssuedCredential> {
+    STASHED_ISSUED.lock().take()
+}
+
+/// Drops whatever a previous attempt left behind.
+///
+/// A new start owns the slot the way it owns the recorded startup error: its enrollment is the
+/// one the caller is about to collect, and an answer from two starts ago would be filed against
+/// the wrong configuration.
+pub(crate) fn clear_stashed_issued() {
+    *STASHED_ISSUED.lock() = None;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nexapipe_client::SecretString;
+
+    fn idle_manager() -> ProxyManager {
+        ProxyManager::new(ProxyManagerConfig {
+            nodes: Vec::new(),
+            local_proxy_addr: "127.0.0.1:0".to_string(),
+            dns_listen_addr: "198.18.0.254:53".to_string(),
+            upstream_dns: "8.8.8.8:53".to_string(),
+            dns_strategy: DnsStrategy::default(),
+            load_balancing: LoadBalancingStrategy::from_name("round_robin")
+                .expect("round_robin is a strategy this client knows"),
+            tun_name: "nexa-tun".to_string(),
+            use_tun: false,
+            relay_mode: "pinned".to_string(),
+            relay_url: String::new(),
+            relay_auth_token: String::new(),
+            discovery_mode: "none".to_string(),
+        })
+    }
+
+    fn credential(client_id: &str) -> IssuedCredential {
+        IssuedCredential {
+            client_id: client_id.to_string(),
+            secret: SecretString::new("JBSWY3DPEHPK3PXP".to_string()),
+            algorithm: "sha1".to_string(),
+            public_key: None,
+            device: Some("win11".to_string()),
+        }
+    }
+
+    /// A start that fails after enrolling keeps the credential, and reading it spends it.
+    ///
+    /// The instance that carried the group is gone by the time the failure is reported, so the
+    /// manager's own slot is the only thing left: reading it twice must not report the same
+    /// spent credential as if it had just been issued.
+    #[tokio::test]
+    async fn a_credential_kept_before_a_failure_is_read_once() {
+        let manager = idle_manager();
+        *manager.issued.lock() = Some(credential("win11"));
+
+        let first = manager.take_issued_credential().await;
+        assert_eq!(
+            first.as_ref().map(|c| c.client_id.as_str()),
+            Some("win11"),
+            "the credential kept for a failed start is what the caller collects"
+        );
+        assert!(
+            manager.take_issued_credential().await.is_none(),
+            "a second read must not report the same credential again"
+        );
     }
 }

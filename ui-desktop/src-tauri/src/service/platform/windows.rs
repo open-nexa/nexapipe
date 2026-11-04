@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 use super::{
     per_user_service_candidates, pick_service_binary, remove_copy_batch, sc_state,
     scm_service_binary, system_service_binary, system_service_dir, ScState, ServiceState,
-    MARKED_FOR_DELETE, NOT_INSTALLED, SERVICE_DISPLAY_NAME, SERVICE_NAME,
+    MARKED_FOR_DELETE, NOT_INSTALLED, SERVICE_DISPLAY_NAME, SERVICE_NAME, WINTUN_DLL_NAME,
 };
 use crate::error::{codes, AppError};
+use crate::proxy::tun_proxy::find_wintun_path;
 use crate::service::platform::account::AccountId;
 use crate::service::platform::install_owner;
 use crate::service::platform::install_version;
@@ -151,6 +152,18 @@ pub fn install(
     let program_files = program_files()?;
     let dir = system_service_dir(&program_files);
     let system = system_service_binary(&program_files);
+    // The service creates the tunnel from its own directory, so the Wintun runtime has to be
+    // there too. The app's copy lives in the per-user installation directory, which the service
+    // does not share — and an install that leaves it behind registers a service whose every TUN
+    // start fails with "wintun.dll not found".
+    let wintun_source = find_wintun_path().ok_or_else(|| {
+        AppError::with_detail(
+            codes::SERVICE_INSTALL_FAILED,
+            "wintun.dll was not found next to the app, so the service could not be given the \
+             runtime it needs to create the tunnel",
+        )
+    })?;
+    let wintun = dir.join(WINTUN_DLL_NAME);
     let bin_path =
         bin_path_value(&scm_service_binary(&system, Path::new(&source)).to_string_lossy());
 
@@ -171,6 +184,8 @@ pub fn install(
                     dir: &dir,
                     source: &source,
                     system: &system,
+                    wintun_source: &wintun_source,
+                    wintun: &wintun,
                     bin_path: &bin_path,
                 },
                 installing_by.as_ref(),
@@ -183,6 +198,7 @@ pub fn install(
         codes::SERVICE_INSTALL_FAILED,
     )
     .and_then(|()| verify_copied(Path::new(&source), &system))
+    .and_then(|()| verify_copied(&wintun_source, &wintun))
     .and_then(|()| verify_present())
     // `sc start` returns success as soon as the SCM has launched the process, which says
     // nothing about whether it stays up: a service that dies during startup still reports a
@@ -213,6 +229,9 @@ struct InstallPaths<'a> {
     source: &'a str,
     /// The copy of it the control manager runs.
     system: &'a Path,
+    /// The Wintun runtime the app ships, and the copy the service will load.
+    wintun_source: &'a Path,
+    wintun: &'a Path,
     /// The value the control manager's `binPath` is given.
     bin_path: &'a str,
 }
@@ -234,6 +253,8 @@ fn install_batch(
         dir,
         source,
         system,
+        wintun_source,
+        wintun,
         bin_path,
     } = paths;
     let redirect = format!("> \"{}\" 2>&1", log.display());
@@ -260,6 +281,23 @@ fn install_batch(
         format!("fc /b \"{source}\" \"{}\"", system.display()),
         "if errorlevel 1 exit /b %errorlevel%".to_string(),
         format!("icacls \"{}\" {FILE_ACL}", system.display()),
+        "if errorlevel 1 exit /b %errorlevel%".to_string(),
+        // The service loads the runtime from its own directory; a copy that did not land is a
+        // TUN that refuses every start with "wintun.dll not found" after the install reported
+        // success.
+        format!(
+            "copy /y \"{}\" \"{}\"",
+            wintun_source.display(),
+            wintun.display()
+        ),
+        "if errorlevel 1 exit /b %errorlevel%".to_string(),
+        format!(
+            "fc /b \"{}\" \"{}\"",
+            wintun_source.display(),
+            wintun.display()
+        ),
+        "if errorlevel 1 exit /b %errorlevel%".to_string(),
+        format!("icacls \"{}\" {FILE_ACL}", wintun.display()),
         "if errorlevel 1 exit /b %errorlevel%".to_string(),
         format!("sc.exe query {SERVICE_NAME} >nul 2>&1"),
         // `start=` is written only where the service is created. An entry that is already
@@ -336,7 +374,7 @@ fn install_batch(
     lines
 }
 
-/// Checks that the copy that was made is the file that was asked for.
+/// Checks that a copy that was made is the file that was asked for.
 ///
 /// The elevated run compares the two files as well — `fc /b`, before the entry is touched —
 /// and this is the same question asked again from the outside, where a mismatch can be
@@ -354,7 +392,7 @@ fn verify_copied(source: &Path, system: &Path) -> Result<(), AppError> {
     Err(AppError::with_detail(
         codes::SERVICE_INSTALL_FAILED,
         format!(
-            "the service binary at {} is not the copy of {} that was installed",
+            "the file at {} is not the copy of {} that was installed",
             system.display(),
             source.display()
         ),
@@ -504,8 +542,12 @@ pub fn uninstall() -> Result<(), AppError> {
 /// only removed when it is empty: anything else in it belongs to somebody else, and leaving it
 /// behind is harmless.
 fn remove_system_copy(dir: &Path, binary: &Path) -> Result<(), AppError> {
+    // The runtime the service loads is copied in beside the binary by the install, so it is
+    // ours to take away again. The path is joined here, on the platform that runs the batch,
+    // because `Path::join` uses the separator of the host that joins it.
+    let wintun = dir.join(WINTUN_DLL_NAME);
     run(
-        |_| remove_copy_batch(dir, binary),
+        |_| remove_copy_batch(dir, binary, &wintun),
         "service uninstall (remove the system copy)",
         // The copy is under Program Files, so the delete is usually refused
         // for an ordinary user — and it is refused *then*, not before: the
@@ -1217,6 +1259,8 @@ mod tests {
                 dir: Path::new(r"C:\Program Files\Nexa\Service"),
                 source: r"C:\App\nexa-service.exe",
                 system: Path::new(r"C:\Program Files\Nexa\Service\nexa-service.exe"),
+                wintun_source: Path::new(r"C:\App\wintun\bin\amd64\wintun.dll"),
+                wintun: Path::new(r"C:\Program Files\Nexa\Service\wintun.dll"),
                 bin_path: r#"\"C:\Program Files\Nexa\Service\nexa-service.exe\" --service"#,
             },
             Some(&account),
@@ -1225,6 +1269,32 @@ mod tests {
         );
 
         with_logging(&lines, Path::new(r"C:\Temp\out.log"))
+    }
+
+    /// The service loads Wintun from its own directory, and the app's copy is in the per-user
+    /// installation directory it does not share. An install that copies only the binary
+    /// registers a service that answers every TUN start with "wintun.dll not found" — which is
+    /// exactly what a released 1.1.0 install did.
+    #[test]
+    fn the_install_copies_and_checks_the_wintun_runtime() {
+        let script = install_script(false, false);
+
+        assert!(
+            script.contains(
+                r#"copy /y "C:\App\wintun\bin\amd64\wintun.dll" "C:\Program Files\Nexa\Service\wintun.dll""#
+            ),
+            "the runtime has to land next to the service binary: {script}"
+        );
+        assert!(
+            script.contains(
+                r#"fc /b "C:\App\wintun\bin\amd64\wintun.dll" "C:\Program Files\Nexa\Service\wintun.dll""#
+            ),
+            "a copy that is not the runtime has to stop the install: {script}"
+        );
+        assert!(
+            script.contains(r#"icacls "C:\Program Files\Nexa\Service\wintun.dll" /inheritance:r"#),
+            "the runtime has to carry the same permissions as the binary: {script}"
+        );
     }
 
     /// When the user's service comes up is the user's decision, and an app that is

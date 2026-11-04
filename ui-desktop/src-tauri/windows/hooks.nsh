@@ -69,6 +69,9 @@ ${UnStrRep}
 
 !define NEXAPIPE_SERVICE_NAME "nexa-service"
 !define NEXAPIPE_SERVICE_EXE "nexa-service.exe"
+; The Wintun runtime the service loads to create the tunnel. The app's registration copies it
+; in beside the service binary, so the uninstaller has to take it away again with it.
+!define NEXAPIPE_WINTUN_DLL "wintun.dll"
 ; The app's own executable. Spelled out rather than taken from the installer
 ; template, which includes this file before it defines MAINBINARYNAME.
 !define NEXAPIPE_APP_EXE "nexa.exe"
@@ -1335,6 +1338,10 @@ Var /GLOBAL NEXAPIPE_SERVICE_IS_UP
   ${AndIf} $NEXAPIPE_SYSTEM_BINARY != "$INSTDIR\${NEXAPIPE_SERVICE_EXE}"
   ${AndIf} $NEXAPIPE_SYSTEM_BINARY != "$INSTDIR\resources\${NEXAPIPE_SERVICE_EXE}"
     FileWrite $0 'del /f /q "$NEXAPIPE_SYSTEM_BINARY" >nul 2>&1$\r$\n'
+    ; The Wintun runtime is copied in beside the binary by the app's registration, so it is
+    ; ours to take away as well: left behind, it keeps the directory under Program Files
+    ; alive, because the rmdir below only removes an empty one.
+    FileWrite $0 'for %%d in ("$NEXAPIPE_SYSTEM_BINARY") do del /f /q "%%~dp${NEXAPIPE_WINTUN_DLL}" >nul 2>&1$\r$\n'
     ; The directory is only removed when it is empty: anything else in it belongs to somebody
     ; else, and leaving it behind is harmless.
     FileWrite $0 'for %%d in ("$NEXAPIPE_SYSTEM_BINARY") do rmdir "%%~dp" >nul 2>&1$\r$\n'

@@ -30,9 +30,12 @@ impl ServiceRunner {
         discovery_mode: Option<String>,
         proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
     ) -> IpcResponse {
-        // A new start owns the slot: whatever the previous one recorded is history, and a caller
-        // that polls the status before the spawn has finished must not read a stale failure.
+        // A new start owns the slots: whatever the previous one recorded is history, and a caller
+        // that polls the status before the spawn has finished must not read a stale failure — or
+        // a credential from an earlier attempt, which belongs to a configuration this start is
+        // about to replace.
         *startup_error_slot().write().await = None;
+        crate::proxy::clear_stashed_issued();
 
         // Merge the global domains into every node — same logic as process mode (lib.rs) —
         // so that domains added through the text box in service mode are also handled
@@ -182,6 +185,9 @@ impl ServiceRunner {
                 };
                 *startup_error_slot().write().await =
                     Some(AppError::with_detail(code, e.to_string()));
+                // The manager is about to be dropped, and a spent token will not produce another
+                // credential: keep what it bought where the read command can still find it.
+                crate::proxy::stash_issued_from_failed_start(&manager).await;
                 // Cleared only when the slot still holds this manager: a newer start has
                 // replaced it, and clearing the slot then would unregister a manager that is
                 // running. Same guard as the desktop's own path.
@@ -255,10 +261,18 @@ impl ServiceRunner {
     pub(super) async fn handle_get_issued_credential(
         proxy_manager: &Arc<tokio::sync::RwLock<Option<Arc<ProxyManager>>>>,
     ) -> IpcResponse {
-        let pm = proxy_manager.read().await;
-        let issued = match pm.as_ref() {
-            Some(manager) => manager.take_issued_credential().await,
-            None => None,
+        // A failed start is asked about after the manager is gone, so what it kept is checked
+        // first. Only one start's credential can be here: a start clears the slot before it
+        // begins.
+        let issued = match crate::proxy::take_stashed_issued() {
+            Some(issued) => Some(issued),
+            None => {
+                let pm = proxy_manager.read().await;
+                match pm.as_ref() {
+                    Some(manager) => manager.take_issued_credential().await,
+                    None => None,
+                }
+            }
         };
         IpcResponse::IssuedCredential(issued.map(|credential| IssuedCredentialPayload {
             client_id: credential.client_id,
