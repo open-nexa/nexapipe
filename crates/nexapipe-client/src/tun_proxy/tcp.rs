@@ -90,7 +90,7 @@ pub(super) async fn run_tcp_acceptor(mut listener: SmolTcpListener, ctx: TunCont
             };
             // Read before the stream moves: `client_addr_hint` needs it whole,
             // and the flow this opens is listed with where it came from.
-            let peer = Some(client_addr_hint(&stream));
+            let peer = Some(client_addr_hint(&stream).to_string());
             let ctx = ctx.clone();
             tokio::spawn(async move {
                 let _slot = slot;
@@ -162,7 +162,7 @@ async fn serve_tcp_flow(
     let flow = pooled.enter_flow(FlowMeta {
         kind: FlowKind::TunTcp,
         target: Some(format!("{domain}:{port}")),
-        source: Some(client_addr_hint(&stream)),
+        source: Some(client_addr_hint(&stream).to_string()),
     });
     let count_to_tunnel = flow.counter();
     let count_from_tunnel = flow.counter();
@@ -272,7 +272,7 @@ async fn serve_tcp_flow(
     // so the two ends of the tunnel give up at about the same moment, and it
     // is what keeps a half-closed flow from holding its resources for the
     // life of the process.
-    let stream_budget = crate::deadline::Deadlines::default().stream;
+    let stream_budget = Duration::from_secs(crate::deadline::STREAM_SECS);
     let both_halves = async {
         tokio::join!(app_to_tunnel, tunnel_to_app);
     };
@@ -299,8 +299,13 @@ async fn serve_tcp_flow(
 }
 
 /// The application's address, for the log line. Only valid before `split`.
-fn client_addr_hint(stream: &SmolTcpStream) -> String {
+///
+/// Returns [`SocketAddr`] rather than `String` so the type carries the
+/// address's shape: a caller that wants a string asks for one, and a
+/// future change to the stack's `local_addr`/`remote_addr` semantics
+/// surfaces as a type mismatch here rather than as a wrong log line.
+fn client_addr_hint(stream: &SmolTcpStream) -> SocketAddr {
     // `local_addr` is the *source* address here; see the naming trap in
     // `run_tcp_acceptor`.
-    stream.local_addr().to_string()
+    stream.local_addr()
 }

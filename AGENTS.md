@@ -9,7 +9,7 @@ Nexapipe is a Rust workspace: an iroh/QUIC-based proxy server forwarding HTTP/We
 - `crates/nexapipe-client/` — Client library (`lib` + `cdylib`). Connection pooling in `connection_pool/`, domain-to-endpoint mapping in `endpoint_group/`, HTTP/CONNECT/WebSocket tunneling in `local_proxy/`, the L4 tunnel client in `l4.rs`, smoltcp-based TUN proxy in `tun_proxy/`, per-domain TUN virtual IPs in `virtual_ip.rs`, JNI bindings in `jni/`, UniFFI bindings in `uniffi_bindings.rs`.
 - `ui-android/` — Android app (Kotlin); VPN/TUN orchestration lives in `app/src/main/java/com/nexa/pipe/vpn/NexaVpnService.kt` and calls the Rust client via JNI.
 - `ui-desktop/` — Tauri 2 desktop app (Vue 3 + TypeScript, Rust backend in `src-tauri/`).
-- Root — workspace `Cargo.toml`, `config.toml`, Dockerfiles, and the per-platform local build scripts (`build_dmg.sh` macOS, `build_deb.sh` Linux, `build_windows.ps1` Windows, `run_android.ps1` Android debug loop). Each mirrors the matching CI job: `--version` reproduces the tag-derived version, and `build_deb.sh` runs the same `verify-deb.sh` check as the Linux CI job.
+- Root — workspace `Cargo.toml`, `config.toml`, Dockerfiles, and the per-platform local build scripts (`build_dmg.sh` macOS, `build_deb.sh` Linux, `build_windows.ps1` Windows, `run_android.ps1` Windows / `run_android.sh` macOS-Linux Android debug loop). Each mirrors the matching CI job: `--version` reproduces the tag-derived version, and `build_deb.sh` runs the same `verify-deb.sh` check as the Linux CI job.
 
 This is a monorepo: `ui-android/` and `ui-desktop/` are plain directories (their git histories were preserved via `git subtree` when they were imported from the former standalone repos `open-nexa/nexa-android` / `open-nexa/nexa-desktop`), not submodules — commit app changes directly here, alongside the server crates. One tag (e.g. `v0.2.0`) releases the server archives, the desktop bundles and the signed APK together from `.github/workflows/release.yml`.
 
@@ -20,7 +20,7 @@ This is a monorepo: `ui-android/` and `ui-desktop/` are plain directories (their
 - `cargo run -p nexapipe -- --local-proxy` — client local-proxy mode.
 - `cargo test --workspace` — run all Rust tests.
 - `cargo fmt` and `cargo clippy --workspace` — format and lint.
-- Android: `run_android.ps1` (cargo-ndk cdylib build with `jni,local-proxy,tun-proxy` + install/run on a device), `ui-android\gradlew.bat :app:compileDebugKotlin`.
+- Android: `run_android.ps1` (Windows) or `run_android.sh` (macOS/Linux) — the cargo-ndk cdylib build with `jni,local-proxy,tun-proxy` + install/run on a device — and `ui-android\gradlew.bat :app:compileDebugKotlin`.
 - Desktop: `cd ui-desktop && npm run tauri:dev` (dev) / `npm run tauri:build` (release); for a release-like package use `build_dmg.sh` / `build_deb.sh` / `build_windows.ps1` from the root.
 
 `crates/nexapipe-client/src/tun_proxy/` is shared by Android (fd entry, `TunProxy::new`) and the desktop (`TunProxy::with_io`); the fd plumbing in `tun_proxy/fd.rs` is Unix-only, and only its Android half is compiled there. Host `cargo check -p nexapipe-client --features tun-proxy` covers the shared code, but the Android half still needs an explicit cross-check after touching the TUN or the L4 client:

@@ -34,7 +34,7 @@ NexaPipe 是一个 Rust workspace，由四部分组成：
 [安全边界](#安全边界) ·
 [客户端库](#使用客户端库) · [客户端应用](#客户端应用) ·
 [开发](#开发) · [贡献](CONTRIBUTING.md) · [路线图](docs/ROADMAP.md) ·
-[变更日志](CHANGELOG.md) · [v1.0.0 发布说明](https://open-nexa.github.io/nexapipe/v1.0.0.html)
+[变更日志](CHANGELOG.md) · [v1.1.0 发布说明](https://open-nexa.github.io/nexapipe/v1.1.0.html)
 
 ---
 
@@ -107,7 +107,8 @@ Android JNI 用的 `cdylib`，以及面向 Swift/Kotlin/Python 的 UniFFI 绑定
 | `ui-desktop/` | Tauri 2 桌面应用（Vue 3 + TypeScript）。 |
 | `config.toml.example` | 覆盖全部配置项的示例（服务端 + 客户端）。它出厂即开启 2FA 且没有任何已 enrolled 的客户端，因此全新安装在 enrolled 第一个客户端之前会拒绝所有连接。复制成 `config.toml` —— 该文件名已被 gitignore，它是运维者的实际配置。Docker compose 用的是 `config/config.toml`，通过 `NEXAPIPE_CONFIG_DIR=/app/config` 让二进制默认读取。 |
 | `config.toml.2fa.example` | 同一个文件，但更短：它不含日志、健康检查和指标这三段，并带有一个 `[auth.clients]` 条目 —— 一个已经 enrolled 的客户端。两份示例都是 2FA 开启。 |
-| `run_android.ps1` | 一键 Android 调试循环（构建 → 安装 → 启动 → logcat）。 |
+| `run_android.ps1` | 一键 Android 调试循环（构建 → 安装 → 启动 → logcat），Windows 版。 |
+| `run_android.sh` | 同一个一键 Android 调试循环的 macOS/Linux（bash）版本。 |
 
 ---
 
@@ -493,7 +494,7 @@ relay 那份也是同样的声明。这些指令不是同一时期引入的，sy
 | `--invite-domains <LIST>` | 邀请码中的域名，逗号分隔（默认：`[local_proxy] proxy_domains`，否则取路由主机名）。 |
 | `--invite-name <NAME>` | 与端点一同保存的标签。 |
 | `--invite-relay <URL>` | 邀请码中的中继 URL（默认：`[iroh] relay_url`）。 |
-| `--endpoint-id <NODE_ID>` | 要对外公布的端点（默认：由 `[iroh] secret_key` 推导）。需要地址查找：客户端通过 discovery 解析它。 |
+| `--endpoint-id <NODE_ID>` | 要对外公布的端点（默认：由 `[iroh] secret_key` 推导）。需要地址查找：客户端通过 discovery 解析它。当配置里写着本服务端自己的身份时，公布的端点必须是本服务端：会把本服务端 2FA 凭据带到别的端点的邀请码会被拒绝。 |
 | `--invite-ticket <TICKET>` | 用完整端点 ticket（服务端启动时打印的那个）代替 Node ID 对外公布。地址随链接携带，因此在 `[iroh] discovery = "none"` 下同样可用。需配合 `--generate-invite`；与 `--endpoint-id` 互斥。必须是本服务端自己的 ticket：会把本服务端的 2FA 凭据带到别的端点的邀请码会被拒绝。 |
 
 ### `nexapipe client`

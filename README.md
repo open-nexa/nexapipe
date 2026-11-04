@@ -39,7 +39,7 @@ NexaPipe is a Rust workspace with four parts:
 [Client library](#using-the-client-library) · [Apps](#client-apps) ·
 [Development](#development) · [Contributing](CONTRIBUTING.md) ·
 [Roadmap](docs/ROADMAP.md) · [Changelog](CHANGELOG.md) ·
-[v1.0.0 notes](https://open-nexa.github.io/nexapipe/v1.0.0.html)
+[v1.1.0 notes](https://open-nexa.github.io/nexapipe/v1.1.0.html)
 
 ---
 
@@ -121,7 +121,8 @@ bindings for Swift/Kotlin/Python. See
 | `ui-desktop/` | Tauri 2 desktop app (Vue 3 + TypeScript). |
 | `config.toml.example` | Example server + client configuration covering every section. It ships with 2FA **on** and no client enrolled, so a fresh install refuses every connection until one is enrolled. Copy it to `config.toml` — that name is gitignored, it is the operator's live config. The docker compose file uses `config/config.toml` instead, picked up via `NEXAPIPE_CONFIG_DIR=/app/config`. |
 | `config.toml.2fa.example` | The same, with a `[auth.clients]` entry — a client that is enrolled already. **The secret in it is published**, so it is a demonstration of what an enrolled client looks like rather than one to use: replace it with `nexapipe --generate-2fa client-001 --force` before the listener is reachable. |
-| `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat). |
+| `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat), for Windows. |
+| `run_android.sh` | The same one-shot Android debug loop for macOS and Linux (bash). |
 
 ---
 
@@ -557,7 +558,7 @@ will name.
 | `--invite-domains <LIST>` | Domains to put in the invite, comma-separated (default: `[local_proxy] proxy_domains`, else the route hosts). |
 | `--invite-name <NAME>` | Label stored alongside the endpoint. |
 | `--invite-relay <URL>` | Relay URL in the invite (default: `[iroh] relay_url`). |
-| `--endpoint-id <NODE_ID>` | Endpoint to publish (default: derived from `[iroh] secret_key`). Requires lookup: the client resolves it through discovery. |
+| `--endpoint-id <NODE_ID>` | Endpoint to publish (default: derived from `[iroh] secret_key`). Requires lookup: the client resolves it through discovery. When the configuration names this server's identity, the endpoint has to be this server's own: an invite that would carry this server's 2FA credential to another endpoint is refused. |
 | `--invite-ticket <TICKET>` | Publish a full endpoint ticket (as printed at server start) instead of a Node ID. The addresses ride in the link, so the invite works with `[iroh] discovery = "none"`. Requires `--generate-invite`; conflicts with `--endpoint-id`. It has to be this server's own ticket: an invite that would carry this server's 2FA credential to another endpoint is refused. |
 
 ### `nexapipe client`
@@ -1938,7 +1939,7 @@ RTT. `TransportTuning` raises it and can be overridden without a rebuild:
 | `NEXAPIPE_QUIC_CONGESTION` | `bbr` | The congestion controller: `bbr` or `cubic`. BBR is model-based and paces to the bottleneck bandwidth and the minimum round trip time, so a random loss on a long path does not cost a window; Cubic reads a loss as congestion and cuts back. An unrecognised value warns and keeps the default. |
 
 Never override iroh's multipath or NAT-traversal knobs — doing so breaks hole
-punching. `TUN_MTU` is 1400 and must be identical in every TUN implementation.
+punching. `TUN_MTU` is 1280 and must be identical in every TUN implementation.
 
 ### TUN tuning
 

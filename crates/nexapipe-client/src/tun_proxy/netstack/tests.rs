@@ -35,7 +35,7 @@ fn tcp_stack() -> (
     StackBuilder::default()
         .enable_tcp(true)
         .enable_udp(false)
-        .mtu(1400)
+        .mtu(1280)
         .tcp_recv_buffer_size(16 * 1024)
         .tcp_send_buffer_size(16 * 1024)
         .build()
@@ -52,7 +52,7 @@ fn udp_stack() -> (
     StackBuilder::default()
         .enable_tcp(false)
         .enable_udp(true)
-        .mtu(1400)
+        .mtu(1280)
         .build()
         .expect("the stack builds")
 }

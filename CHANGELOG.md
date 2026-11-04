@@ -10,19 +10,18 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
-**v1.0.0 is out.** The v0.7.0 release planned for this cycle was cancelled
-after a review of the project against comparable products; the scope that
-replaced it, and the items that were deliberately dropped from it, are recorded
-in [§0 of the roadmap](docs/ROADMAP.md#0-the-v100-decision-2026-10-20).
-Nothing that shipped in 0.6.1 changes: every configuration key keeps its name
+**v1.1.0 is out.** The cycle before it cancelled v0.7.0 and shipped v1.0.0
+instead; the scope that replaced it, and the items that were deliberately
+dropped from it, are recorded in
+[§0 of the roadmap](docs/ROADMAP.md#0-the-v100-decision-2026-10-20). This
+cycle opens no new capability on the server. What it does is turn the
+configuration, the credential check and the access record into things a
+deployment can replace; answer the tunnel's questions the way the protocol
+says they are to be answered; and take the delay out of the path a phone's
+traffic takes. Every configuration key that shipped in 1.0.0 keeps its name
 and its meaning.
 
-## [Unreleased]
-
-> The three items below are already in the crates.io releases of `nexapipe`,
-> `nexapipe-client` and `nexapipe-proto` at 1.0.0 and 1.0.1. They stay listed
-> here because the tag that would carry them into the server archives, the
-> desktop bundles and the signed APK has not been cut yet.
+## [1.1.0] — 2026-11-04
 
 ### Added
 
@@ -82,6 +81,31 @@ and its meaning.
   only moves the leak next door.
   A sink runs on a thread of its own, so one that reaches the network cannot
   hold up the log file, and the log file cannot hold up the sink.
+- **Where the proxy keeps what it keeps is now a store, and the file is one
+  implementation of it.** The configuration, the runtime counters and the
+  admin token were three files at three paths, read and written by name from
+  wherever they were needed. That is fine for one store and awkward for two:
+  a deployment that keeps its configuration in a database has no file to read,
+  and every reader that names a path is a reader that cannot be moved.
+  `Storage` says what a store has to be able to do — read the configuration,
+  write a client's credential, count a lockout, hand out the admin token —
+  and a backend says how it does it. `FileStorage` is the one that exists
+  today, and it behaves exactly as the code behaved before: the same files,
+  the same locks, the same messages.
+  The configuration is handed out as **text**, so a store that keeps it in
+  rows still answers with the same TOML the file would have held, and every
+  reader, every error message and every validation runs in the one place
+  that names a key. The credentials are not: a client's secret, a device's
+  key and the admin token travel as the zeroizing types they have always
+  travelled as.
+  A write is **by entity, never by document** — a write that re-rendered the
+  whole configuration would take the operator's comments with it, and one
+  that replaced the whole document would take a route somebody added while
+  the server was running. So the interface says "this client's secret", and
+  the backend decides what that means in its own terms.
+  The interface is asynchronous because a database is: the file backend does
+  its work in a blocking task and answers immediately, while a backend that
+  talks to a server answers when the server answers.
 - **The three crates are publishable.** They were marked `publish = false`, so
   nothing outside this repository could depend on them — which is a problem for
   the one thing a library is for. The client is the piece that is meant to be
@@ -113,6 +137,12 @@ and its meaning.
   The client logs the same split from its own side — the time the stream took
   to open and the time the status byte took to come back — so the two ends can
   be compared against each other.
+- **The one-shot Android debug loop runs on macOS and Linux too.**
+  `run_android.sh` is the bash port of `run_android.ps1`: the same six stages —
+  preflight, Rust build, JNI symbol check, install, launch with a smoke check,
+  logcat streaming — with the same flags as long options (`--serial`, `--abi`,
+  `--build-only`, `--check`, …). A developer on a Unix machine no longer needs
+  PowerShell to drive a device.
 
 ### Changed
 
@@ -208,6 +238,22 @@ and its meaning.
   What the device sees is the same — the same handshake, the same windows, the
   same UDP path — and the tests that drive it are new: a segment that opens a
   connection, the bytes that travel each way, and a datagram in and out.
+- **The inner MTU is pinned to 1280.** It was 1400, but the tunnel path is
+  probed by PLPMTUD and observed to swing between roughly 1326 and 1452, so
+  1400 can sit above the current path MTU — and a TUN MTU is fixed when the
+  interface is created, with no setter to follow the probe afterwards. 1280 is
+  the IPv6 minimum link MTU (RFC 8200), it sits below every observed PLPMTUD
+  valley, and it is the floor Tailscale pins and WireGuard falls back to.
+  Existing connections keep the MSS they negotiated; the value applies to the
+  flows opened after it. All three definitions of it — client, desktop and
+  Android — carry the same number, along with the examples, the tests and the
+  documents that name it.
+- **A flow socket no longer waits to answer a small message.** smoltcp enables
+  Nagle and a 10 ms delayed ACK by default. A flow socket's peer is the
+  device's own kernel on the TUN descriptor, so an acknowledgement costs a
+  local round trip rather than a network one — and both defaults only add
+  latency to the small messages an interactive session is made of. Both are
+  off on every new flow socket now, with a regression test that says so.
 - **The Android app and the client library agree about which invite codes are
   valid.** The Android codec says it mirrors `nexapipe_client::provisioning`
   and that both must accept and reject the same codes, because one writes
@@ -246,6 +292,22 @@ and its meaning.
 
 ### Fixed
 
+- **An invite cannot point at one endpoint while carrying another endpoint's
+  credential.** `--endpoint-id` published whatever endpoint it was given and
+  put this server's 2FA secret or its one-time enrollment token into the same
+  link — and a client that scans that link sends the credential to the
+  endpoint the link names. An endpoint ID that is not this server's therefore
+  handed this server's secret to whichever endpoint holds that ID, where a
+  one-time code can be captured and replayed here for as long as it is valid.
+  The endpoint an invite names and the credential it carries now have to
+  belong to the same server: when the configuration says who this server is
+  (`[iroh] secret_key`), an invite naming another endpoint is refused, and
+  warned about when it carries no credential — then it is a wrong address
+  rather than a leaked secret. The check runs before the credential is
+  touched, so a refused invite does not revoke the enrollment token the
+  operator still holds. `--endpoint-id` keeps its meaning where the
+  configuration names no identity at all: a server that generates its
+  identity at start-up has no other way to be published.
 - **The desktop does not act on one missed service read.** The service gate is
   read over the IPC port, and that read has deadlines of its own — half a
   second to connect and five to be answered. A busy machine misses them while
@@ -348,9 +410,6 @@ and its meaning.
   route that named the same backend twice was failed twice by one probe and
   taken out of rotation by a single round's worth of noise. It is counted
   once.
-
-### Fixed
-
 - **The client does not record its own refusal as a backend failure.** A full
   connection pool and a credential replaced mid-dial are refusals the client
   made, not facts about the backend. Both reached the place where every
@@ -377,8 +436,30 @@ and its meaning.
   open, and a timeout is treated the way the open's timeout already is: the
   connection is discarded and the attempt ends, within the same overall
   budget.
+- **A poisoned address map is rebuilt, not answered with a name that is not
+  there.** The map of the virtual addresses held two directions: the domain
+  an address was handed out for, and the address a domain was handed. A
+  panic between the two inserts of an allocation leaves them out of step,
+  and a poisoned lock recovered into that state. The name was then handed a
+  **new** address on its next lookup, and the packets the application still
+  sent to the old one were answered with a name that was not there any more.
+  The direction the packet path reads is the one that survives a poison; the
+  other is rebuilt from it when the lock is recovered.
+- **The UDP flow ceiling is counted instead of walked.** The demultiplexer
+  checked the ceiling by walking the whole flow table on every datagram. The
+  table is counted in an atomic now, and the walk runs only when the count
+  says the ceiling was reached — to sweep out the flows that ended but
+  whose task has not reached its bookkeeping yet. The count is given back
+  exactly when the entry is removed, so it cannot drift from the table it
+  counts.
+- **A DNS reply is dropped rather than held.** The reply was handed to the
+  TUN writer with a blocking send, and that writer's queue is shared with
+  the UDP flows: a full queue held the reply — and the flows behind it —
+  until it drained. The reply is time-sensitive, because the resolver
+  retries a query that gets no answer, so it is dropped now and the retry
+  does the work.
 
-### Fixed
+### Fixed in the release pipeline
 
 - **A Linux client gets an update now.** The v1.0.0 release went out with an
   updater manifest that covered four of the six platforms: `linux-x86_64` and

@@ -183,13 +183,20 @@ const DNS_PORT: u16 = 53;
 /// Inner MTU for both the TUN device (see `Builder.setMtu` in NexaVpnService.kt) and the
 /// smoltcp stack. These two must agree.
 ///
-/// Not 1500: an inner IP packet of 1500 bytes does not fit in one QUIC datagram. iroh's MTU
-/// discovery tops out around a 1452-byte UDP payload, and the QUIC short header plus the
-/// AEAD tag eat ~17 more bytes, leaving ~1435 for stream data. A 1500-byte inner packet
-/// therefore had to be fragmented across two datagrams, roughly doubling the datagram count
-/// and the number of AEAD operations per megabyte. 1400 leaves ~35 bytes of headroom and
-/// keeps one inner segment == one QUIC datagram.
-const TUN_MTU: usize = 1400;
+/// 1280 is the IPv6 minimum MTU (RFC 8200), below every path MTU iroh's PLPMTUD
+/// has been observed to settle on — the same floor Tailscale pins. The inner
+/// traffic rides QUIC byte streams rather than one-datagram-per-segment, so
+/// this is a safety floor for the tunnel's own segment sizing, not a
+/// guarantee that one inner segment maps to one QUIC datagram.
+///
+/// 1400 assumed the probe would reach its ~1452-byte ceiling. Measured paths sat at 1326
+/// (one that reached 1452 lost 20 packets), where an MSS of 1360 spilt a full inner segment
+/// into a tail fragment. Tracking PLPMTUD at runtime is not an option: the TUN MTU is fixed
+/// at `establish()`, smoltcp's interface MTU has no setter, and TCP MSS is negotiated at the
+/// handshake, so changing it would drop every live connection and still not reach an
+/// established one. QUIC carries a byte stream, so continuous traffic still fills whole
+/// datagrams and the efficiency cost is small.
+const TUN_MTU: usize = 1280;
 
 /// The per-socket TCP window the TUN stack uses, in bytes.
 ///
@@ -886,6 +893,14 @@ impl TunProxy {
         }
 
         // Stack → TUN pump (Stack Stream → writer).
+        //
+        // Unlike the Android fd pump this path does not retry on `WouldBlock`:
+        // `tun`'s `AsyncDevice` writer handles EAGAIN internally, and the
+        // contract of `AsyncWrite::write_all` is to keep writing until all
+        // bytes are written or an error occurs. A writer that returned
+        // `WouldBlock` from `write_all` without retrying would hang here — if
+        // such a writer is ever used, add the same retry loop the Android
+        // pump has above.
         {
             let stopped_clone = stopped.clone();
             tasks.push(tokio::spawn(async move {

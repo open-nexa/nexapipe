@@ -15,7 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use crate::conn::limits::{ByteBudget, ByteReservation};
 use crate::metrics::CopyLeg;
 
-/// Read size for the copy loops. Large enough that a 1400-byte inner segment never
+/// Read size for the copy loops. Large enough that a 1280-byte inner segment never
 /// needs two syscalls, small enough to stay off the allocator's slow path.
 pub const COPY_BUF_SIZE: usize = 16 * 1024;
 
