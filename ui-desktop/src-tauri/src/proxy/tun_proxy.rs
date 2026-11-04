@@ -673,7 +673,7 @@ impl Drop for TeardownGuard {
 /// Order of precedence: WINTUN_PATH injected at compile time (where build.rs copied it)
 /// → exe directory → exe/wintun/bin/{arch} → bundled resources dir → runtime WINTUN_PATH.
 #[cfg(windows)]
-fn find_wintun_path() -> Option<PathBuf> {
+pub(crate) fn find_wintun_path() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(p) = option_env!("WINTUN_PATH") {
         candidates.push(PathBuf::from(p));

@@ -320,11 +320,16 @@ fn sc_state(query_output: &str, exit_code: Option<i32>) -> ScState {
 /// was already gone reported success with the directory still under Program Files.
 #[cfg(any(windows, test))]
 fn remove_copy_batch(dir: &Path, binary: &Path) -> Vec<String> {
+    let wintun = dir.join(WINTUN_DLL_NAME);
     vec![
         format!("del /f /q \"{}\"", binary.display()),
         // The delete reports a refusal and keeps going; this is what turns it into the one
         // code the escalation knows.
         format!("if exist \"{}\" exit /b 5", binary.display()),
+        // The service loads wintun.dll from its own directory; it is ours to remove too, or
+        // the directory stays behind with a copy of the runtime in it.
+        format!("del /f /q \"{}\"", wintun.display()),
+        format!("if exist \"{}\" exit /b 5", wintun.display()),
         format!("if exist \"{}\" rmdir \"{}\"", dir.display(), dir.display()),
         // Not empty: somebody else's files keep it there, so the refusal is not ours to undo.
         format!("if exist \"{}\\*\" exit /b 0", dir.display()),
@@ -342,6 +347,14 @@ fn remove_copy_batch(dir: &Path, binary: &Path) -> Vec<String> {
 /// system-wide one alike.
 #[cfg(any(windows, test))]
 pub(crate) const SERVICE_BINARY_NAME: &str = "nexa-service.exe";
+
+/// The Wintun runtime the service loads when it creates the tunnel.
+///
+/// Kept next to the service binary because that is where `find_wintun_path` looks first once
+/// the service runs from `C:\Program Files\Nexa\Service` — the app's own copy is in the
+/// per-user installation directory, which the service does not share.
+#[cfg(any(windows, test))]
+pub(crate) const WINTUN_DLL_NAME: &str = "wintun.dll";
 
 /// The directory the service binary is copied into when the service is
 /// registered.
@@ -1110,6 +1123,18 @@ The specified service has been marked for deletion.
                     .to_string()
             ),
             "a file that is still there has to ask for elevation by exit code: {script:?}"
+        );
+        assert!(
+            script.contains(
+                &r#"del /f /q "C:\Program Files\Nexa\Service\wintun.dll""#.to_string()
+            ),
+            "the runtime the service loads has to go with the binary: {script:?}"
+        );
+        assert!(
+            script.contains(
+                &r#"if exist "C:\Program Files\Nexa\Service\wintun.dll" exit /b 5"#.to_string()
+            ),
+            "a runtime that survived the delete is a refusal like any other: {script:?}"
         );
         assert!(
             !script
