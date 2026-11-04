@@ -984,6 +984,12 @@ jobs:
 
       - name: Record the artifact sizes
         shell: bash
+        # The script lives at the root of the repository and the job's steps
+        # run in `ui-desktop`, so the step runs from the root as well — the
+        # path it is handed is repository-root-relative, and a path that does
+        # not exist is skipped rather than an error, which is how a step that
+        # looks for a file in the wrong directory ends up weighing nothing.
+        working-directory: ${{ github.workspace }}
         run: .github/scripts/record-sizes.sh "desktop bundles" ui-desktop/release-artifact
 
       - name: Upload build artifacts
