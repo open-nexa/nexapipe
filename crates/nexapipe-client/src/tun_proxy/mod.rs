@@ -183,9 +183,11 @@ const DNS_PORT: u16 = 53;
 /// Inner MTU for both the TUN device (see `Builder.setMtu` in NexaVpnService.kt) and the
 /// smoltcp stack. These two must agree.
 ///
-/// 1280 is the IPv6 minimum MTU (RFC 8200), below every path MTU iroh's PLPMTUD can settle
-/// on, so one inner segment always fits in one QUIC datagram — even while the path MTU is
-/// still being probed or has fallen back after loss.
+/// 1280 is the IPv6 minimum MTU (RFC 8200), below every path MTU iroh's PLPMTUD
+/// has been observed to settle on — the same floor Tailscale pins. The inner
+/// traffic rides QUIC byte streams rather than one-datagram-per-segment, so
+/// this is a safety floor for the tunnel's own segment sizing, not a
+/// guarantee that one inner segment maps to one QUIC datagram.
 ///
 /// 1400 assumed the probe would reach its ~1452-byte ceiling. Measured paths sat at 1326
 /// (one that reached 1452 lost 20 packets), where an MSS of 1360 spilt a full inner segment

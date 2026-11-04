@@ -429,6 +429,11 @@ impl IpMapping {
     /// On poison we rebuild `domain_to_ip` from `ip_to_domain`, which is the
     /// direction the packet path reads: a destination address is looked up to
     /// find its domain, so the forward map is the source of truth.
+    ///
+    /// The poison is cleared once the rebuild has succeeded: a lock that stays
+    /// poisoned runs this closure on every acquisition, which would put the
+    /// rebuild's map-wide work and allocations on the packet path for the
+    /// lifetime of the mapping instead of once.
     fn locked(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|poisoned| {
             let mut inner = poisoned.into_inner();
@@ -436,6 +441,7 @@ impl IpMapping {
             if let Some(v6) = inner.v6.as_mut() {
                 v6.rebuild_reverse();
             }
+            self.inner.clear_poison();
             inner
         })
     }
@@ -900,5 +906,9 @@ mod tests {
         // The recovery rebuilds the map the allocator reads, so the name still
         // answers with the address it had.
         assert_eq!(mapping.allocate("b.test"), second);
+
+        // The recovery clears the poison as well: a lock left poisoned would
+        // rerun the rebuild on every later acquisition.
+        assert!(!mapping.inner.is_poisoned());
     }
 }

@@ -457,7 +457,10 @@ CARGO_NDK="$(command -v cargo-ndk)"
 
 SDK_ROOT="$(resolve_android_sdk)" || die "Android SDK not found (set ANDROID_HOME or add sdk.dir to ui-android/local.properties)"
 resolve_ndk_home "$SDK_ROOT"
-ADB="$(resolve_adb "$SDK_ROOT")"
+# A missing adb is fatal only when a stage needs a device; --check wants to
+# report it as a warning and a build-only run does not need it at all. A bare
+# assignment would abort under set -e before either of those could say why.
+ADB="$(resolve_adb "$SDK_ROOT" || true)"
 
 ok "cargo      : $CARGO"
 ok "cargo-ndk  : $CARGO_NDK"
@@ -493,12 +496,12 @@ $NO_LOG       || need_device=1
 DEVICE=""
 if [[ -n "$ADB" ]]; then
     ok "adb        : $ADB"
+elif $CHECK_ONLY; then
+    warn "adb not found under $SDK_ROOT/platform-tools"
+elif [[ "$need_device" -ne 0 ]]; then
+    die "adb not found; install the platform-tools package of the SDK"
 else
-    if $CHECK_ONLY; then
-        warn "adb not found under $SDK_ROOT/platform-tools"
-    else
-        die "adb not found; install the platform-tools package of the SDK"
-    fi
+    warn "adb not found; no device stage is selected, continuing without one"
 fi
 
 if [[ -n "$ADB" ]]; then
@@ -549,15 +552,19 @@ fi
 if ! $SKIP_RUST; then
     step "Building the client cdylib ($RUST_TARGET, features: $FEATURES)"
     # Run from the repo root so the root .cargo/config.toml (target linker)
-    # applies.
+    # applies — the script may be invoked from any directory, and Cargo
+    # discovers that config from the working directory, not the manifest.
     info "\$ cd $REPO_ROOT"
     # --package, not -p: after "build" every argument is forwarded to cargo,
     # but the short -p would be ambiguous with cargo-ndk's own --platform
     # option. --platform $MIN_SDK matches CI (release-apk.yml builds with
     # --platform 26).
-    run_native 'cargo ndk build' \
-        "$CARGO" ndk --target "$RUST_TARGET" --platform "$MIN_SDK" \
-        build --release --package nexapipe-client --features "$FEATURES"
+    (
+        cd "$REPO_ROOT" || die "cannot change into $REPO_ROOT"
+        run_native 'cargo ndk build' \
+            "$CARGO" ndk --target "$RUST_TARGET" --platform "$MIN_SDK" \
+            build --release --package nexapipe-client --features "$FEATURES"
+    )
     ok "cargo ndk build finished"
 else
     step "Skipping the Rust build (--skip-rust); reusing $SO_SOURCE"
@@ -604,6 +611,10 @@ ok "installed into $JNI_LIB_DIR"
 if ! $SKIP_INSTALL; then
     step "gradlew :app:installDebug"
     [[ -x "$GRADLE_WRAPPER" ]] || die "gradlew not found at $GRADLE_WRAPPER (is ui-android checked out in this repository?)"
+    # Gradle picks a device of its own without ANDROID_SERIAL, and with more
+    # than one attached it can install to a device other than the one this
+    # script selected with --serial (or auto-detected).
+    export ANDROID_SERIAL="$DEVICE"
     # -Pabi keeps the build to the one APK this device can run; without it
     # assembleDebug produces one per ABI and installDebug has more than one
     # candidate to put on it.
@@ -630,7 +641,7 @@ if ! $SKIP_INSTALL; then
                 echo ""
                 warn "INSTALL_FAILED_USER_RESTRICTED — the device blocked the install."
                 info "On Xiaomi/MIUI/HyperOS: Settings → Developer options → enable"
-                info "  \"USB 安装\" (USB install) and \"USB 调试 (安全设置)\"."
+                info "  \"USB install\" and \"USB debugging (Security settings)\"."
                 info "On other OEMs: look for a similar \"install via USB\" toggle."
             fi
             exit 1
@@ -662,12 +673,17 @@ if ! $SKIP_LAUNCH; then
     fi
 
     launch_output=""
-    capture_native launch_output "$ADB" -s "$DEVICE" shell am start -W -n "$ACTIVITY" || true
+    # Keep the command's status: older adb shells exit 0 with an error in the
+    # text (caught by the pattern below), while a transport failure exits
+    # nonzero without printing anything the pattern would match.
+    launch_status=0
+    capture_native launch_output "$ADB" -s "$DEVICE" shell am start -W -n "$ACTIVITY" \
+        || launch_status=$?
     while IFS= read -r line; do
         info "$line"
     done <<<"$launch_output"
-    if echo "$launch_output" | grep -qE 'Error(:| type)'; then
-        die "am start failed for $ACTIVITY"
+    if [[ $launch_status -ne 0 ]] || echo "$launch_output" | grep -qE 'Error(:| type)'; then
+        die "am start failed for $ACTIVITY (exit code $launch_status)"
     fi
     ok "activity started"
 
@@ -681,7 +697,11 @@ if ! $SKIP_LAUNCH; then
         loaded=""
         buffer=""
         while [[ $(date +%s) -lt $deadline ]]; do
-            mapfile -t filters < <(get_logcat_filters)
+            # mapfile needs Bash 4; macOS still ships 3.2 as /bin/bash.
+            filters=()
+            while IFS= read -r filter; do
+                filters+=("$filter")
+            done < <(get_logcat_filters)
             dump_output=""
             capture_native dump_output "$ADB" -s "$DEVICE" logcat -d -v brief "${filters[@]}" || true
             buffer="$dump_output"
@@ -736,7 +756,11 @@ info "actually bring the tunnel up - adb cannot tap it for you."
 info "Follow the file live in another window with:"
 info "    tail -f \"$LOG_FILE\""
 
-mapfile -t log_args < <(get_logcat_filters)
+# mapfile needs Bash 4; macOS still ships 3.2 as /bin/bash.
+log_args=()
+while IFS= read -r filter; do
+    log_args+=("$filter")
+done < <(get_logcat_filters)
 # The file is overwritten on every run, so truncate first.
 : > "$LOG_FILE"
 run_native 'logcat' "$ADB" -s "$DEVICE" logcat -v time "${log_args[@]}" >> "$LOG_FILE"

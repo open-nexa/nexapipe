@@ -270,8 +270,8 @@
     <p>On macOS the refusal is the strict one: the app does not open until the user chooses
       &ldquo;Open Anyway&rdquo; in the dialog, which is a click in System Settings &rarr; Privacy
       &amp; Security. The Tauri updater&rsquo;s own signature is separate from the operating
-      system&rsquo;s and is present either way, so an update installs the same way as the first
-      install does.</p>
+      system&rsquo;s and is produced when the release build runs with its signing key, so an update
+      installs the same way as the first install does whenever the release carried one.</p>
   </div>
 
   <h3 class="subhead">Desktop &amp; mobile app &mdash; nexa</h3>

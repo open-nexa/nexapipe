@@ -316,9 +316,8 @@ pub(super) async fn run_udp_demux(mut socket: UdpReadHalf, ctx: TunContext) {
                 }
 
                 warned_full.store(false, Ordering::Relaxed);
-                flows.insert(key, queue.clone());
+                insert_flow(&mut flows, &active_flows, key, queue.clone());
                 drop(flows);
-                active_flows.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(run_udp_flow(
                     ctx.clone(),
                     table.clone(),
@@ -628,6 +627,26 @@ fn release_flow(table: &FlowTable, key: &FlowKey, mine: &UdpQueue, active_flows:
     {
         flows.remove(key);
         active_flows.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Put a starting flow in the table, counting it only when it is new.
+///
+/// The insert may replace a closed entry — a flow that has ended but whose
+/// task has not reached `release_flow` yet. A replacement takes over a slot
+/// that is already counted: the flow it replaces can no longer give the count
+/// back, because `release_flow` only removes an entry that is still its own,
+/// so the count now belongs to the replacement. Counting a replacement as
+/// well would drift the count upward until a sweep reset it, and the drift
+/// itself would trigger that sweep.
+fn insert_flow(
+    flows: &mut HashMap<FlowKey, UdpQueue>,
+    active_flows: &AtomicUsize,
+    key: FlowKey,
+    queue: UdpQueue,
+) {
+    if flows.insert(key, queue).is_none() {
+        active_flows.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -986,6 +1005,73 @@ mod tests {
         assert!(
             !lock_flows(&table).contains_key(&key),
             "the entry is gone with the flow"
+        );
+    }
+
+    /// A flow that replaces a closed one takes over its count.
+    ///
+    /// The demultiplexer inserts a new queue whenever the entry it finds is
+    /// closed — a flow that has ended but whose task has not reached
+    /// `release_flow` yet. The closed entry was counted when it started, and
+    /// it can no longer give that count back, so the replacement inherits it
+    /// rather than adding one of its own: counting both would drift the
+    /// count upward and turn the ceiling's fast path into a sweep per
+    /// datagram.
+    #[tokio::test]
+    async fn a_replacement_flow_keeps_the_count_of_the_flow_it_replaced() {
+        let key: FlowKey = (
+            "127.0.0.1:1000".parse().expect("an address"),
+            "127.0.0.1:53".parse().expect("an address"),
+        );
+        let table: FlowTable = Arc::new(Mutex::new(HashMap::new()));
+        let active_flows = AtomicUsize::new(0);
+
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let queue = UdpQueue::new(sender);
+        insert_flow(&mut lock_flows(&table), &active_flows, key, queue.clone());
+        assert_eq!(
+            active_flows.load(Ordering::Relaxed),
+            1,
+            "the first flow is counted"
+        );
+
+        // The flow ends — its channel closes — but its task has not taken
+        // the entry out of the table yet.
+        drop(receiver);
+        assert!(
+            queue.sender.is_closed(),
+            "the ended flow's channel is closed"
+        );
+
+        // A datagram for the same five-tuple replaces it.
+        let (sender, _receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(UDP_FLOW_QUEUE);
+        let replacement = UdpQueue::new(sender);
+        insert_flow(
+            &mut lock_flows(&table),
+            &active_flows,
+            key,
+            replacement.clone(),
+        );
+        assert_eq!(
+            active_flows.load(Ordering::Relaxed),
+            1,
+            "the replacement takes over the count of the flow it replaced"
+        );
+
+        // The ended flow's late release leaves the count and the entry
+        // alone, and the replacement's release gives the count back exactly
+        // once.
+        release_flow(&table, &key, &queue, &active_flows);
+        assert_eq!(
+            active_flows.load(Ordering::Relaxed),
+            1,
+            "the ended flow cannot take the count the replacement now owns"
+        );
+        release_flow(&table, &key, &replacement, &active_flows);
+        assert_eq!(
+            active_flows.load(Ordering::Relaxed),
+            0,
+            "the count is given back with the last entry"
         );
     }
 }
