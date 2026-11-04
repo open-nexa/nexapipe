@@ -716,6 +716,11 @@ impl ProxyManager {
                 // The probe above connected to every backend, so an enrollment may have
                 // happened; the listen socket is the first thing that can fail afterwards.
                 self.remember_issued(&endpoint_group).await;
+                // The mode was set before the socket existed, and a mode of "running" with
+                // nothing listening is a lie the status reports and the frontend believes:
+                // it reads as a live proxy, so the failure is never read and never shown.
+                // The TUN branch puts it back to nothing for the same reason.
+                *self.mode.lock() = None;
                 return Err(StartError::Other(e));
             }
         };
@@ -1100,8 +1105,7 @@ impl ProxyManager {
 ///
 /// One slot per process: the proxy is run either by the app or by the service, and each process
 /// collects the credential its own start produced.
-static STASHED_ISSUED: parking_lot::Mutex<Option<IssuedCredential>> =
-    parking_lot::Mutex::new(None);
+static STASHED_ISSUED: parking_lot::Mutex<Option<IssuedCredential>> = parking_lot::Mutex::new(None);
 
 /// Keeps what an enrollment issued before a start failed, for [`take_stashed_issued`].
 ///

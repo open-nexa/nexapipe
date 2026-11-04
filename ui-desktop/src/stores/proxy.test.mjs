@@ -55,6 +55,7 @@ globalThis.window = {
 
 const { useProxyStore } = await import('./proxy');
 const { useConfigStore } = await import('./config');
+const { createNode } = await import('./config/nodes');
 const { useToast } = await import('../composables/useToast');
 
 /**
@@ -241,8 +242,23 @@ test('a service that is stopped turns TUN off without claiming an outdated build
 test('a failed start still reads the credential its enrollment may have bought', async () => {
   const store = await freshStore();
 
+  // The node that is waiting for a credential: it holds a token, and the token is what the
+  // start spends.
+  const node = createNode({
+    connectionType: 'ticket',
+    ticket: 'ticket-1',
+    enrollment: { clientId: 'win11', token: 'token-1' },
+  });
+
   answers.set('start_proxy', null);
   answers.set('get_startup_error', { code: 'proxy.start_failed', detail: 'wintun.dll not found' });
+  // The credential the spent token bought, and the only copy of it.
+  answers.set('take_issued_credential', {
+    clientId: 'win11',
+    secret: 'JBSWY3DPEHPK3PXP',
+    algorithm: 'sha1',
+    device: 'win11',
+  });
   // One poll sees the start in progress, the next sees it given up — the shape
   // `waitForStart` reads as "it was starting and is not any more".
   let polls = 0;
@@ -261,6 +277,17 @@ test('a failed start still reads the credential its enrollment may have bought',
   assert.ok(
     calls.includes('take_issued_credential'),
     'the credential a spent token bought is read even though the start failed',
+  );
+  assert.equal(
+    node.twoFactor?.secret,
+    'JBSWY3DPEHPK3PXP',
+    'the credential the spent token bought is kept: without it the device has nothing to ' +
+      'authenticate with on the next start',
+  );
+  assert.equal(
+    node.enrollment,
+    undefined,
+    'the token is spent, so the node does not keep holding it beside the credential',
   );
 });
 

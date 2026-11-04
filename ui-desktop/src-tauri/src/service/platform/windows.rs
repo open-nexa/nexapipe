@@ -542,8 +542,12 @@ pub fn uninstall() -> Result<(), AppError> {
 /// only removed when it is empty: anything else in it belongs to somebody else, and leaving it
 /// behind is harmless.
 fn remove_system_copy(dir: &Path, binary: &Path) -> Result<(), AppError> {
+    // The runtime the service loads is copied in beside the binary by the install, so it is
+    // ours to take away again. The path is joined here, on the platform that runs the batch,
+    // because `Path::join` uses the separator of the host that joins it.
+    let wintun = dir.join(WINTUN_DLL_NAME);
     run(
-        |_| remove_copy_batch(dir, binary),
+        |_| remove_copy_batch(dir, binary, &wintun),
         "service uninstall (remove the system copy)",
         // The copy is under Program Files, so the delete is usually refused
         // for an ordinary user — and it is refused *then*, not before: the
