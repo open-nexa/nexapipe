@@ -10,6 +10,11 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
+**v1.1.1 is out.** It is a patch release, and a Windows one: the desktop app's
+service is given the Wintun runtime it needs to create the tunnel, and a start
+that fails after spending an enrollment token keeps the credential that token
+bought. Nothing on the wire changes, so nothing has to be enrolled again.
+
 **v1.1.0 is out.** The cycle before it cancelled v0.7.0 and shipped v1.0.0
 instead; the scope that replaced it, and the items that were deliberately
 dropped from it, are recorded in
@@ -20,6 +25,55 @@ deployment can replace; answer the tunnel's questions the way the protocol
 says they are to be answered; and take the delay out of the path a phone's
 traffic takes. Every configuration key that shipped in 1.0.0 keeps its name
 and its meaning.
+
+## [1.1.1] — 2026-11-05
+
+A patch release, and a Windows one. Nothing on the wire changes: the
+handshake, the ALPN and the L4 preface are the same, so a 1.1.0 client talks
+to a 1.1.1 server and the other way round, and nothing has to be enrolled
+again.
+
+### Fixed
+
+- **Desktop: the Windows service is given the Wintun runtime it needs to
+  create the tunnel.** The service binary is copied under
+  `C:\Program Files\Nexa\Service` so that the control manager runs a file the
+  ordinary user cannot replace — but only the binary was copied, and the
+  service creates the tunnel from its own directory. Every service-mode TUN
+  start failed with `wintun.dll not found`, *after* the authentication had
+  already succeeded, which reads like a backend problem:
+
+  ```
+  INFO  Authenticating connection with 2FA as client 'win11'
+  INFO  2FA authentication succeeded for client 'win11'
+  INFO  All 1 backend(s) reachable
+  INFO  TUN mode requested, starting TUN + DNS hijack mode
+  ERROR TUN proxy failed: wintun.dll not found.
+  ```
+
+  The install now resolves the runtime the app ships, copies it in beside the
+  service binary, checks the copy the same way the binary's copy is checked,
+  and gives it the same permissions; an install that cannot find the runtime
+  fails rather than registering a service whose tunnel can never come up. The
+  uninstaller takes the runtime away again with the binary — including the
+  NSIS uninstaller, which deletes the service binary and then removes the
+  directory, and could not remove a directory the runtime was still in.
+
+- **Desktop: a start that fails keeps the credential its enrollment bought.** A
+  registration token is spent by the first connection that presents it, and
+  the credential the server answers with is the only copy left. The TUN device
+  is created after that connection, so the most common failure was also the
+  one that lost it: the instance holding the credential was dropped, both
+  start paths unregistered the manager right after reporting the failure, and
+  the frontend only read the credential on the success path. The credential is
+  now moved out of the group before every failure return and every teardown,
+  kept where the read command can still find it, and collected on the failure
+  path as well as the successful one.
+
+- **Desktop: a local-proxy start that fails says so.** The mode was set before
+  the listen socket existed and the failure path did not put it back, so the
+  status answered "running" with nothing listening: the frontend took the
+  start as a success and the failure was never read and never shown.
 
 ## [1.1.0] — 2026-11-04
 
