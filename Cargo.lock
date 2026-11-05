@@ -2554,7 +2554,7 @@ dependencies = [
 
 [[package]]
 name = "nexapipe"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "base32",
@@ -2603,7 +2603,7 @@ dependencies = [
 
 [[package]]
 name = "nexapipe-client"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "android_logger",
  "anyhow",
@@ -2645,7 +2645,7 @@ dependencies = [
 
 [[package]]
 name = "nexapipe-proto"
-version = "1.1.1"
+version = "1.2.0"
 dependencies = [
  "hmac",
  "serde",
