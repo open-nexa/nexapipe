@@ -207,6 +207,15 @@ pub struct ProxyManagerConfig {
     /// selection any more — an implicit probe made the mode depend on how the app happened to be
     /// launched, so the same configuration could forward traffic two different ways.
     pub use_tun: bool,
+    /// Whether the endpoint may bind an IPv6 socket and offer IPv6 candidates to
+    /// hole punching. Off by default: on hosts where IPv6 exists but cannot carry
+    /// full-size QUIC datagrams (PPPoE: v6 MTU 1480, ICMPv6 "packet too big"
+    /// filtered), iroh's net report calls v6 usable and path migration moves
+    /// traffic onto it — where every datagram above the real MTU fails, which
+    /// reads as a connection that dies a few seconds in. On, it is the
+    /// candidate set the server and the Android app already publish: an IPv6
+    /// path is one more way for a connection to go direct.
+    pub use_ipv6: bool,
     pub relay_mode: String,
     pub relay_url: String,
     /// Bearer token for a `custom` relay that requires one. Only ever read together with
@@ -387,18 +396,29 @@ impl ProxyManager {
         if let Some(restriction) = &restriction {
             tracing::info!("Peers are dialled through {}", restriction.describe());
         }
-        // Bind IPv4 only. On hosts where IPv6 exists but cannot carry full-size QUIC
-        // datagrams (PPPoE: v6 MTU 1480, ICMPv6 "packet too big" filtered), iroh's net
-        // report calls v6 usable, relay dials and path migration move traffic onto v6 —
-        // where every datagram above the real MTU fails (sendmsg 10040), which reads as a
-        // connection that dies a few seconds in. With no v6 socket the net report stays
-        // v4-only and relay dials stop preferring v6. The TUN is IPv4-only anyway.
-        let mut ep_builder = Endpoint::builder(presets::N0)
-            .clear_ip_transports()
-            .bind_addr("0.0.0.0:0")
-            .map_err(|e| anyhow::anyhow!("Failed to configure the IPv4-only socket: {}", e))?
-            .transport_config(transport_tuning.transport_config())
-            .relay_mode(relay.relay_mode());
+        // Bind IPv4 only unless the user asked for IPv6 candidates. On hosts where IPv6
+        // exists but cannot carry full-size QUIC datagrams (PPPoE: v6 MTU 1480, ICMPv6
+        // "packet too big" filtered), iroh's net report calls v6 usable, relay dials and
+        // path migration move traffic onto v6 — where every datagram above the real MTU
+        // fails (sendmsg 10040), which reads as a connection that dies a few seconds in.
+        // With no v6 socket the net report stays v4-only and relay dials stop preferring
+        // v6. That is why v4-only is the default and IPv6 is the opt-in: the failure it
+        // prevents is silent and mid-connection, while what the opt-in buys — an IPv6
+        // path in the candidate set hole punching offers — is exactly what the server
+        // and the Android app publish by default. The TUN is IPv4-only either way; the
+        // candidates are about the iroh underlay, not the tunnel.
+        let mut ep_builder = if self.config.use_ipv6 {
+            Endpoint::builder(presets::N0)
+                .transport_config(transport_tuning.transport_config())
+                .relay_mode(relay.relay_mode())
+        } else {
+            Endpoint::builder(presets::N0)
+                .clear_ip_transports()
+                .bind_addr("0.0.0.0:0")
+                .map_err(|e| anyhow::anyhow!("Failed to configure the IPv4-only socket: {}", e))?
+                .transport_config(transport_tuning.transport_config())
+                .relay_mode(relay.relay_mode())
+        };
         ep_builder = discovery.apply(ep_builder);
         if let Some(restriction) = restriction {
             ep_builder = ep_builder.hooks(restriction);
@@ -1148,6 +1168,7 @@ mod tests {
                 .expect("round_robin is a strategy this client knows"),
             tun_name: "nexa-tun".to_string(),
             use_tun: false,
+            use_ipv6: false,
             relay_mode: "pinned".to_string(),
             relay_url: String::new(),
             relay_auth_token: String::new(),

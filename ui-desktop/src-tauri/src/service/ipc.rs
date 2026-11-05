@@ -345,6 +345,7 @@ impl std::fmt::Debug for StartProxyRequest {
             .field("load_balancing", &self.load_balancing)
             .field("tun_name", &self.tun_name)
             .field("use_tun", &self.use_tun)
+            .field("use_ipv6", &self.use_ipv6)
             .field("relay_mode", &self.relay_mode)
             .field("relay_url", &self.relay_url)
             .field("relay_auth_token", &present(&self.relay_auth_token))
@@ -374,6 +375,12 @@ pub struct StartProxyRequest {
     /// probe-based behaviour produced for an unprivileged caller anyway.
     #[serde(default)]
     pub use_tun: Option<bool>,
+    /// Whether the endpoint may bind IPv6 and offer IPv6 candidates to hole
+    /// punching. Absent means the IPv4-only default, which is what the desktop
+    /// did before the setting existed — and an older service binary ignores
+    /// the field entirely, so the default survives a version skew.
+    #[serde(default)]
+    pub use_ipv6: Option<bool>,
     pub relay_mode: Option<String>,
     pub relay_url: Option<String>,
     /// Bearer token for a custom relay that requires one.

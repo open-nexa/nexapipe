@@ -634,6 +634,9 @@ async function start(): Promise<void> {
       tunName: config.tunName,
       useService: config.useService,
       useTun: wantTun,
+      // Whether hole punching may offer an IPv6 path. Off is the v4-only socket
+      // the app always bound; on is the candidate set the server publishes.
+      useIpv6: config.useIpv6,
       relayMode: config.relayMode,
       relayUrl: config.relayUrl,
       // The token goes to the relay it was issued for and to no other: the

@@ -17,9 +17,16 @@ use std::sync::Arc;
 /// endpoint of its own, so a server with `discovery = "none"` still had a
 /// client asking n0 where it was — and a `custom` relay was not applied to
 /// that client at all.
+///
+/// Nothing configured means `pinned`, the same default the server, the
+/// desktop and the Android client resolve to — and for the same reason: iroh's
+/// own default picks the home relay by latency and migrates between them, and
+/// every migration drops the connections routed through it. This used to be
+/// `None`, which handed the endpoint to iroh's default, so the CLI client was
+/// the one endpoint left migrating.
 fn resolve_network_options(
     iroh: Option<&IrohConfig>,
-) -> anyhow::Result<(Option<RelayModeSpec>, DiscoveryMode)> {
+) -> anyhow::Result<(RelayModeSpec, DiscoveryMode)> {
     let relay = RelayModeSpec::parse(
         iroh.and_then(|c| c.relay_mode.as_deref()),
         iroh.and_then(|c| c.relay_url.as_deref()),
@@ -29,19 +36,14 @@ fn resolve_network_options(
                 .map(|token| token.expose_secret().as_str())
         }),
     )
-    .context("invalid [iroh] relay configuration")?;
+    .context("invalid [iroh] relay configuration")?
+    .unwrap_or(RelayModeSpec::Pinned);
     let discovery = match iroh.and_then(|c| c.discovery.as_deref()) {
         Some(value) => DiscoveryMode::parse(value)
             .with_context(|| format!("invalid [iroh] discovery: {value:?}"))?,
         None => DiscoveryMode::default(),
     };
-    tracing::info!(
-        "Relay: {}",
-        relay
-            .as_ref()
-            .map(RelayModeSpec::describe)
-            .unwrap_or_else(|| "default (nothing configured)".to_string())
-    );
+    tracing::info!("Relay: {}", relay.describe());
     tracing::info!("Discovery: {}", discovery.describe());
     Ok((relay, discovery))
 }
@@ -90,11 +92,9 @@ pub async fn run_local_proxy(
 
         let mut builder =
             Endpoint::builder(presets::N0).transport_config(transport_tuning.transport_config());
-        if let Some(relay) = &relay {
-            builder = builder.relay_mode(relay.relay_mode());
-        }
+        builder = builder.relay_mode(relay.relay_mode());
         builder = discovery.apply(builder);
-        if let Some(restriction) = relay.as_ref().and_then(|r| r.dial_restriction(discovery)) {
+        if let Some(restriction) = relay.dial_restriction(discovery) {
             builder = builder.hooks(restriction);
         }
         let ep = builder.bind().await?;
@@ -136,7 +136,7 @@ pub async fn run_local_proxy(
             nexapipe_client::connection_pool::parse_endpoint_addr(server_node_id, server_ticket)?;
         let conn_pool = nexapipe_client::IrohConnectionPool::new_with_options(
             endpoint_addr,
-            relay.clone(),
+            Some(relay),
             discovery,
         )
         .await?;

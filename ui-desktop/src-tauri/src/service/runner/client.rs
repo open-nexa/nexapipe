@@ -219,6 +219,7 @@ impl ServiceRunner {
                         req.load_balancing,
                         req.tun_name,
                         req.use_tun,
+                        req.use_ipv6,
                         req.relay_mode,
                         req.relay_url,
                         req.relay_auth_token,

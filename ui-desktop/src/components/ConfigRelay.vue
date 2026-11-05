@@ -13,6 +13,7 @@
  */
 import { useI18n } from "vue-i18n";
 import ConfigSection from "./ConfigSection.vue";
+import AppToggle from "./base/AppToggle.vue";
 import type { DiscoveryMode, RelayMode } from "../types";
 
 defineProps<{
@@ -26,6 +27,8 @@ defineProps<{
   relayAuthTokenRelay: string;
   /** Whether a Node ID may be resolved through n0's address lookup. */
   discoveryMode: DiscoveryMode;
+  /** Whether hole punching may offer an IPv6 path. */
+  useIpv6: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -33,6 +36,8 @@ const emit = defineEmits<{
   (e: "update:relayMode", mode: RelayMode): void;
   /** Another address lookup is in use. */
   (e: "update:discoveryMode", mode: DiscoveryMode): void;
+  /** The IPv6 setting changed. */
+  (e: "update:useIpv6", enabled: boolean): void;
   /** The URL as it is typed. */
   (e: "update:relayUrl", url: string): void;
   /** The URL field was left: the store trims it and rebinds the token to it. */
@@ -77,6 +82,16 @@ const { t } = useI18n();
           <option value="none">{{ t("config.discoveryNone") }}</option>
         </select>
         <p class="hint">{{ t("config.discoveryModeHint") }}</p>
+      </div>
+
+      <div class="form-group">
+        <label class="form-label">{{ t("config.useIpv6") }}</label>
+        <AppToggle
+          :model-value="useIpv6"
+          :label="t('config.useIpv6')"
+          @update:model-value="emit('update:useIpv6', $event)"
+        />
+        <p class="hint">{{ t("config.useIpv6Hint") }}</p>
       </div>
 
       <div v-if="relayMode === 'custom'" class="form-group">

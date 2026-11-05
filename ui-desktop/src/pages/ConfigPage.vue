@@ -56,6 +56,7 @@ const {
   importInvite,
   updateRelayMode,
   updateDiscoveryMode,
+  updateUseIpv6,
   updateRelayUrl,
   commitRelayUrl,
   updateRelayAuthToken,
@@ -228,8 +229,10 @@ watch(activeTab, () => {
           :relay-auth-token="config.relayAuthToken"
           :relay-auth-token-relay="config.relayAuthTokenRelay"
           :discovery-mode="config.discoveryMode"
+          :use-ipv6="config.useIpv6"
           @update:relay-mode="updateRelayMode"
           @update:discovery-mode="updateDiscoveryMode"
+          @update:use-ipv6="updateUseIpv6"
           @update:relay-url="updateRelayUrl"
           @commit:relay-url="commitRelayUrl"
           @update:relay-auth-token="updateRelayAuthToken"

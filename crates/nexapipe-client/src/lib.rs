@@ -14,6 +14,7 @@ pub mod http;
 pub mod lb;
 pub mod provisioning;
 pub mod relay;
+pub mod stable_ticket;
 pub mod traffic;
 pub mod transport;
 
@@ -77,6 +78,7 @@ pub use lb::LoadBalancingStrategy;
 pub use nexapipe_proto::secret::{Secret, SecretBytes, SecretString};
 pub use provisioning::{EndpointInvite, EndpointTarget, InviteTotp};
 pub use relay::{PINNED_RELAY_URL, RelayModeSpec, RelayRestriction};
+pub use stable_ticket::StableTicket;
 pub use transport::{Congestion, TransportTuning, transport_config, transport_config_with_tuning};
 
 #[cfg(feature = "local-proxy")]

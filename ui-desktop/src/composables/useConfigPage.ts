@@ -137,6 +137,14 @@ export function useConfigPage() {
   }
 
   /**
+   * Whether hole punching may offer an IPv6 path. A plain boolean with nothing
+   * bound to it, so the store takes the value directly.
+   */
+  function updateUseIpv6(enabled: boolean): void {
+    updateConfig({ useIpv6: enabled });
+  }
+
+  /**
    * The relay URL as it is typed.
    *
    * The store keeps the raw text while the field is being typed into and trims it when the field
@@ -174,6 +182,7 @@ export function useConfigPage() {
     importInvite,
     updateRelayMode,
     updateDiscoveryMode,
+    updateUseIpv6,
     updateRelayUrl,
     commitRelayUrl,
     updateRelayAuthToken,
