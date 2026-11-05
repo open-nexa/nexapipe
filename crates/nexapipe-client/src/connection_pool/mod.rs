@@ -214,19 +214,27 @@ pub fn parse_endpoint_addr(
     let ticket_addr = match server_ticket {
         Some(ticket_str) => {
             let trimmed = ticket_str.trim();
-            match trimmed.parse::<EndpointTicket>() {
-                Ok(ticket) => Some(ticket.into()),
-                Err(ticket_err) => {
-                    // A ticket that does not parse may still be a bare Node ID
-                    // that was put in the ticket field — which is what a
-                    // configuration that grew a ticket field around an
-                    // endpoint id looks like.
-                    let endpoint_id = trimmed.parse::<EndpointId>().map_err(|e| {
-                        crate::error::ClientError::ParseError(format!(
-                            "Failed to parse as ticket or node ID: {ticket_err} (as a node ID: {e})"
-                        ))
-                    })?;
-                    Some(endpoint_id.into())
+            // A blank ticket field is no ticket at all: a template or an
+            // unset placeholder leaves `server_ticket = ""` around a node ID
+            // that was working before the field existed, and an empty string
+            // is not a ticket anyone issued.
+            if trimmed.is_empty() {
+                None
+            } else {
+                match trimmed.parse::<EndpointTicket>() {
+                    Ok(ticket) => Some(ticket.into()),
+                    Err(ticket_err) => {
+                        // A ticket that does not parse may still be a bare Node ID
+                        // that was put in the ticket field — which is what a
+                        // configuration that grew a ticket field around an
+                        // endpoint id looks like.
+                        let endpoint_id = trimmed.parse::<EndpointId>().map_err(|e| {
+                            crate::error::ClientError::ParseError(format!(
+                                "Failed to parse as ticket or node ID: {ticket_err} (as a node ID: {e})"
+                            ))
+                        })?;
+                        Some(endpoint_id.into())
+                    }
                 }
             }
         }

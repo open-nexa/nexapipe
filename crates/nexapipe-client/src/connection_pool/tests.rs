@@ -1594,6 +1594,24 @@ fn a_node_id_in_the_ticket_field_still_parses() {
     assert_eq!(addr.id, id);
 }
 
+/// A blank ticket field is no ticket at all.
+///
+/// A template or an unset placeholder leaves `server_ticket = ""` around a
+/// node ID that was working before the field existed; an empty string is not
+/// a ticket anyone issued, so it counts as absent rather than as a parse
+/// error.
+#[test]
+fn a_blank_ticket_field_counts_as_absent() {
+    let id = iroh::SecretKey::generate().public();
+    let addr = parse_endpoint_addr(Some(&id.to_string()), Some("   "))
+        .expect("a blank ticket field is no ticket at all");
+    assert_eq!(addr.id, id);
+    assert!(
+        addr.addrs.is_empty(),
+        "with no ticket there is no path, only the identity"
+    );
+}
+
 /// Nothing at all is still refused.
 #[test]
 fn neither_a_node_id_nor_a_ticket_is_refused() {

@@ -273,7 +273,7 @@
     "discoveryN0": "Ask n0 (a Node ID is looked up)",
     "discoveryNone": "Ask nobody (tickets only)",
     "useIpv6": "IPv6 hole punching",
-    "useIpv6Hint": "Offer an IPv6 path to the peer when one exists, alongside IPv4. Off by default: on a network whose IPv6 cannot carry full-size QUIC datagrams the connection can die seconds in, which is why the socket was IPv4-only before this switch existed.",
+    "useIpv6Hint": "Offer an IPv6 path to the peer when one exists, alongside IPv4. Takes effect the next time the proxy starts. Off by default: on a network whose IPv6 cannot carry full-size QUIC datagrams the connection can die seconds in, which is why the socket was IPv4-only before this switch existed.",
     "restoreDefaults": "Restore defaults",
     "restoreDefaultsHint": "Puts the three addresses and the load-balancing strategy back to what a fresh installation has.",
     "networkDefaultsRestored": "The three addresses and the load-balancing strategy are back to their defaults.",

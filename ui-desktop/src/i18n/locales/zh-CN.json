@@ -273,7 +273,7 @@
     "discoveryN0": "向 n0 查询（按 Node ID 找地址）",
     "discoveryNone": "不查询任何人（只能用票据）",
     "useIpv6": "IPv6 打洞",
-    "useIpv6Hint": "存在 IPv6 路径时，与 IPv4 一并提供给对端打洞。默认关闭：在 IPv6 无法承载完整 QUIC 报文的网络上，连接可能在几秒后中断——这正是此开关出现前套接字只用 IPv4 的原因。",
+    "useIpv6Hint": "存在 IPv6 路径时，与 IPv4 一并提供给对端打洞。下次启动代理时生效。默认关闭：在 IPv6 无法承载完整 QUIC 报文的网络上，连接可能在几秒后中断——这正是此开关出现前套接字只用 IPv4 的原因。",
     "restoreDefaults": "恢复默认",
     "restoreDefaultsHint": "把三个地址和负载均衡策略恢复为全新安装时的值。",
     "networkDefaultsRestored": "三个地址和负载均衡策略已恢复为默认值。",
