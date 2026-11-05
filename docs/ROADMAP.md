@@ -7,7 +7,7 @@ intend to fix it.
 
 | | |
 |---|---|
-| Last updated | 2026-11-05 (**v1.1.1 shipped** — the release notes are in [docs/releases/v1.1.1.md](releases/v1.1.1.md); it is a patch release, and a Windows one: the desktop app's service is given the Wintun runtime it needs to create the tunnel, a start that fails after spending an enrollment token keeps the credential that token bought, and a local-proxy start that fails says so. Nothing on the wire changes. v1.1.0 shipped on 4 November 2026 — it opens no new capability and makes three of the things around the proxy replaceable: the credential check is a seam (`Authenticator`), the access log is a record rather than a line (`AccessRecord` / `AccessSink`), and where the proxy keeps what it keeps is a store (`Storage`, with the file behind it); a client can carry a ticket instead of a Node ID; the tunnel's opening is measured in three phases; the path a device's traffic takes is cheaper and the inner MTU is pinned to 1280; the desktop app is 32% smaller. **Phase 4 is renumbered to v1.2**: the edge binary keeps its id and its gate, and v1.1.0 took the number Phase 4 had. v1.0.0 shipped on 24 October 2026 — the scope is in [§0](#0-the-v100-decision-2026-10-20) and the release notes are in [docs/releases/v1.0.0.md](releases/v1.0.0.md); the third-party boundary is closed: `relay_mode = "custom"` really excludes n0's relays and `[iroh] discovery` switches the address lookup off; a device's credential can be a key instead of a shared secret; a client can be held to the ports it may reach; the server's runtime state lives in a file of its own beside the configuration; both clients pick their address block and can bring the tunnel back by themselves; the host-pattern rule is one rule on both sides; R16 closes: the process-wide ceilings are configurable through `[limits]`, and every finding of the 2026-10-10 audit is now fixed — see [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and [§6](#hardening-sweep--after-v060); [§4.1](#41-backend-handling-p2) closes C3 and C4 — `https://` backends and HTTP/2, `[retry]`, `[circuit_breaker]`, and the `least_conn` lease; R18's supply-chain verification landed: `cargo deny` over both cargo workspaces, every action pinned to a commit SHA, the base images pinned by digest, `--locked` in the Dockerfiles, and a signed image with a provenance attestation — see [§6](#hardening-sweep--after-v060); [§4.3](#43-identity-and-authorization-p1) records R5's second half — per-device Ed25519 keys, TOTP demoted to the enrollment moment — landing in the server and the client library, with both UIs still to come) |
+| Last updated | 2026-11-05 (**v1.2.0 shipped** — the release notes are in [docs/releases/v1.2.0.md](releases/v1.2.0.md); it opens one new thing on the client — a ticket that does not go stale: the Node ID plus exactly one relay URL and no IP addresses, so a client starts its handshake without waiting for an address lookup, while the lookup still runs and the direct path is still used; and nothing configured now means one fixed relay on the server and in the local proxy alike, because a relay that migrates drops the connections routed through it. The desktop can offer IPv6 candidates to hole punching, off by default. Nothing on the wire changes. **Phase 4 is renumbered to v1.3**: the edge binary keeps its id and its gate, and v1.2.0 took the number Phase 4 had. v1.1.1 shipped on 5 November 2026 — it is a patch release, and a Windows one: the desktop app's service is given the Wintun runtime it needs to create the tunnel, a start that fails after spending an enrollment token keeps the credential that token bought, and a local-proxy start that fails says so. Nothing on the wire changes. v1.1.0 shipped on 4 November 2026 — it opens no new capability and makes three of the things around the proxy replaceable: the credential check is a seam (`Authenticator`), the access log is a record rather than a line (`AccessRecord` / `AccessSink`), and where the proxy keeps what it keeps is a store (`Storage`, with the file behind it); a client can carry a ticket instead of a Node ID; the tunnel's opening is measured in three phases; the path a device's traffic takes is cheaper and the inner MTU is pinned to 1280; the desktop app is 32% smaller. Phase 4 has since been renumbered to v1.3. v1.0.0 shipped on 24 October 2026 — the scope is in [§0](#0-the-v100-decision-2026-10-20) and the release notes are in [docs/releases/v1.0.0.md](releases/v1.0.0.md); the third-party boundary is closed: `relay_mode = "custom"` really excludes n0's relays and `[iroh] discovery` switches the address lookup off; a device's credential can be a key instead of a shared secret; a client can be held to the ports it may reach; the server's runtime state lives in a file of its own beside the configuration; both clients pick their address block and can bring the tunnel back by themselves; the host-pattern rule is one rule on both sides; R16 closes: the process-wide ceilings are configurable through `[limits]`, and every finding of the 2026-10-10 audit is now fixed — see [§4.9](#49-security-and-stability-audit-2026-10-10-p0p1) and [§6](#hardening-sweep--after-v060); [§4.1](#41-backend-handling-p2) closes C3 and C4 — `https://` backends and HTTP/2, `[retry]`, `[circuit_breaker]`, and the `least_conn` lease; R18's supply-chain verification landed: `cargo deny` over both cargo workspaces, every action pinned to a commit SHA, the base images pinned by digest, `--locked` in the Dockerfiles, and a signed image with a provenance attestation — see [§6](#hardening-sweep--after-v060); [§4.3](#43-identity-and-authorization-p1) records R5's second half — per-device Ed25519 keys, TOTP demoted to the enrollment moment — landing in the server and the client library, with both UIs still to come) |
 | Scope | server, client library, Android and desktop apps. Community-maintained targets follow [Platform policy](#5-platform-policy). |
 | Status | Living document. Items come from code audits and reviews. |
 
@@ -814,7 +814,7 @@ competes with R13 for the same attention. What puts it ahead is that R13 is stil
 behind its own gate — the premise has not been validated — while this is what the
 tree says about itself today.
 
-### Phase 4 — v1.2, "reachable without our client" (exploratory)
+### Phase 4 — v1.3, "reachable without our client" (exploratory)
 
 | ID | Deliverable | Notes |
 |---|---|---|
@@ -882,6 +882,26 @@ close gaps the seams opened rather than answering a roadmap question.
 store of its own without changing anything else, and the numbers a slow tunnel
 produces say which of the two ends the time was spent in.
 
+### Phase 3.8 — v1.2.0, "a path that does not have to be looked up"
+
+One new thing on the client, and one default that changes because of it. The
+client already could carry a ticket instead of a Node ID, which is what makes a
+deployment reachable without n0's address lookup; what it could not do was
+carry one that stays usable. This cycle gives it a ticket that does not go
+stale, and pins the relay that ticket names.
+
+| ID | Deliverable | Notes |
+|---|---|---|
+| — | **A stable ticket** | The Node ID plus exactly one relay URL and no IP addresses. The addresses in an ordinary ticket change whenever the host moves, the socket gets a new port or the home relay migrates, and a stale ticket is worse than no ticket: it sends the client to an address that no longer answers. iroh does not wait for an address lookup when it already knows any path, so a client holding this ticket starts its handshake at once instead of after a DNS and pkarr round trip. The lookup still runs, and its result is merged into the path set when it arrives, so the direct addresses and the hole punch are not given up: the ticket removes the *wait*, not the *possibility* of a direct path |
+| — | **Nothing configured means `pinned`** | The server and the CLI's local proxy were the two endpoints left on iroh's own default — every N0 relay, home relay chosen by latency, migrating between them — and every migration drops the connections routed through it, a WebSocket in particular. Both resolve to `pinned` now, the same default the desktop app and the Android client already used. A fixed relay is also what makes the stable ticket name a relay the endpoint stays registered at; under `default` there is no single URL to write down and the stable ticket falls back to the Node ID alone |
+| — | **A Node ID and a ticket together** | The Node ID is the identity and the ticket's addresses are the paths. A configured Node ID used to win and the ticket to be ignored, so the path the ticket carried was thrown away; the two are compared now, and a ticket that names a different endpoint is refused rather than resolved in favour of either |
+| — | **IPv6 candidates are opt-in on the desktop** | The endpoint was bound IPv4-only because on a host whose IPv6 cannot carry full-size QUIC datagrams iroh's net report calls v6 usable and path migration moves traffic onto it, where every datagram above the real MTU fails — a connection that dies a few seconds in. The IPv4-only bind is still the default; the new `useIpv6` setting puts IPv6 candidates in the set hole punching offers, the same set the server and the Android app already publish |
+
+**Done when:** a client holding the ticket the server prints reaches it without
+waiting for an address lookup, still uses the direct path when the lookup
+brings one, and no endpoint on the server's own side is on a relay that can
+migrate out from under its connections.
+
 ### Dependencies
 
 ```text
@@ -913,7 +933,7 @@ R4 management ── R5 per-device ──┬── R6 distribution ──► v0.
                                               ├── secrets-file env + no gate ► v0.6.1
                                               ├── Android tun-proxy gate ────► v0.6.1
                                               │
-                              R13 edge (after validation) ──► v1.2
+                              R13 edge (after validation) ──► v1.3
 
         S1 measure (v1.0.0) ──┬── S2 desktop profile ──┐   (size-perf-roadmap.md)
                                └── S3 Android R8 ───────┴── S4 budget gate

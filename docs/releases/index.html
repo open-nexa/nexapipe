@@ -140,6 +140,12 @@
       </thead>
       <tbody>
         <tr>
+          <th scope="row">1.2.0</th>
+          <td class="date">5 November 2026</td>
+          <td>A ticket that does not go stale: the Node ID plus one fixed relay URL, so a client starts its handshake without waiting for an address lookup while the lookup still runs and the direct path is still used. Nothing configured now means one fixed relay instead of a migrating one, on the server and in the local proxy alike. The desktop can offer IPv6 candidates to hole punching, off by default. No client has to be enrolled again. The macOS and Windows desktop bundles are published unsigned.</td>
+          <td><a href="v1.2.0.html">Release notes</a></td>
+        </tr>
+        <tr>
           <th scope="row">1.1.1</th>
           <td class="date">5 November 2026</td>
           <td>A patch release, and a Windows one: the desktop app's service is given the Wintun runtime it needs to create the tunnel, a start that fails after spending an enrollment token keeps the credential that token bought, and a local-proxy start that fails says so. Nothing on the wire changes. No client has to be enrolled again. The macOS and Windows desktop bundles are published unsigned.</td>

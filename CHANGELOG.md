@@ -10,6 +10,17 @@ and the signed Android APK come out of `.github/workflows/release.yml`.
 For what comes next, and for why some things are deliberately not planned, see
 [docs/ROADMAP.md](docs/ROADMAP.md).
 
+**v1.2.0 is out.** It opens one new thing on the client — a ticket that does not
+go stale — and it changes one default on the server: nothing configured now
+means one fixed relay rather than every N0 relay with a home relay chosen by
+latency, because a relay that migrates drops the connections routed through it.
+The stable ticket is the Node ID plus that one relay URL and nothing else: a
+client can start its handshake on it at once instead of waiting for a DNS and
+pkarr round trip, and the lookup still runs beside it, so the direct path and
+the hole punch are not given up. Nothing on the wire changes: the handshake, the
+ALPN and the L4 preface are the same, so a 1.1.1 client talks to a 1.2.0 server
+and the other way round.
+
 **v1.1.1 is out.** It is a patch release, and a Windows one: the desktop app's
 service is given the Wintun runtime it needs to create the tunnel, and a start
 that fails after spending an enrollment token keeps the credential that token
@@ -25,6 +36,90 @@ deployment can replace; answer the tunnel's questions the way the protocol
 says they are to be answered; and take the delay out of the path a phone's
 traffic takes. Every configuration key that shipped in 1.0.0 keeps its name
 and its meaning.
+
+## [1.2.0] — 2026-11-05
+
+A minor release. Nothing on the wire changes: the handshake, the ALPN and the
+L4 preface are the same, so a 1.1.1 client talks to a 1.2.0 server and the
+other way round, and nothing has to be enrolled again.
+
+### Added
+
+- **A ticket that does not go stale.** An ordinary ticket carries an
+  address, and an address carries two things with very different lifetimes:
+  the **Node ID**, which is the endpoint's public key and changes only if the
+  secret key changes, and the **addresses** — the relay URLs and the IP
+  addresses — which change whenever the host moves, the socket gets a new
+  port, or the home relay migrates. The addresses are what make an ordinary
+  ticket go stale, and a stale ticket is worse than no ticket: it sends the
+  client to an address that no longer answers. That is why deployments end up
+  carrying a bare Node ID instead, and why a Node ID alone has to wait for an
+  address lookup before the first packet can go anywhere.
+  A **stable ticket** is the Node ID plus exactly one relay URL and no IP
+  addresses at all. The Node ID keeps the identity fixed, which is the part an
+  operator can actually pin, and the relay URL gives the client a path it can
+  use immediately: iroh does not wait for an address lookup when it already
+  knows any path, so a client holding this ticket starts its handshake at once
+  instead of after a DNS and pkarr round trip — which, in a network where
+  those lookups are slow or blocked, is the difference between a connection and
+  a timeout. The lookup still runs, and its result is merged into the path set
+  when it arrives: the direct addresses the peer publishes are still used and
+  hole punching still happens. The ticket removes the *wait*, not the
+  *possibility* of a direct path.
+  The server prints one at start-up beside the ordinary ticket — "Stable
+  ticket (does not go stale)" — and says so when the relay mode pins no
+  relay: there is then no URL to write down, and the ticket is the Node ID
+  alone, which is what the endpoint id is anyway and therefore no worse than
+  not having one.
+- **The desktop app can offer IPv6 candidates to hole punching, and does not
+  by default.** The endpoint was bound IPv4-only, because on a host whose IPv6
+  exists but cannot carry full-size QUIC datagrams (PPPoE: v6 MTU 1480,
+  ICMPv6 "packet too big" filtered) iroh's net report calls v6 usable and
+  path migration moves traffic onto it — where every datagram above the real
+  MTU fails, which reads as a connection that dies a few seconds in. The
+  IPv4-only bind is still the default; the new `useIpv6` setting turns the
+  IPv6 socket on, which puts IPv6 candidates in the set hole punching offers.
+  That set is the one the server and the Android app already publish, so
+  turning it on makes the desktop's direct path the same shape as theirs. The
+  setting is off by default because a configuration written before it existed
+  is a configuration from the IPv4-only era, and the default keeps it that
+  way.
+
+### Changed
+
+- **Nothing configured means `pinned`, on the server and in the local proxy.**
+  iroh's own default is every N0 relay with the home relay chosen by latency,
+  and it may migrate between them — and every migration drops the connections
+  routed through it, a WebSocket in particular. The server and the CLI's
+  `--local-proxy` were the two endpoints left migrating: the local proxy
+  resolved "nothing configured" to no mode at all and handed the endpoint to
+  iroh's default. Both resolve to `pinned` now, the same default the desktop
+  app and the Android client already used — and a fixed relay is also what
+  makes the stable ticket name a relay the endpoint stays registered at.
+  `config.toml.example` ships `relay_mode = "pinned"` now and says what the
+  difference is. A configuration that names a mode explicitly is unaffected:
+  `default` still means every N0 relay, and `custom` still means the one
+  relay the operator runs.
+- **A Node ID and a ticket can now be configured together, and both are
+  used.** The Node ID is the identity and the ticket's addresses are the
+  paths. Before, a configured Node ID won and the ticket was ignored
+  entirely, so a ticket that carried the path was thrown away in favour of
+  the bare Node ID — and the client was back to waiting for a lookup. A blank
+  ticket field is no ticket at all: a template or an unset placeholder leaves
+  `server_ticket = ""` around a node ID that was working before the field
+  existed, and an empty string is not a ticket anybody issued. A ticket field
+  holding a bare Node ID still works, which is what a configuration that grew
+  a ticket field around an endpoint id looks like.
+
+### Fixed
+
+- **A ticket that names a different endpoint is refused.** A Node ID and a
+  ticket given together used to be resolved in favour of the Node ID without
+  the two being compared, so a ticket issued for one endpoint could be
+  configured against another and the disagreement was invisible. It is refused
+  now, with the two names in the message, rather than resolved in favour of
+  either: a ticket for the wrong endpoint reaches the wrong endpoint, and no
+  amount of address fixing repairs that.
 
 ## [1.1.1] — 2026-11-05
 
