@@ -182,31 +182,78 @@ fn identity_changed(before: Option<&TwoFactorAuth>, after: Option<&TwoFactorAuth
     before.map(|a| a.identity()) != after.map(|a| a.identity())
 }
 
+/// The address a backend is dialled at.
+///
+/// **Both** the Node ID and the ticket are used when both are given, and that
+/// is the point of the change: the Node ID is the identity, the ticket's
+/// addresses are the paths.
+///
+/// The Node ID alone leaves the client with an address that carries no path at
+/// all, so iroh has to look the peer up before the first packet can go
+/// anywhere — a DNS and pkarr round trip that is slow at best and unreachable
+/// at worst. A ticket that names a relay gives the client a path it can use
+/// immediately, and the lookup still runs alongside it, so a direct address
+/// published later is used too.
+///
+/// A ticket whose Node ID disagrees with the configured one is refused rather
+/// than silently resolved in favour of either: a ticket for the wrong
+/// endpoint reaches the wrong endpoint, and no address fixing repairs that.
+/// The Node ID in the ticket is the one that wins, because it is the
+/// identity the ticket itself was issued for.
 pub fn parse_endpoint_addr(
     server_node_id: Option<&str>,
     server_ticket: Option<&str>,
 ) -> Result<EndpointAddr, crate::error::ClientError> {
-    if let Some(node_id_str) = server_node_id {
-        let endpoint_id: EndpointId = node_id_str.parse().map_err(|e| {
+    let node_id = match server_node_id {
+        Some(node_id_str) => Some(node_id_str.trim().parse::<EndpointId>().map_err(|e| {
             crate::error::ClientError::ParseError(format!("Failed to parse server_node_id: {}", e))
-        })?;
-        Ok(endpoint_id.into())
-    } else if let Some(ticket_str) = server_ticket {
-        if let Ok(ticket) = ticket_str.parse::<EndpointTicket>() {
-            Ok(ticket.into())
-        } else {
-            let endpoint_id: EndpointId = ticket_str.parse().map_err(|e| {
-                crate::error::ClientError::ParseError(format!(
-                    "Failed to parse as ticket or node ID: {}",
-                    e
-                ))
-            })?;
-            Ok(endpoint_id.into())
+        })?),
+        None => None,
+    };
+
+    let ticket_addr = match server_ticket {
+        Some(ticket_str) => {
+            let trimmed = ticket_str.trim();
+            match trimmed.parse::<EndpointTicket>() {
+                Ok(ticket) => Some(ticket.into()),
+                Err(ticket_err) => {
+                    // A ticket that does not parse may still be a bare Node ID
+                    // that was put in the ticket field — which is what a
+                    // configuration that grew a ticket field around an
+                    // endpoint id looks like.
+                    let endpoint_id = trimmed.parse::<EndpointId>().map_err(|e| {
+                        crate::error::ClientError::ParseError(format!(
+                            "Failed to parse as ticket or node ID: {ticket_err} (as a node ID: {e})"
+                        ))
+                    })?;
+                    Some(endpoint_id.into())
+                }
+            }
         }
-    } else {
-        Err(crate::error::ClientError::InvalidConfig(
+        None => None,
+    };
+
+    match (node_id, ticket_addr) {
+        (None, None) => Err(crate::error::ClientError::InvalidConfig(
             "Either server_node_id or server_ticket must be provided".to_string(),
-        ))
+        )),
+        (Some(node_id), None) => Ok(node_id.into()),
+        (None, Some(addr)) => Ok(addr),
+        (Some(node_id), Some(addr)) => {
+            if addr.id != node_id {
+                return Err(crate::error::ClientError::InvalidConfig(format!(
+                    "the ticket names endpoint {} but server_node_id names {}; a ticket for one \
+                     endpoint cannot reach another",
+                    addr.id, node_id
+                )));
+            }
+            // The identity is the Node ID, the paths are the ticket's. The
+            // ticket's own Node ID is the same one — it was checked above.
+            Ok(EndpointAddr {
+                id: node_id,
+                addrs: addr.addrs,
+            })
+        }
     }
 }
 

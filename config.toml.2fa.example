@@ -75,10 +75,12 @@ bind_port = 0
 # is allowed to fail, so a host without IPv6 still starts. Ignored without
 # bind_port.
 bind_ipv6 = false
-# Which relay to use. One of: default (all N0 relays; the default when unset),
-# pinned (the single built-in relay this project pins), custom (relay_url below),
-# disabled (no relay transport at all — a peer's relay becomes unusable too).
-# relay_mode = "default"
+# Which relay to use. One of: pinned (the single built-in relay this project
+# pins; the default when unset), default (all N0 relays; the home relay is
+# chosen by latency and may migrate, which drops the connections routed through
+# it), custom (relay_url below), disabled (no relay transport at all — a peer's
+# relay becomes unusable too).
+# relay_mode = "pinned"
 # Only read with relay_mode = "custom", and then required.
 # relay_url = "https://relay.example.com"
 # Bearer token for that relay; it has to be configured on both sides.

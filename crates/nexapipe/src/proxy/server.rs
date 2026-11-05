@@ -23,6 +23,7 @@ use iroh_tickets::Ticket;
 use iroh_tickets::endpoint::EndpointTicket;
 use nexapipe_client::discovery::DiscoveryMode;
 use nexapipe_client::relay::RelayModeSpec;
+use nexapipe_client::stable_ticket::StableTicket;
 use nexapipe_proto::protocol::accepted_alpns;
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -251,10 +252,16 @@ pub async fn run_proxy(
     let mut builder = Endpoint::builder(presets::N0).alpns(accepted_alpns());
 
     // Which relay we use, resolved by the same code the clients use, so the two cannot drift
-    // apart. `None` means nothing was configured, which is iroh's default (every N0 relay).
-    // Everything else either resolves or fails startup: `relay_mode` used to be ignored
+    // apart. Everything else either resolves or fails startup: `relay_mode` used to be ignored
     // entirely unless `relay_url` was also set, and a `relay_url` on its own was logged and
     // then dropped — both of which let a broken configuration run unchanged.
+    //
+    // **Nothing configured means `pinned`**, the same default the clients use, and
+    // not iroh's own default of every N0 relay. The difference is not cosmetic:
+    // iroh picks the home relay by latency and may migrate between them, and
+    // every migration drops the connections routed through it — a WebSocket in
+    // particular. A fixed relay is also what makes the stable ticket below
+    // name a relay the endpoint stays registered at.
     let relay = RelayModeSpec::parse(
         iroh_config.as_ref().and_then(|c| c.relay_mode.as_deref()),
         iroh_config.as_ref().and_then(|c| c.relay_url.as_deref()),
@@ -265,17 +272,16 @@ pub async fn run_proxy(
         }),
     )
     .context("invalid [iroh] relay configuration")?;
-    if let Some(relay) = &relay {
-        tracing::info!("Relay: {}", relay.describe());
-        if !relay.uses_url()
-            && let Some(url) = iroh_config.as_ref().and_then(|c| c.relay_url.as_deref())
-        {
-            tracing::warn!(
-                "[iroh] relay_url {url:?} is set but this mode does not use one; ignoring it"
-            );
-        }
-        builder = builder.relay_mode(relay.relay_mode());
+    let relay_in_force = relay.clone().unwrap_or(RelayModeSpec::Pinned);
+    tracing::info!("Relay: {}", relay_in_force.describe());
+    if !relay_in_force.uses_url()
+        && let Some(url) = iroh_config.as_ref().and_then(|c| c.relay_url.as_deref())
+    {
+        tracing::warn!(
+            "[iroh] relay_url {url:?} is set but this mode does not use one; ignoring it"
+        );
     }
+    builder = builder.relay_mode(relay_in_force.relay_mode());
 
     // Whether this endpoint may use n0's address lookup — the DNS and pkarr
     // queries that turn a Node ID into an address. It is the one piece of n0's
@@ -396,17 +402,40 @@ pub async fn run_proxy(
     let ticket = EndpointTicket::new(node_addr);
     let ticket_str = ticket.encode_string();
 
+    // The ticket that does not go stale: the Node ID, plus the one relay this
+    // endpoint stays registered at. The addresses in the ticket above change
+    // whenever the host moves or the socket gets a new port, so a client
+    // holding one of those has to be handed a new one; this one does not.
+    //
+    // It is only a fixed relay when the relay mode pins one — `default` lets
+    // iroh choose the home relay by latency and migrate between them, and a
+    // migrating relay has no URL to write down. In that case the stable
+    // ticket is the Node ID alone, which is what the endpoint id is anyway,
+    // so it is no worse than not printing one.
+    let stable = StableTicket::build(node_id, &relay_in_force);
+    let stable_ticket_str = stable.to_ticket_string();
+
     println!("\n========================================");
     println!("Proxy Connection Information");
     println!("========================================");
     println!("Node ID (stable, for server_node_id): {}", node_id);
     println!("Ticket (for clients): {}", ticket_str);
+    println!("Stable ticket (does not go stale): {}", stable_ticket_str);
+    if stable.relay.is_none() {
+        println!(
+            "  (no fixed relay: this endpoint's relay mode is {:?}, so the stable",
+            relay_in_force
+        );
+        println!("   ticket carries the Node ID only. Set [iroh] relay_mode = \"pinned\" to give");
+        println!("   clients a path they can use without an address lookup.)");
+    }
     println!("========================================");
     println!("To use stable connection, add to [local_proxy] in config.toml:");
     println!("server_node_id = \"{}\"", node_id);
     println!("========================================\n");
 
     tracing::info!("Connection ticket: {}", ticket_str);
+    tracing::info!("Stable ticket: {}", stable_ticket_str);
     tracing::info!("Node ID (for server_node_id config): {}", node_id);
 
     // ===== Plaintext listener =====

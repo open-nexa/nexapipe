@@ -125,15 +125,20 @@ bind_port = 0
 # Ignored without bind_port: there would be no port to keep both families on.
 bind_ipv6 = false
 
-# Relay mode: pinned / default / disabled / custom. Unset means default.
-#   default  - every N0 relay, home relay chosen by latency; it can migrate
-#              between relays, which drops the connections routed through it
-#   pinned   - one fixed N0 relay (Singapore). Use when relay migration is
-#              worse than a slightly slower relay
+# Relay mode: pinned / default / disabled / custom. Unset means pinned.
+#   pinned   - one fixed N0 relay (Singapore). The default, because iroh
+#              otherwise picks the home relay by latency and may migrate
+#              between them, and every migration drops the connections routed
+#              through it (a WebSocket in particular). A fixed relay is also
+#              what the stable ticket at start-up names, so a client holding
+#              it has a path it can use without an address lookup.
+#   default  - every N0 relay, home relay chosen by latency. Faster to a
+#              nearby relay, but the home relay moves, and a stable ticket
+#              cannot name a relay that moves.
 #   disabled - no relay transport at all. Note this also means you cannot dial
 #              a peer through *its* relay
 #   custom   - one relay you run, and only that one; no N0 relay is used
-relay_mode = "default"
+relay_mode = "pinned"
 
 # Only used when relay_mode = "custom"; setting relay_url without a relay_mode
 # means custom. Pointing it at *.relay.n0.iroh.link is rejected (use pinned or

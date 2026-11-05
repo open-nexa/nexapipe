@@ -79,7 +79,7 @@ impl RelayModeSpec {
     /// Resolves the configuration into a mode.
     ///
     /// `Ok(None)` means nothing was configured; the caller decides what that means
-    /// (the clients default to [`Self::Pinned`], the server to [`Self::Default`]).
+    /// (the clients and the server both default to [`Self::Pinned`]).
     /// Every other outcome is either a mode or a hard error — there is no path that
     /// substitutes a different mode for one the user asked for.
     ///
@@ -358,7 +358,11 @@ fn warn(message: &str) {
     let _ = message;
 }
 
-fn pinned_relay_url() -> RelayUrl {
+/// The one relay [`RelayModeSpec::Pinned`] pins to, parsed.
+///
+/// Shared with [`crate::stable_ticket`], which writes it into a ticket: a
+/// ticket that names this relay is fixed, because this relay never changes.
+pub(crate) fn pinned_relay_url() -> RelayUrl {
     static PINNED: OnceLock<RelayUrl> = OnceLock::new();
     PINNED
         .get_or_init(|| {

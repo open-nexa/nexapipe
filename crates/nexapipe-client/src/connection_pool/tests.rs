@@ -10,12 +10,14 @@ use super::{
     BorrowState, CONNECTION_IDLE_TIMEOUT, DialOutcome, IrohConnectionPool, LinkKind, LinkStatus,
     MAX_CONNECTIONS_PER_PROTOCOL, PRECONNECT_CONNECT_TIMEOUT, PoolRefusal, connections_for,
     drop_stale_connections, encode_link_status, identity_changed, may_pool, may_publish,
+    parse_endpoint_addr,
 };
 use crate::auth::{Enrollment, TotpAlgorithm, TwoFactorAuth};
 #[cfg(feature = "local-proxy")]
 use crate::endpoint_group::EndpointGroup;
 use iroh::Endpoint;
 use iroh::endpoint::presets;
+use iroh_tickets::Ticket;
 use nexapipe_proto::auth::{Algorithm, AuthMessage, Format};
 use nexapipe_proto::protocol::Protocol;
 use nexapipe_proto::secret::SecretString;
@@ -1511,4 +1513,90 @@ fn the_connect_budget_covers_a_relayed_handshake() {
         "the connect budget is {}s, which is shorter than a relayed handshake",
         PRECONNECT_CONNECT_TIMEOUT.as_secs(),
     );
+}
+
+/// A Node ID on its own is an address with no path.
+///
+/// The client then has to look the peer up before the first packet can go
+/// anywhere, which is a DNS and pkarr round trip that is slow at best.
+#[test]
+fn a_node_id_alone_carries_no_path() {
+    let id = iroh::SecretKey::generate().public();
+    let addr = parse_endpoint_addr(Some(&id.to_string()), None).expect("a node ID parses");
+    assert_eq!(addr.id, id);
+    assert!(
+        addr.addrs.is_empty(),
+        "a node ID alone names no path, which is the whole problem"
+    );
+}
+
+/// A ticket and a Node ID together are the identity and the path.
+///
+/// The Node ID says which endpoint, the ticket says how to reach it. Both are
+/// needed for the connection to start without a lookup.
+#[test]
+fn a_node_id_and_a_ticket_are_merged() {
+    let id = iroh::SecretKey::generate().public();
+    let relay: iroh::RelayUrl = "https://aps1-1.relay.n0.iroh.link.".parse().unwrap();
+    let ticket = iroh_tickets::endpoint::EndpointTicket::new(
+        iroh::EndpointAddr::new(id).with_relay_url(relay.clone()),
+    );
+    let ticket_str = ticket.encode_string();
+
+    let addr = parse_endpoint_addr(Some(&id.to_string()), Some(&ticket_str))
+        .expect("a node ID and a ticket parse");
+
+    assert_eq!(addr.id, id, "the identity is the node ID");
+    assert_eq!(
+        addr.relay_urls().collect::<Vec<_>>(),
+        vec![&relay],
+        "the path is the ticket's relay"
+    );
+}
+
+/// A ticket for one endpoint and a Node ID for another is a contradiction, and
+/// a contradiction is refused rather than resolved in favour of either side.
+#[test]
+fn a_ticket_for_another_endpoint_is_refused() {
+    let id = iroh::SecretKey::generate().public();
+    let other = iroh::SecretKey::generate().public();
+    let ticket = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::new(other));
+    let ticket_str = ticket.encode_string();
+
+    let err = parse_endpoint_addr(Some(&id.to_string()), Some(&ticket_str))
+        .expect_err("a ticket for another endpoint is refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("cannot reach another"),
+        "the reason says what is wrong: {message}"
+    );
+}
+
+/// A ticket on its own is what it always was.
+#[test]
+fn a_ticket_alone_still_works() {
+    let id = iroh::SecretKey::generate().public();
+    let ticket = iroh_tickets::endpoint::EndpointTicket::new(iroh::EndpointAddr::new(id));
+    let ticket_str = ticket.encode_string();
+
+    let addr = parse_endpoint_addr(None, Some(&ticket_str)).expect("a ticket parses");
+    assert_eq!(addr.id, id);
+}
+
+/// A bare Node ID put in the ticket field is still a Node ID.
+///
+/// A configuration that grew a ticket field around an endpoint id looks
+/// exactly like this, and it used to work.
+#[test]
+fn a_node_id_in_the_ticket_field_still_parses() {
+    let id = iroh::SecretKey::generate().public();
+    let addr = parse_endpoint_addr(None, Some(&id.to_string())).expect("a node ID parses");
+    assert_eq!(addr.id, id);
+}
+
+/// Nothing at all is still refused.
+#[test]
+fn neither_a_node_id_nor_a_ticket_is_refused() {
+    let err = parse_endpoint_addr(None, None).expect_err("nothing is refused");
+    assert!(err.to_string().contains("server_node_id"));
 }
