@@ -160,6 +160,15 @@ export interface ProxyConfig {
    * being installed (see docs/ui-refactor-plan.md §5.12) and is never chosen implicitly.
    */
   useTun: boolean;
+  /**
+   * Whether the endpoint may bind IPv6 and offer IPv6 candidates to hole punching.
+   *
+   * Off by default: on a host whose IPv6 cannot carry full-size QUIC datagrams the v6
+   * path looks usable to iroh and the connection dies a few seconds in, which is why
+   * the socket was IPv4-only before the setting existed. On, it is one more way for a
+   * connection to go direct — the candidate set the server and Android publish anyway.
+   */
+  useIpv6: boolean;
   /** Execution backend: in-process, or through the installed system service. */
   useService: boolean;
   relayMode: RelayMode;

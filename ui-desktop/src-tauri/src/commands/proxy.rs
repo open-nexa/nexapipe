@@ -34,6 +34,10 @@ pub(crate) async fn start_proxy(
     tun_name: Option<String>,
     use_service: Option<bool>,
     use_tun: Option<bool>,
+    // Whether the endpoint may bind IPv6 and offer IPv6 candidates to hole
+    // punching. Absent means the IPv4-only default, which is what the app did
+    // before the setting existed.
+    use_ipv6: Option<bool>,
     relay_mode: Option<String>,
     relay_url: Option<String>,
     relay_auth_token: Option<String>,
@@ -116,6 +120,7 @@ pub(crate) async fn start_proxy(
             load_balancing: load_balancing.clone(),
             tun_name: tun_name.clone(),
             use_tun: Some(use_tun),
+            use_ipv6,
             relay_mode: relay_mode.clone(),
             relay_url: relay_url.clone(),
             relay_auth_token: relay_auth_token.clone(),
@@ -226,6 +231,7 @@ pub(crate) async fn start_proxy(
         load_balancing,
         tun_name,
         use_tun,
+        use_ipv6: use_ipv6.unwrap_or(false),
         relay_mode: relay_mode.unwrap_or_else(|| "pinned".to_string()),
         relay_url: relay_url.unwrap_or_default(),
         relay_auth_token: relay_auth_token.unwrap_or_default(),

@@ -31,6 +31,10 @@ export const defaultConfig: ProxyConfig = {
   loadBalancing: 'round_robin',
   tunName: 'nexa-tun',
   useTun: false,
+  // IPv6 candidates are opt-in: the IPv4-only socket is the safe default on a
+  // host whose IPv6 cannot carry full-size QUIC datagrams, which is why the
+  // endpoint was bound v4-only before the setting existed.
+  useIpv6: false,
   useService: false,
   relayMode: 'pinned',
   relayUrl: '',
@@ -205,6 +209,9 @@ export function normalizeConfig(raw: Record<string, unknown>): ProxyConfig {
   // `useTun` is new in version 1 and defaults to off, so a payload written before the explicit
   // mode model keeps running in local proxy mode rather than suddenly claiming the tunnel.
   config.useTun = asBoolean(raw.useTun, defaultConfig.useTun);
+  // `useIpv6` arrived later than version 1: a payload from before it exists is a
+  // payload from the IPv4-only era, and the default keeps it that way.
+  config.useIpv6 = asBoolean(raw.useIpv6, defaultConfig.useIpv6);
   config.useService = asBoolean(raw.useService, config.useService);
 
   return config;
