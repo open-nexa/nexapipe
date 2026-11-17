@@ -8,7 +8,7 @@
 //! the counter writeback that has to leave a key device's entry intact.
 
 use nexapipe::auth::{AuthConfig, AuthError, ClientAuth, DeviceAuth, TotpValidator, Verified};
-use nexapipe::config::ProxyConfig;
+use nexapipe::config::Config;
 use nexapipe::config_watcher::save_auth_state;
 use nexapipe_client::auth::{TotpAlgorithm, TwoFactorAuth};
 use std::collections::HashMap;
@@ -343,7 +343,7 @@ fn keeps_a_key_device_when_it_writes_counters() {
     )
     .unwrap();
 
-    let (_, auth) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let (_, auth) = Config::load_with_auth(path_str).unwrap();
     let mut auth = auth.expect("the config declares [auth]");
     let phone = &auth.clients["client-001"].devices["phone"];
     assert_eq!(phone.public_key.as_deref(), Some(key.as_str()));
@@ -380,7 +380,7 @@ fn keeps_a_key_device_when_it_writes_counters() {
         "the key survives the writeback: {on_disk}"
     );
 
-    let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let (_, reloaded) = Config::load_with_auth(path_str).unwrap();
     let reloaded = reloaded.unwrap();
     let phone = &reloaded.clients["client-001"].devices["phone"];
     assert_eq!(phone.public_key.as_deref(), Some(key.as_str()));

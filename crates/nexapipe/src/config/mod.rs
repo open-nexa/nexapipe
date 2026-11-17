@@ -1,8 +1,9 @@
 //! The configuration file: what it says, and what is done with it.
 //!
-//! The file is one thing, and it is six: the shapes it is written in, the
-//! routes it is translated into, the rules it has to satisfy, the way it is
-//! read, the credential half of it, and the identity the endpoint keeps.
+//! The file is one thing, and it is seven: the shapes it is written in, the
+//! model those shapes make, the routes it is translated into, the rules it has
+//! to satisfy, the way it is read, the credential half of it, and the identity
+//! the endpoint keeps.
 //!
 //! Where it is kept is not this module's business: that is the storage's, and
 //! it lives in [`crate::storage`]. What is here is the same whichever store
@@ -12,6 +13,7 @@ mod auth_file;
 mod identity;
 mod io;
 mod load;
+mod model;
 mod routes;
 mod schema;
 mod validate;
@@ -20,18 +22,16 @@ mod validate;
 mod tests;
 
 pub use auth_file::{
-    AuthTomlConfig, ClientAuthToml, ClientSecretWrite, DeviceAuthToml,
-    check_credential_file_permissions,
+    Auth, AuthClient, AuthDevice, ClientSecretWrite, check_credential_file_permissions,
 };
 pub use identity::{EndpointIdentity, generate_secret_key_hex};
 pub use io::{FIRST_RUN_CONFIG, should_warn_about_permissions, warn_about_readable_credentials};
 pub use load::{load_config, load_config_with_auth};
 pub use schema::{
-    AdminConfig, BackendProtocol, BackendsConfig, CircuitBreaker, CircuitBreakerConfig,
+    AdminConfig, BackendProtocol, BackendsConfig, CircuitBreaker, CircuitBreakerConfig, Config,
     CredentialSource, HealthCheckConfig, IrohConfig, LocalProxyConfig, LocalProxyNode,
-    LocalProxyTwoFactorConfig, LogConfig, MetricsConfig, PeersConfig, ProxyConfig, Retry,
-    RetryConfig, RouteMode, RouteSpec, ServerConfig, Timeouts, TimeoutsConfig,
-    get_backend_protocol,
+    LocalProxyTwoFactorConfig, LogConfig, MetricsConfig, PeersConfig, Retry, RetryConfig,
+    RouteMode, RouteSpec, ServerConfig, Timeouts, TimeoutsConfig, get_backend_protocol,
 };
 pub use validate::{
     get_route_mode, get_route_modes, get_strategy, parse_route_mode, validate_backend,

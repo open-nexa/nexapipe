@@ -769,7 +769,7 @@ async fn a_rotated_invite_starts_with_its_own_budget() {
     // The live state the server started with: the old token, and the counters
     // the state file carries for it.
     let (_, auth) =
-        crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
+        crate::config::Config::load_with_auth(path_str.as_str()).expect("the config loads");
     let state = AuthState::new(
         auth.expect("the config declares an [auth] section"),
         store(&path_str),
@@ -821,7 +821,7 @@ async fn a_rotated_invite_leaves_nothing_for_the_next_start() {
     state_file_with_enrollment_counters(&path_str, "old-token", 3, a_live_lockout_window());
 
     let (_, auth) =
-        crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
+        crate::config::Config::load_with_auth(path_str.as_str()).expect("the config loads");
     let state = AuthState::new(
         auth.expect("the config declares an [auth] section"),
         store(&path_str),
@@ -845,7 +845,7 @@ async fn a_rotated_invite_leaves_nothing_for_the_next_start() {
     // And the startup path itself: the loader that applies the file onto the
     // configuration.
     let (_, auth) =
-        crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
+        crate::config::Config::load_with_auth(path_str.as_str()).expect("the config loads");
     let client = &auth.expect("the config declares an [auth] section").clients["client-001"];
     assert_eq!(
         client.enrollment_failed_attempts, 0,
@@ -873,7 +873,7 @@ async fn an_unchanged_token_keeps_its_live_counters() {
     state_file_with_enrollment_counters(&path_str, "token", 3, window);
 
     let (_, auth) =
-        crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
+        crate::config::Config::load_with_auth(path_str.as_str()).expect("the config loads");
     let state = AuthState::new(
         auth.expect("the config declares an [auth] section"),
         store(&path_str),
@@ -918,7 +918,7 @@ async fn the_state_file_counters_are_honoured_for_an_unchanged_token() {
     state_file_with_enrollment_counters(&path_str, "token", 3, window);
 
     let (_, auth) =
-        crate::config::ProxyConfig::load_with_auth(path_str.as_str()).expect("the config loads");
+        crate::config::Config::load_with_auth(path_str.as_str()).expect("the config loads");
     let auth = auth.expect("the config declares an [auth] section");
     let client = &auth.clients["client-001"];
     assert_eq!(

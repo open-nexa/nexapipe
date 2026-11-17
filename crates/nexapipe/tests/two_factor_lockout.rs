@@ -7,7 +7,7 @@
 //! survive a restart.
 
 use nexapipe::auth::{AuthConfig, AuthError, ClientAuth, DeviceAuth, TotpValidator, Verified};
-use nexapipe::config::ProxyConfig;
+use nexapipe::config::Config;
 use nexapipe::config_watcher::save_auth_state;
 use nexapipe_client::auth::{TotpAlgorithm, TwoFactorAuth};
 use std::collections::HashMap;
@@ -329,7 +329,7 @@ fn persists_lockout_counters_across_a_reload() {
          created_at = \"1723756800\"\n";
     std::fs::write(&path, source).unwrap();
 
-    let (_, auth) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let (_, auth) = Config::load_with_auth(path_str).unwrap();
     let mut auth = auth.expect("the config declares [auth]");
 
     let entry = auth.clients.get_mut("client-001").unwrap();
@@ -354,7 +354,7 @@ fn persists_lockout_counters_across_a_reload() {
         "a credential has no business in the state file: {state}"
     );
 
-    let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let (_, reloaded) = Config::load_with_auth(path_str).unwrap();
     let reloaded = reloaded.unwrap();
     let entry = reloaded.clients.get("client-001").unwrap();
     assert_eq!(entry.failed_attempts, 2);
@@ -368,7 +368,7 @@ fn persists_lockout_counters_across_a_reload() {
     assert!(!state.contains("failed_attempts"), "{state}");
     assert!(!state.contains("locked_until"), "{state}");
 
-    let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let (_, reloaded) = Config::load_with_auth(path_str).unwrap();
     let reloaded = reloaded.unwrap();
     let entry = reloaded.clients.get("client-001").unwrap();
     assert_eq!(entry.failed_attempts, 0);
@@ -398,7 +398,7 @@ fn the_enrollment_counter_survives_a_reload() {
          pending_enrollment = \"0123456789abcdef\"\n";
     std::fs::write(&path, source).unwrap();
 
-    let (_, auth) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let (_, auth) = Config::load_with_auth(path_str).unwrap();
     let mut auth = auth.expect("the config declares [auth]");
 
     // The rule the server applies to a wrong guess at a token, called the same
@@ -419,7 +419,7 @@ fn the_enrollment_counter_survives_a_reload() {
         "the client's own counter did not move: {state}"
     );
 
-    let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let (_, reloaded) = Config::load_with_auth(path_str).unwrap();
     let reloaded = reloaded.unwrap();
     let entry = reloaded.clients.get("client-001").unwrap();
     assert_eq!(entry.enrollment_failed_attempts, 1);
@@ -453,7 +453,7 @@ fn does_not_resurrect_a_client_removed_from_disk() {
     )
     .unwrap();
 
-    let (_, auth) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let (_, auth) = Config::load_with_auth(path_str).unwrap();
     let mut auth = auth.unwrap();
     auth.clients.insert(
         "client-002".to_string(),
@@ -485,7 +485,7 @@ fn does_not_resurrect_a_client_removed_from_disk() {
     );
 
     // And a state file that carries one does not bring it back either.
-    let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let (_, reloaded) = Config::load_with_auth(path_str).unwrap();
     let reloaded = reloaded.unwrap();
     assert!(
         !reloaded.clients.contains_key("client-002"),
@@ -706,7 +706,7 @@ fn keeps_the_device_table_when_it_writes_counters() {
          secret = \"MFRGGZDFMZTWQ2LKNNWG23TPKRSXG5BA\"\n";
     std::fs::write(&path, source).unwrap();
 
-    let (_, auth) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let (_, auth) = Config::load_with_auth(path_str).unwrap();
     let mut auth = auth.expect("the config declares [auth]");
     assert_eq!(
         auth.clients["client-001"].devices.len(),
@@ -737,7 +737,7 @@ fn keeps_the_device_table_when_it_writes_counters() {
         "the configuration was rewritten: {on_disk}"
     );
 
-    let (_, reloaded) = ProxyConfig::load_with_auth(path_str).unwrap();
+    let (_, reloaded) = Config::load_with_auth(path_str).unwrap();
     let reloaded = reloaded.unwrap();
     let client = &reloaded.clients["client-001"];
     // The device names, not the client: a `ClientAuth` carries a credential.

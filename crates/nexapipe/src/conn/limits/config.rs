@@ -12,7 +12,7 @@ use super::connections::{
     ENV_MAX_CONNECTIONS_PER_PEER,
 };
 use super::streams::{DEFAULT_MAX_STREAMS_GLOBAL, ENV_MAX_STREAMS_GLOBAL};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// The `[limits]` section: the ceilings the whole process runs under.
 ///
@@ -29,7 +29,7 @@ use serde::Deserialize;
 ///
 /// **A zero is refused at startup**, in [`Limits::resolve`]: it would refuse
 /// every connection, which is a typo rather than a setting.
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
     /// Concurrent connections one peer may hold.

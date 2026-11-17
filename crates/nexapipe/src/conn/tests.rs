@@ -37,8 +37,8 @@ async fn the_state_file_carries_the_counters_as_of_the_write() {
     )
     .unwrap();
 
-    let (_, config) = crate::config::ProxyConfig::load_with_auth(path.to_str().unwrap())
-        .expect("the config loads");
+    let (_, config) =
+        crate::config::Config::load_with_auth(path.to_str().unwrap()).expect("the config loads");
     let auth = AuthState::new(
         config.expect("the config declares an [auth] section"),
         std::sync::Arc::new(crate::storage::file::FileStorage::new(path)),

@@ -1,6 +1,6 @@
 //! The tests of the command line.
 
-use nexapipe::config::ProxyConfig;
+use nexapipe::config::Config;
 
 use super::client::{seconds_of, stamp};
 use super::config::toml_key;
@@ -9,7 +9,7 @@ use super::invite::invite_domains;
 /// A config written the way an operator writes one, read the way the
 /// server reads it: the tests go through the real parser rather than
 /// around it, so a key that stops being readable shows up here.
-fn config(toml: &str) -> ProxyConfig {
+fn config(toml: &str) -> Config {
     toml::from_str(toml).expect("the config in the test is readable")
 }
 

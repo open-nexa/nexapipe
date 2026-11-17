@@ -6,7 +6,7 @@ use crate::Cli;
 use iroh::SecretKey;
 use iroh_tickets::endpoint::EndpointTicket;
 use nexapipe::auth::AuthConfig;
-use nexapipe::config::ProxyConfig;
+use nexapipe::config::Config;
 use nexapipe::storage::Storage;
 use nexapipe_client::relay::RelayModeSpec;
 use nexapipe_proto::secret::SecretString;
@@ -560,7 +560,7 @@ fn ticket_node_id(ticket: &str) -> anyhow::Result<String> {
 /// identity at start-up and writes it back, so the file is the only place the
 /// identity can be read from — and before the first start it is not there at
 /// all.
-fn config_server_identity(config: Option<&ProxyConfig>) -> anyhow::Result<Option<String>> {
+fn config_server_identity(config: Option<&Config>) -> anyhow::Result<Option<String>> {
     let Some(secret) = config
         .and_then(|config| config.iroh.as_ref())
         .and_then(|iroh| iroh.secret_key.as_ref())
@@ -578,7 +578,7 @@ fn config_server_identity(config: Option<&ProxyConfig>) -> anyhow::Result<Option
 /// Where the domain list comes from, so the printed invite says so.
 pub(super) fn invite_domains(
     explicit: &[String],
-    config: Option<&ProxyConfig>,
+    config: Option<&Config>,
 ) -> (Vec<String>, String) {
     if !explicit.is_empty() {
         return (explicit.to_vec(), "from --invite-domains".to_string());

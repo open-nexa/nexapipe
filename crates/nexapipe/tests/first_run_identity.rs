@@ -255,7 +255,7 @@ fn an_ephemeral_identity_differs_between_starts() {
 
 /// An ephemeral identity must not make the config count as holding a credential.
 ///
-/// `ProxyConfig::holds_credentials()` looks at the config *as loaded*; an
+/// `Config::holds_credentials()` looks at the config *as loaded*; an
 /// implementation that folded a never-written key into that struct would claim
 /// the file holds a secret key. The deployment that needs an ephemeral identity
 /// is exactly the read-only one, so that would turn graceful degradation into
@@ -278,7 +278,7 @@ fn an_ephemeral_identity_is_not_a_credential_in_the_config() {
     );
     // The invariant, read back from the file: a config whose key was never
     // written holds no credential.
-    let reloaded = nexapipe::config::ProxyConfig::from_file(path.to_str().expect("utf-8 path"))
+    let reloaded = nexapipe::config::Config::from_file(path.to_str().expect("utf-8 path"))
         .expect("the config still parses after an ephemeral start");
     assert_eq!(
         configured_secret_key(&path),
@@ -389,7 +389,7 @@ fn the_env_var_supplies_the_identity_without_touching_the_config() {
 
     // And the config, read back the way the permission check reads it, holds
     // no credential: the key is not in the file for anyone to see.
-    let reloaded = nexapipe::config::ProxyConfig::from_file(path.to_str().expect("utf-8 path"))
+    let reloaded = nexapipe::config::Config::from_file(path.to_str().expect("utf-8 path"))
         .expect("the config still parses");
     assert!(
         !reloaded.holds_credentials(),
@@ -509,7 +509,7 @@ fn the_env_named_key_file_holds_the_identity_outside_the_config() {
         "the key in the env-named file is the one the identity survives a restart on"
     );
 
-    let reloaded = nexapipe::config::ProxyConfig::from_file(path.to_str().expect("utf-8 path"))
+    let reloaded = nexapipe::config::Config::from_file(path.to_str().expect("utf-8 path"))
         .expect("the config still parses");
     assert!(
         !reloaded.holds_credentials(),

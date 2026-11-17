@@ -159,6 +159,23 @@ pub(crate) fn default_created_at() -> String {
 }
 
 impl AuthConfig {
+    /// The clients whose port list is held against the port the client names.
+    ///
+    /// A client with no port list is not limited by ports at all, and a client
+    /// with `allow_ports_strict` on is held against the port the request is
+    /// served from — the stronger rule. What is left is the historical one,
+    /// and it is the one an operator has to be told about.
+    pub fn clients_with_the_named_port_rule(&self) -> Vec<&str> {
+        let mut ids: Vec<&str> = self
+            .clients
+            .iter()
+            .filter(|(_, client)| client.allow_ports.is_some() && !client.allow_ports_strict)
+            .map(|(id, _)| id.as_str())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
     /// A copy carrying only the counters the config file is written back to.
     ///
     /// The whole config used to be cloned on every attempt worth counting, and

@@ -258,7 +258,7 @@ secret = "JBSWY3DPEHPK3PXP"
 /// stronger rule, and the one that needs no warning.
 #[test]
 fn the_port_rule_is_read_at_the_top_level() {
-    let config = parse(
+    let (_, auth) = load_from(
         "[auth]\n\
          enabled = true\n\
          \n\
@@ -273,42 +273,51 @@ fn the_port_rule_is_read_at_the_top_level() {
          \n\
          [auth.clients.unlimited]\n\
          secret = \"JBSWY3DPEHPK3PXP\"\n",
-    );
+    )
+    .expect("the config loads");
 
-    let rules = config.auth.expect("the [auth] section was read");
+    let auth = auth.expect("the [auth] section was read");
     assert_eq!(
-        rules.clients_with_the_named_port_rule(),
+        auth.clients_with_the_named_port_rule(),
         vec!["named"],
         "only the client with a port list and the strict flag off is reported"
     );
 }
 
-/// The summary holds no credential.
+/// The configuration the server keeps holds no credential.
 ///
 /// The section it is read from holds the seeds, and a copy of them inside the
 /// configuration would be a second copy of every secret in the file, held for
-/// as long as the configuration lives. The two keys it keeps are not secrets,
-/// and nothing else is kept at all.
+/// as long as the configuration lives — and this configuration is cloned on
+/// every request that needs it. The seeds move into the runtime's own shape
+/// instead, and this is where they live.
 #[test]
-fn the_port_rule_summary_holds_no_credential() {
-    let config = parse(
+fn the_loaded_configuration_holds_no_credential() {
+    let (config, auth) = load_from(
         "[auth]\n\
          enabled = true\n\
          \n\
          [auth.clients.client-001]\n\
          secret = \"JBSWY3DPEHPK3PXP\"\n\
          allow_ports = [443]\n",
-    );
+    )
+    .expect("the config loads");
 
-    let rules = config.auth.expect("the [auth] section was read");
-    let debug = format!("{rules:?}");
+    let debug = format!("{config:?}");
     assert!(
         !debug.contains("JBSWY3DPEHPK3PXP"),
         "the seed was copied into the configuration: {debug}"
     );
+
+    let auth = auth.expect("the [auth] section was read");
+    assert_eq!(
+        auth.clients["client-001"].secret.expose_secret(),
+        "JBSWY3DPEHPK3PXP",
+        "the seed moved into the runtime's shape rather than being copied"
+    );
 }
 
-fn parse(source: &str) -> ProxyConfig {
+fn parse(source: &str) -> Config {
     toml::from_str(source).expect("config should parse")
 }
 
@@ -316,11 +325,11 @@ fn parse(source: &str) -> ProxyConfig {
 ///
 /// `load_with_auth` takes a path rather than a string — it is also what
 /// checks the file's permissions — so parsing a snippet needs a real file.
-fn load_from(source: &str) -> anyhow::Result<(ProxyConfig, Option<crate::auth::AuthConfig>)> {
+fn load_from(source: &str) -> anyhow::Result<(Config, Option<crate::auth::AuthConfig>)> {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("config.toml");
     std::fs::write(&path, source).expect("write the config");
-    ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+    Config::load_with_auth(path.to_str().expect("utf-8 path"))
 }
 
 /// `build_routes` is what both a cold start and a config reload use, so a
@@ -1032,7 +1041,7 @@ fn load_with_algorithm(algorithm: &str) -> anyhow::Result<crate::auth::AuthConfi
     let dir = tempfile::tempdir().expect("a scratch directory");
     let path = dir.path().join("config.toml");
     std::fs::write(&path, source).expect("the config is written");
-    let (_, auth) = ProxyConfig::load_with_auth(path.to_str().expect("a path"))?;
+    let (_, auth) = Config::load_with_auth(path.to_str().expect("a path"))?;
     auth.ok_or_else(|| anyhow::anyhow!("the config has no [auth] section"))
 }
 
@@ -1345,7 +1354,7 @@ pending_enrollment = "TOKEN"
 fn enrolling_a_device_writes_its_entry_and_leaves_the_clients_secret() {
     let (_dir, path) = scratch_client_with_token();
 
-    ProxyConfig::complete_device_enrollment(
+    Config::complete_device_enrollment(
         &path,
         "alice",
         "laptop",
@@ -1359,7 +1368,7 @@ fn enrolling_a_device_writes_its_entry_and_leaves_the_clients_secret() {
         "the token was left spendable: {on_disk}"
     );
 
-    let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config still loads");
+    let (_, auth) = Config::load_with_auth(&path).expect("the config still loads");
     let auth = auth.expect("auth is enabled");
     let alice = &auth.clients["alice"];
     assert_eq!(
@@ -1398,7 +1407,7 @@ fn a_client_can_stop_answering_devices_that_name_themselves_not_at_all() {
     };
 
     let (_dir, path) = scratch_config(&source(None));
-    let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config parses");
+    let (_, auth) = Config::load_with_auth(&path).expect("the config parses");
     assert!(
         auth.expect("auth is enabled").clients["alice"].unnamed_device_allowed,
         "the default has to stay permissive: every client issued before 0.6.0 has no \
@@ -1406,7 +1415,7 @@ fn a_client_can_stop_answering_devices_that_name_themselves_not_at_all() {
     );
 
     let (_dir, path) = scratch_config(&source(Some("unnamed_device_allowed = false\n")));
-    let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config parses");
+    let (_, auth) = Config::load_with_auth(&path).expect("the config parses");
     assert!(
         !auth.expect("auth is enabled").clients["alice"].unnamed_device_allowed,
         "a flag the operator set must reach the running server"
@@ -1419,14 +1428,14 @@ fn a_client_can_stop_answering_devices_that_name_themselves_not_at_all() {
 fn a_second_device_enrolling_leaves_the_first_one_alone() {
     let (_dir, path) = scratch_client_with_token();
 
-    ProxyConfig::complete_device_enrollment(
+    Config::complete_device_enrollment(
         &path,
         "alice",
         "laptop",
         DeviceMaterial::Secret("LAPTOPSECRET"),
     )
     .expect("the first device enrolls");
-    ProxyConfig::complete_device_enrollment(
+    Config::complete_device_enrollment(
         &path,
         "alice",
         "phone",
@@ -1434,7 +1443,7 @@ fn a_second_device_enrolling_leaves_the_first_one_alone() {
     )
     .expect("the second device enrolls");
 
-    let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config still loads");
+    let (_, auth) = Config::load_with_auth(&path).expect("the config still loads");
     let auth = auth.expect("auth is enabled");
     let devices = &auth.clients["alice"].devices;
     // The count, not the map: the map carries each device's secret, and a
@@ -1455,23 +1464,16 @@ fn an_empty_device_secret_is_refused_by_both_writers() {
     let (_dir, path) = scratch_client_with_token();
     let before = fs::read_to_string(&path).expect("read the config first");
 
-    let enrollment = ProxyConfig::complete_device_enrollment(
-        &path,
-        "alice",
-        "laptop",
-        DeviceMaterial::Secret(""),
-    )
-    .expect_err("an empty secret is not a credential, it is a config that cannot be read again");
+    let enrollment =
+        Config::complete_device_enrollment(&path, "alice", "laptop", DeviceMaterial::Secret(""))
+            .expect_err(
+                "an empty secret is not a credential, it is a config that cannot be read again",
+            );
     assert!(enrollment.to_string().contains("empty"), "{enrollment:#}");
 
-    let operator = ProxyConfig::write_device_credential(
-        &path,
-        "alice",
-        "laptop",
-        DeviceMaterial::Secret(""),
-        true,
-    )
-    .expect_err("the same for the operator CLI");
+    let operator =
+        Config::write_device_credential(&path, "alice", "laptop", DeviceMaterial::Secret(""), true)
+            .expect_err("the same for the operator CLI");
     assert!(operator.to_string().contains("empty"), "{operator:#}");
 
     assert_eq!(
@@ -1480,7 +1482,7 @@ fn an_empty_device_secret_is_refused_by_both_writers() {
         "a refused write still changed the file"
     );
     assert!(
-        ProxyConfig::load_with_auth(&path).is_ok(),
+        Config::load_with_auth(&path).is_ok(),
         "the config was left in a state that cannot be loaded"
     );
 }
@@ -1595,7 +1597,7 @@ fn a_config_reached_through_a_symlink_is_the_one_that_changes() {
 /// The client the server would see after a write, read back through the
 /// very loader `--generate-2fa` and the server share.
 fn secret_of(path: &str, client_id: &str) -> Option<String> {
-    let (_, auth) = ProxyConfig::load_with_auth(path).expect("config still parses");
+    let (_, auth) = Config::load_with_auth(path).expect("config still parses");
     auth.and_then(|auth| {
         auth.clients
             .get(client_id)
@@ -1616,7 +1618,7 @@ fn client_secret_is_appended_without_rewriting_the_file() {
          backends = [\"http://127.0.0.1:8080\"]\n",
     );
 
-    let outcome = ProxyConfig::write_client_secret(&path, "client-001", "JBSWY3DPEHPK3PXP", false)
+    let outcome = Config::write_client_secret(&path, "client-001", "JBSWY3DPEHPK3PXP", false)
         .expect("secret should be written");
     assert_eq!(outcome, ClientSecretWrite::Added);
 
@@ -1641,7 +1643,7 @@ fn client_secret_joins_an_existing_auth_section() {
          secret = \"AAAAAAAAAAAAAAAA\"\n",
     );
 
-    let outcome = ProxyConfig::write_client_secret(&path, "client-002", "JBSWY3DPEHPK3PXP", false)
+    let outcome = Config::write_client_secret(&path, "client-002", "JBSWY3DPEHPK3PXP", false)
         .expect("secret should be written");
     assert_eq!(outcome, ClientSecretWrite::Added);
 
@@ -1657,7 +1659,7 @@ fn client_secret_joins_an_existing_auth_section() {
         Some("JBSWY3DPEHPK3PXP")
     );
     // 2FA was already on and stays on; enabling it is the operator's call.
-    let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config parses");
+    let (_, auth) = Config::load_with_auth(&path).expect("config parses");
     assert!(auth.expect("[auth] exists").enabled);
 }
 
@@ -1671,7 +1673,7 @@ fn client_secret_needs_force_to_replace_one() {
          secret = \"OLDOLDOLDOLDOLD\"\n",
     );
 
-    let err = ProxyConfig::write_client_secret(&path, "client-001", "JBSWY3DPEHPK3PXP", false)
+    let err = Config::write_client_secret(&path, "client-001", "JBSWY3DPEHPK3PXP", false)
         .expect_err("an enrolled client must not lose its secret by accident");
     assert!(err.to_string().contains("already has a secret"));
     assert_eq!(
@@ -1679,7 +1681,7 @@ fn client_secret_needs_force_to_replace_one() {
         Some("OLDOLDOLDOLDOLD")
     );
 
-    let outcome = ProxyConfig::write_client_secret(&path, "client-001", "JBSWY3DPEHPK3PXP", true)
+    let outcome = Config::write_client_secret(&path, "client-001", "JBSWY3DPEHPK3PXP", true)
         .expect("force replaces it");
     assert_eq!(outcome, ClientSecretWrite::Replaced);
     assert_eq!(
@@ -1694,7 +1696,7 @@ fn client_ids_that_are_not_bare_keys_are_quoted() {
     // quoted so it stays one key.
     let (_dir, path) = scratch_config("default_backend = \"http://127.0.0.1:15666\"\n");
 
-    ProxyConfig::write_client_secret(&path, "client.001", "JBSWY3DPEHPK3PXP", false)
+    Config::write_client_secret(&path, "client.001", "JBSWY3DPEHPK3PXP", false)
         .expect("secret should be written");
 
     let written = fs::read_to_string(&path).expect("read back");
@@ -1743,7 +1745,7 @@ fn a_key_file_resolves_and_leaves_the_config_credential_free() {
     let path = dir.path().join("config.toml");
     fs::write(&path, "[iroh]\nsecret_key_file = \"iroh.key\"\n").expect("write the config");
 
-    let (config, _) = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+    let (config, _) = Config::load_with_auth(path.to_str().expect("utf-8 path"))
         .expect("a config whose key lives in a file loads");
 
     let iroh = config.iroh.as_ref().expect("the [iroh] section parsed");
@@ -1779,7 +1781,7 @@ fn naming_the_key_twice_refuses_to_load() {
     )
     .expect("write the config");
 
-    let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+    let err = Config::load_with_auth(path.to_str().expect("utf-8 path"))
         .expect_err("two answers to one question are refused");
     assert!(err.to_string().contains("named by"), "{err}");
     assert!(err.to_string().contains("secret_key_file"), "{err}");
@@ -1914,7 +1916,7 @@ fn a_relay_token_file_resolves() {
     fs::write(&path, "[iroh]\nrelay_auth_token_file = \"relay.token\"\n")
         .expect("write the config");
 
-    let (config, _) = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+    let (config, _) = Config::load_with_auth(path.to_str().expect("utf-8 path"))
         .expect("a config whose token lives in a file loads");
 
     let iroh = config.iroh.as_ref().expect("the [iroh] section parsed");
@@ -1938,7 +1940,7 @@ fn a_missing_relay_token_file_refuses_to_load() {
     fs::write(&path, "[iroh]\nrelay_auth_token_file = \"relay.token\"\n")
         .expect("write the config");
 
-    let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+    let err = Config::load_with_auth(path.to_str().expect("utf-8 path"))
         .expect_err("a token cannot be generated into a missing file");
     assert!(err.to_string().contains("does not exist"), "{err}");
 }
@@ -1952,7 +1954,7 @@ fn an_empty_key_file_refuses_to_load() {
     let path = dir.path().join("config.toml");
     fs::write(&path, "[iroh]\nsecret_key_file = \"iroh.key\"\n").expect("write the config");
 
-    let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+    let err = Config::load_with_auth(path.to_str().expect("utf-8 path"))
         .expect_err("a blank credential file is refused");
     assert!(err.to_string().contains("holds nothing"), "{err}");
 }
@@ -1966,9 +1968,8 @@ fn a_missing_key_file_is_generated_into() {
     let path = dir.path().join("config.toml");
     fs::write(&path, "[iroh]\nsecret_key_file = \"iroh.key\"\n").expect("write the config");
 
-    let config =
-        ProxyConfig::from_file(path.to_str().expect("utf-8 path")).expect("the config loads");
-    let identity = ProxyConfig::ensure_iroh_secret_key(path.to_str().expect("utf-8 path"), &config)
+    let config = Config::from_file(path.to_str().expect("utf-8 path")).expect("the config loads");
+    let identity = Config::ensure_iroh_secret_key(path.to_str().expect("utf-8 path"), &config)
         .expect("the identity resolves");
     // Compare instead of formatting: the identity is the endpoint's private
     // key, and it does not belong in a message that CI keeps — even though
@@ -2001,7 +2002,7 @@ fn a_missing_key_file_is_generated_into() {
          point of the pointer"
     );
 
-    let (reloaded, _) = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+    let (reloaded, _) = Config::load_with_auth(path.to_str().expect("utf-8 path"))
         .expect("the config reloads from the key file");
     assert_eq!(
         reloaded.iroh.as_ref().expect("[iroh]").secret_key_source,
@@ -2025,7 +2026,7 @@ fn a_world_readable_key_file_refuses_to_load() {
     let path = dir.path().join("config.toml");
     fs::write(&path, "[iroh]\nsecret_key_file = \"iroh.key\"\n").expect("write the config");
 
-    let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+    let err = Config::load_with_auth(path.to_str().expect("utf-8 path"))
         .expect_err("a world-readable credential file is refused");
     assert!(err.to_string().contains("chmod 600"), "{err}");
 }
@@ -2097,9 +2098,9 @@ fn an_enrollment_token_is_recorded_then_spent() {
          secret = \"JBSWY3DPEHPK3PXP\"\n",
     );
 
-    ProxyConfig::write_pending_enrollment(&path, "client-001", "deadbeef")
+    Config::write_pending_enrollment(&path, "client-001", "deadbeef")
         .expect("token should be written");
-    let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config still parses");
+    let (_, auth) = Config::load_with_auth(&path).expect("config still parses");
     let auth = auth.expect("auth section");
     assert_eq!(
         auth.clients["client-001"]
@@ -2115,9 +2116,9 @@ fn an_enrollment_token_is_recorded_then_spent() {
 
     // Issuing a second token replaces the first: that is how a link that
     // never arrived gets revoked.
-    ProxyConfig::write_pending_enrollment(&path, "client-001", "cafebabe")
+    Config::write_pending_enrollment(&path, "client-001", "cafebabe")
         .expect("token should be replaced");
-    let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config still parses");
+    let (_, auth) = Config::load_with_auth(&path).expect("config still parses");
     assert_eq!(
         auth.unwrap().clients["client-001"]
             .pending_enrollment
@@ -2126,9 +2127,9 @@ fn an_enrollment_token_is_recorded_then_spent() {
         Some("cafebabe")
     );
 
-    ProxyConfig::complete_enrollment(&path, "client-001", "NEWSECRETVALUE")
+    Config::complete_enrollment(&path, "client-001", "NEWSECRETVALUE")
         .expect("enrollment should be saved");
-    let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config still parses");
+    let (_, auth) = Config::load_with_auth(&path).expect("config still parses");
     let client = &auth.unwrap().clients["client-001"];
     assert_eq!(client.secret.as_str(), "NEWSECRETVALUE");
     // The token has to go with it, or the same link enrolls a second device.
@@ -2156,7 +2157,7 @@ fn a_blank_enrollment_token_is_refused() {
          pending_enrollment = \"\"\n",
     );
 
-    let err = ProxyConfig::load_with_auth(&path).expect_err("a blank token must not load");
+    let err = Config::load_with_auth(&path).expect_err("a blank token must not load");
     assert!(err.to_string().contains("pending_enrollment"), "{err}");
 }
 
@@ -2192,14 +2193,14 @@ fn a_parsed_iroh_config_prints_no_credentials() {
 #[test]
 fn an_enrollment_token_needs_a_client() {
     let (_dir, path) = scratch_config("default_backend = \"http://127.0.0.1:15666\"\n");
-    let err = ProxyConfig::write_pending_enrollment(&path, "ghost", "deadbeef")
+    let err = Config::write_pending_enrollment(&path, "ghost", "deadbeef")
         .expect_err("a missing client must not be silently created");
     assert!(err.to_string().contains("ghost"), "{err}");
 }
 
 /// The devices of a client, as the server would read them back.
 fn devices_of(path: &str, client_id: &str) -> HashMap<String, crate::auth::DeviceAuth> {
-    let (_, auth) = ProxyConfig::load_with_auth(path).expect("config still parses");
+    let (_, auth) = Config::load_with_auth(path).expect("config still parses");
     auth.and_then(|auth| auth.clients.get(client_id).map(|c| c.devices.clone()))
         .unwrap_or_default()
 }
@@ -2217,7 +2218,7 @@ fn a_device_secret_lands_under_the_clients_devices_table() {
          secret = \"JBSWY3DPEHPK3PXP\"\n",
     );
 
-    let outcome = ProxyConfig::write_device_credential(
+    let outcome = Config::write_device_credential(
         &path,
         "acme",
         "laptop",
@@ -2259,7 +2260,7 @@ fn a_device_secret_needs_force_to_replace_one() {
          secret = \"OLDOLDOLDOLDOLD\"\n",
     );
 
-    let err = ProxyConfig::write_device_credential(
+    let err = Config::write_device_credential(
         &path,
         "acme",
         "laptop",
@@ -2278,7 +2279,7 @@ fn a_device_secret_needs_force_to_replace_one() {
         Some("OLDOLDOLDOLDOLD")
     );
 
-    let outcome = ProxyConfig::write_device_credential(
+    let outcome = Config::write_device_credential(
         &path,
         "acme",
         "laptop",
@@ -2307,7 +2308,7 @@ fn a_device_secret_needs_a_client_with_a_secret() {
          secret = \"JBSWY3DPEHPK3PXP\"\n",
     );
 
-    let err = ProxyConfig::write_device_credential(
+    let err = Config::write_device_credential(
         &path,
         "ghost",
         "laptop",
@@ -2336,7 +2337,7 @@ fn an_unprintable_device_name_is_refused() {
     );
 
     for name in ["", "lap top", "laptop\nsecret = \"x\""] {
-        let err = ProxyConfig::write_device_credential(
+        let err = Config::write_device_credential(
             &path,
             "acme",
             name,
@@ -2364,7 +2365,7 @@ fn a_device_key_lands_under_the_clients_devices_table() {
     );
     let key = crate::auth::public_key_hex(&iroh::SecretKey::generate().public());
 
-    let outcome = ProxyConfig::write_device_credential(
+    let outcome = Config::write_device_credential(
         &path,
         "acme",
         "server",
@@ -2404,7 +2405,7 @@ fn a_public_key_that_is_not_a_key_is_refused_by_the_writer() {
     );
     let before = fs::read_to_string(&path).expect("read the config first");
 
-    let err = ProxyConfig::write_device_credential(
+    let err = Config::write_device_credential(
         &path,
         "acme",
         "server",
@@ -2420,7 +2421,7 @@ fn a_public_key_that_is_not_a_key_is_refused_by_the_writer() {
         "a refused write still changed the file"
     );
     assert!(
-        ProxyConfig::load_with_auth(&path).is_ok(),
+        Config::load_with_auth(&path).is_ok(),
         "the config was left in a state that cannot be loaded"
     );
 }
@@ -2444,7 +2445,7 @@ fn a_key_replaces_a_secret_only_with_force() {
     );
     let key = crate::auth::public_key_hex(&iroh::SecretKey::generate().public());
 
-    let err = ProxyConfig::write_device_credential(
+    let err = Config::write_device_credential(
         &path,
         "acme",
         "server",
@@ -2457,7 +2458,7 @@ fn a_key_replaces_a_secret_only_with_force() {
         "{err}"
     );
 
-    let outcome = ProxyConfig::write_device_credential(
+    let outcome = Config::write_device_credential(
         &path,
         "acme",
         "server",
@@ -2494,7 +2495,7 @@ fn revoking_a_device_leaves_the_others_alone() {
          secret = \"BBBBBBBBBBBBBBBB\"\n",
     );
 
-    ProxyConfig::remove_device(&path, "acme", "laptop").expect("the device should be revoked");
+    Config::remove_device(&path, "acme", "laptop").expect("the device should be revoked");
 
     let devices = devices_of(&path, "acme");
     assert_eq!(devices.len(), 1, "one device went, {devices:?}");
@@ -2526,7 +2527,7 @@ fn revoking_a_device_that_is_not_there_says_which_ones_are() {
          secret = \"AAAAAAAAAAAAAAAA\"\n",
     );
 
-    let err = ProxyConfig::remove_device(&path, "acme", "tablet")
+    let err = Config::remove_device(&path, "acme", "tablet")
         .expect_err("a missing device must not be reported as revoked");
     assert!(err.to_string().contains("tablet"), "{err}");
     assert!(err.to_string().contains("laptop"), "{err}");
@@ -2551,7 +2552,7 @@ fn revoking_a_client_takes_its_devices_with_it() {
                   secret = \"CCCCCCCCCCCCCCCC\"\n";
     let (_dir, path) = scratch_config(source);
 
-    ProxyConfig::remove_client(&path, "acme").expect("the client should be revoked");
+    Config::remove_client(&path, "acme").expect("the client should be revoked");
 
     let written = fs::read_to_string(&path).expect("read back");
     assert!(!written.contains("acme"), "{written}");
@@ -2561,7 +2562,7 @@ fn revoking_a_client_takes_its_devices_with_it() {
         Some("CCCCCCCCCCCCCCCC"),
         "the neighbouring client is untouched"
     );
-    let (_, auth) = ProxyConfig::load_with_auth(&path).expect("config still parses");
+    let (_, auth) = Config::load_with_auth(&path).expect("config still parses");
     assert_eq!(auth.expect("[auth] exists").clients.len(), 1);
 }
 
@@ -2575,7 +2576,7 @@ fn revoking_something_absent_leaves_the_file_alone() {
                   secret = \"JBSWY3DPEHPK3PXP\"\n";
     let (_dir, path) = scratch_config(source);
 
-    let err = ProxyConfig::remove_client(&path, "ghost")
+    let err = Config::remove_client(&path, "ghost")
         .expect_err("a missing client must not be reported as revoked");
     assert!(err.to_string().contains("ghost"), "{err}");
     assert_eq!(
@@ -2586,8 +2587,8 @@ fn revoking_something_absent_leaves_the_file_alone() {
 
     // No [auth.clients] at all, and the same answer.
     let (_dir, path) = scratch_config("default_backend = \"http://127.0.0.1:15666\"\n");
-    assert!(ProxyConfig::remove_client(&path, "acme").is_err());
-    assert!(ProxyConfig::remove_device(&path, "acme", "laptop").is_err());
+    assert!(Config::remove_client(&path, "acme").is_err());
+    assert!(Config::remove_device(&path, "acme", "laptop").is_err());
     assert_eq!(
         fs::read_to_string(&path).expect("read back"),
         "default_backend = \"http://127.0.0.1:15666\"\n"
@@ -2710,7 +2711,7 @@ allow_hosts = ["*iakl.top"]
     )
     .expect("write the config");
 
-    let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+    let err = Config::load_with_auth(path.to_str().expect("utf-8 path"))
         .expect_err("the pattern has to be refused");
     assert!(err.to_string().contains("label boundary"), "{err}");
 }
@@ -2735,7 +2736,7 @@ allow_hosts = ["*.."]
     )
     .expect("write the config");
 
-    let err = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+    let err = Config::load_with_auth(path.to_str().expect("utf-8 path"))
         .expect_err("the pattern has to be refused");
     assert!(err.to_string().contains("catch-all"), "{err}");
 }
@@ -2967,7 +2968,7 @@ fn a_config_without_iroh_gains_the_key() {
     );
 
     let identity =
-        ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+        Config::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
             .expect("the identity is resolved");
 
     let EndpointIdentity::Generated(key) = identity else {
@@ -3008,7 +3009,7 @@ fn an_existing_iroh_section_keeps_its_other_keys() {
          bind_port = 41641\n",
     );
 
-    ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+    Config::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
         .expect("the identity is resolved");
 
     let written = fs::read_to_string(&path).expect("the config is still there");
@@ -3035,7 +3036,7 @@ fn the_comments_around_the_key_survive() {
          relay_mode = \"pinned\"\n",
     );
 
-    ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+    Config::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
         .expect("the identity is resolved");
 
     let written = fs::read_to_string(&path).expect("the config is still there");
@@ -3087,7 +3088,7 @@ fn a_configured_key_is_left_alone() {
     let (_dir, path) = scratch_config(&format!("[iroh]\nsecret_key = \"{key}\"\n"));
 
     let identity =
-        ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+        Config::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
             .expect("the identity is resolved");
 
     assert_eq!(
@@ -3110,7 +3111,7 @@ fn an_unparseable_key_refuses_rather_than_rotating() {
     let broken = "[iroh]\nsecret_key = \"not-a-key\"\n";
     let (_dir, path) = scratch_config(broken);
 
-    let err = ProxyConfig::ensure_iroh_secret_key(&path, &parse(broken))
+    let err = Config::ensure_iroh_secret_key(&path, &parse(broken))
         .expect_err("a key that does not parse must not be papered over");
 
     let message = err.to_string();
@@ -3142,12 +3143,10 @@ fn an_unparseable_key_refuses_rather_than_rotating() {
 fn the_node_id_survives_a_restart() {
     let (_dir, path) = scratch_config("debug = true\n");
 
-    let first =
-        ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
-            .expect("the first start resolves an identity");
-    let second =
-        ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
-            .expect("the second start resolves an identity");
+    let first = Config::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+        .expect("the first start resolves an identity");
+    let second = Config::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+        .expect("the second start resolves an identity");
 
     assert_eq!(
         first.key(),
@@ -3221,7 +3220,7 @@ fn an_unwritable_config_still_resolves_an_identity() {
     fs::write(&path, "this is not TOML at all: \"\n").expect("write a file that is not TOML");
     let path = path.to_string_lossy().into_owned();
 
-    let identity = ProxyConfig::ensure_iroh_secret_key(&path, &parse("debug = true\n"))
+    let identity = Config::ensure_iroh_secret_key(&path, &parse("debug = true\n"))
         .expect("a file the server cannot write must not stop it: the key is generated either way");
 
     // Compare instead of formatting: the identity is the endpoint's private
@@ -3291,7 +3290,7 @@ fn a_generated_key_lands_in_a_private_file() {
     use std::os::unix::fs::PermissionsExt;
 
     let (_dir, path) = scratch_config("debug = true\n");
-    ProxyConfig::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
+    Config::ensure_iroh_secret_key(&path, &parse(&fs::read_to_string(&path).unwrap()))
         .expect("the identity is resolved");
 
     let mode = fs::metadata(&path)

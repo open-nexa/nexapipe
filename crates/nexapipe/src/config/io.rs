@@ -6,7 +6,7 @@
 //! configuration rather than about the file: how the text is parsed, and what
 //! is said when the file holds a credential anybody can read.
 
-use super::ProxyConfig;
+use super::Config;
 
 /// Parses the configuration file's text, with an error that says what to do
 /// about a key this build does not know.
@@ -56,7 +56,7 @@ pub(crate) fn parse_config<T: serde::de::DeserializeOwned>(text: &str) -> anyhow
 /// that needed an `AuthConfig` to exist would be silent for exactly that file.
 pub fn warn_about_readable_credentials(
     path: &std::path::Path,
-    proxy: &ProxyConfig,
+    proxy: &Config,
     auth: Option<&crate::auth::AuthConfig>,
 ) {
     if !should_warn_about_permissions(path, proxy, auth) {
@@ -78,7 +78,7 @@ pub fn warn_about_readable_credentials(
 /// question it answers.
 pub fn should_warn_about_permissions(
     path: &std::path::Path,
-    proxy: &ProxyConfig,
+    proxy: &Config,
     auth: Option<&crate::auth::AuthConfig>,
 ) -> bool {
     // A credential the file holds in the clear: an inline `[iroh]` key or

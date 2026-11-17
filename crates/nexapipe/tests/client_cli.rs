@@ -172,9 +172,8 @@ fn a_device_gets_a_credential_of_its_own() {
 
     // And it is not merely text in the file: the server has to read it back as a
     // credential of that device.
-    let (_, auth) =
-        nexapipe::config::ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
-            .expect("config still parses");
+    let (_, auth) = nexapipe::config::Config::load_with_auth(path.to_str().expect("utf-8 path"))
+        .expect("config still parses");
     let auth = auth.expect("[auth] exists");
     assert_eq!(
         auth.clients["acme"].devices["laptop"].secret.as_str(),

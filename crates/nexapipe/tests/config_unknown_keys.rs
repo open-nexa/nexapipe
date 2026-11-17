@@ -10,7 +10,7 @@
 //! error naming the key, and the shipped examples still loading — a config
 //! that has been wrong for years is still a config that has to work.
 
-use nexapipe::config::ProxyConfig;
+use nexapipe::config::Config;
 
 /// One section, and a key in it that does not exist.
 struct Case {
@@ -118,11 +118,11 @@ const CASES: &[Case] = &[
 ];
 
 /// Writes a config file and loads it the way a start does.
-fn load(file: &str) -> anyhow::Result<ProxyConfig> {
+fn load(file: &str) -> anyhow::Result<Config> {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("config.toml");
     std::fs::write(&path, file).expect("write the config");
-    ProxyConfig::from_file(path.to_str().expect("utf-8 path"))
+    Config::from_file(path.to_str().expect("utf-8 path"))
 }
 
 /// Every section refuses a key it does not know, and the error names it.
@@ -158,7 +158,7 @@ fn the_loader_the_server_uses_refuses_an_unknown_key_too() {
     let path = dir.path().join("config.toml");
     std::fs::write(&path, "[server]\nexposee = true\n").expect("write the config");
 
-    let error = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+    let error = Config::load_with_auth(path.to_str().expect("utf-8 path"))
         .expect_err("a key this build does not know is refused");
     assert!(
         error.to_string().contains("exposee"),
@@ -225,7 +225,7 @@ fn the_auth_section_is_still_read() {
     .expect("write the config");
 
     let (config, auth) =
-        ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path")).expect("the config parses");
+        Config::load_with_auth(path.to_str().expect("utf-8 path")).expect("the config parses");
     let auth = auth.expect("[auth] was read");
     assert!(auth.enabled, "2FA is on");
     assert_eq!(auth.issuer, "NexaPipe");
@@ -243,6 +243,6 @@ fn a_config_without_an_auth_section_loads() {
     std::fs::write(&path, "debug = false\n").expect("write the config");
 
     let (_, auth) =
-        ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path")).expect("the config parses");
+        Config::load_with_auth(path.to_str().expect("utf-8 path")).expect("the config parses");
     assert!(auth.is_none(), "no [auth] section means no 2FA");
 }

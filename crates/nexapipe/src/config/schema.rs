@@ -8,11 +8,11 @@ use crate::conn::limits::LimitsConfig;
 
 use nexapipe_proto::secret::SecretString;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use std::collections::HashMap;
+use super::auth_file::{Auth, deserialize_auth};
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// Address of the plaintext listener. **Absent means "do not bind it at
@@ -35,7 +35,7 @@ pub struct ServerConfig {
     // ---- Removed keys, still accepted so an existing config.toml keeps parsing ----
     //
     // This process no longer terminates TLS: the backend does (Caddy &co). The
-    // fields below are kept only so `ProxyConfig::from_file` does not fail on a
+    // fields below are kept only so `Config::from_file` does not fail on a
     // config written for the old layout; `warn_removed_tls_keys` logs them at
     // startup and they can be deleted from the file.
     pub tls_enabled: Option<bool>,
@@ -61,7 +61,7 @@ pub struct ServerConfig {
 /// a credential into the file operators copy around and commit, and writing it
 /// back would trip the watcher that reloads on the config's mtime. See
 /// [`crate::admin::token`].
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
     /// Address of the auxiliary listener. **Absent means "do not bind it"**,
@@ -76,7 +76,7 @@ pub struct AdminConfig {
 /// the same binary is deployed with and without a scraper, and a feature would
 /// mean a second build-and-test combination in CI and in every release for a
 /// decision a deployment makes per host.
-#[derive(Debug, Deserialize, Clone, Copy, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default)]
 #[serde(deny_unknown_fields)]
 pub struct MetricsConfig {
     /// Serve `/metrics` on the `[admin]` listener. Default: `false`.
@@ -90,7 +90,7 @@ pub struct MetricsConfig {
 /// has no `[iroh]` section at all but still needs somewhere to put the secret
 /// key it just generated. Every field is optional, so "all of them absent" is
 /// exactly what an empty `[iroh]` means.
-#[derive(Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct IrohConfig {
     pub relay_url: Option<String>,
@@ -153,7 +153,7 @@ pub struct IrohConfig {
     /// [`Self::secret_key_file`] for the relay bearer token.
     pub relay_auth_token_file: Option<String>,
     /// Where `secret_key` was resolved from. Filled by
-    /// `ProxyConfig::resolve_external_credentials` during the load; not
+    /// `Config::resolve_external_credentials` during the load; not
     /// spelled in the file, so `serde` skips it.
     #[serde(skip)]
     pub secret_key_source: CredentialSource,
@@ -165,7 +165,7 @@ pub struct IrohConfig {
 
 /// Where a `[iroh]` credential was resolved from.
 ///
-/// [`ProxyConfig::holds_credentials`] asks this: the permission gate is about
+/// [`Config::holds_credentials`] asks this: the permission gate is about
 /// what an account that reads *the config file* would obtain, and a credential
 /// that came from the environment or from a pointed-to file is not in the
 /// config for anyone to read. Only the inline literal makes the file itself a
@@ -192,7 +192,7 @@ pub(crate) fn redacted(value: &Option<SecretString>) -> Option<&'static str> {
 
 /// Handwritten so the endpoint's credentials never reach a log line.
 ///
-/// `ProxyConfig` is logged at debug level whenever it is parsed — including on
+/// `Config` is logged at debug level whenever it is parsed — including on
 /// every hot reload, where the logger is already installed — and a derived
 /// `Debug` would put the ed25519 private key and the relay bearer token on that
 /// line. Reading the log would then be enough to own this endpoint's identity
@@ -313,7 +313,7 @@ pub fn get_backend_protocol(value: &Option<String>) -> anyhow::Result<BackendPro
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct RouteSpec {
     pub host_pattern: String,
@@ -369,7 +369,7 @@ pub(crate) fn default_path_pattern() -> String {
     "/".to_string()
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct LocalProxyNode {
     pub server_node_id: Option<String>,
@@ -378,7 +378,7 @@ pub struct LocalProxyNode {
 }
 
 /// Client-side 2FA credentials used by local-proxy mode.
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct LocalProxyTwoFactorConfig {
     pub enabled: Option<bool>,
@@ -400,7 +400,7 @@ impl std::fmt::Debug for LocalProxyTwoFactorConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct LocalProxyConfig {
     pub enabled: bool,
@@ -439,7 +439,7 @@ pub struct LocalProxyConfig {
 ///
 /// Every field is optional; the defaults (see `log::init`) keep the previous
 /// behaviour of logging to stdout and add rotating files under `./logs`.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 pub struct LogConfig {
     /// Write the log to files. Default: `true`.
@@ -501,7 +501,7 @@ pub struct LogConfig {
 ///
 /// Read once at startup, not live: these are handed to the HTTP client builder
 /// and to the stream handlers when they start, so an edit takes a restart.
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct TimeoutsConfig {
@@ -657,7 +657,7 @@ impl Default for Timeouts {
 /// traffic is simply forwarded, which is what the proxy did before health checks
 /// existed. A backend that 404s, or answers any 2xx, is already counted healthy,
 /// so having no dedicated health endpoint is not on its own a reason to opt out.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct HealthCheckConfig {
@@ -687,7 +687,12 @@ impl Default for HealthCheckConfig {
     }
 }
 
-/// The whole configuration file.
+/// The whole configuration, as the model holds it.
+///
+/// One type, and the one place a key is named: the sections below are the
+/// file's own shapes, and a store that keeps the configuration as rows reads
+/// them out of the same types a file is parsed into. The codecs that speak it
+/// live in [`crate::config::model`].
 ///
 /// **An unknown key is an error.** Every section refuses the keys it does not
 /// know, and so does the top level: a key that is not read is a key the
@@ -698,9 +703,9 @@ impl Default for HealthCheckConfig {
 /// The two keys that exist only to be refused — `default_backend` and
 /// `[acme]` — are still parsed, so a config carrying one is told what to do
 /// with it instead of being accepted and ignored.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct ProxyConfig {
+pub struct Config {
     /// **Removed.** Kept in the struct for exactly one reason: serde drops keys
     /// it does not know, so deleting this field would let a config that still
     /// names a `default_backend` keep running — and quietly start answering 404
@@ -758,101 +763,23 @@ pub struct ProxyConfig {
     /// is, with the defaults.
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
-    /// The `[auth]` section, as far as the port rule is concerned.
+    /// The `[auth]` section: the 2FA settings, the clients and their devices.
     ///
-    /// The 2FA half of the file is parsed by [`Self::load_with_auth`], which
-    /// owns the seeds and the rules around them — this section is where they
-    /// are validated, where the enrollment tokens live and where the counters
-    /// are read. The top level refuses the keys it does not know, and `[auth]`
-    /// is not one of them.
+    /// **Empty once the configuration has been loaded.** The seeds move into
+    /// the runtime's own shape — see [`Self::take_auth`] — and this section is
+    /// the *file's*, not the server's: a configuration that kept a second copy
+    /// of every seed would be cloned on every request, and every clone would
+    /// be another copy of every secret in the file.
     ///
-    /// Only the two keys that say which of the two port rules a client is held
-    /// against are read here, and no credential is among them: the seeds stay
-    /// with the loader that owns them, and a copy of them inside this struct
-    /// would be a second copy of every secret in the file, held for as long as
-    /// the configuration lives.
+    /// Read here, as part of the whole configuration, rather than by a loader
+    /// of its own, so that the section is refused for the keys it does not
+    /// know like every other section: `enable = true` instead of `enabled`
+    /// left 2FA off with nothing in the log to say so.
     ///
-    /// Read at all so the operator can be told which rule is in force. A port
-    /// list held against the port a client names is a weaker restriction than
-    /// it looks — a request that names no port is not checked at all — and the
-    /// flag that says so is not in the name of the setting.
-    #[serde(default, deserialize_with = "deserialize_auth_port_rules")]
-    pub(crate) auth: Option<AuthPortRules>,
-}
-
-/// The `[auth]` section, as far as the port rule is concerned.
-///
-/// The credentials in that section belong to the auth loader, and this struct
-/// keeps none of them: it reads the two keys that say which of the two port
-/// rules a client is held against, and ignores everything else in the section.
-/// An ignored value is never copied, so the seeds in the file stay in the one
-/// place that owns them.
-#[derive(Debug, Deserialize, Clone, Default)]
-pub(crate) struct AuthPortRules {
-    /// The clients, by id.
-    #[serde(default)]
-    pub clients: HashMap<String, ClientPortRule>,
-}
-
-/// One client's port rule: the list of ports, and the port it is held against.
-///
-/// The two keys are the whole of it. `allow_ports` is the list, and
-/// `allow_ports_strict` says whether that list is checked against the port the
-/// request is *served from* (the stronger rule) or the one the client *names*
-/// (the historical one).
-#[derive(Debug, Deserialize, Clone, Default)]
-pub(crate) struct ClientPortRule {
-    /// The ports this client may reach.
-    #[serde(default)]
-    pub allow_ports: Option<Vec<u16>>,
-    /// Whether the list is checked against the port the request is served from.
-    #[serde(default)]
-    pub allow_ports_strict: Option<bool>,
-}
-
-impl AuthPortRules {
-    /// The clients whose port list is held against the port the client names.
-    ///
-    /// A client with no port list is not limited by ports at all, and a client
-    /// with `allow_ports_strict` on is held against the port the request is
-    /// served from — the stronger rule. What is left is the historical one,
-    /// and it is the one an operator has to be told about.
-    pub fn clients_with_the_named_port_rule(&self) -> Vec<&str> {
-        let mut ids: Vec<&str> = self
-            .clients
-            .iter()
-            .filter(|(_, client)| {
-                client.allow_ports.is_some() && !client.allow_ports_strict.unwrap_or(false)
-            })
-            .map(|(id, _)| id.as_str())
-            .collect();
-        ids.sort_unstable();
-        ids
-    }
-}
-
-/// Reads the `[auth]` section far enough to know which port rule is in force,
-/// and says so when it is the weaker one.
-///
-/// Said here, at the parse, because this is the one point every reader of the
-/// file passes through — the startup path included — and a second read of the
-/// same section would be a second pass over the credentials in it.
-fn deserialize_auth_port_rules<'de, D>(deserializer: D) -> Result<Option<AuthPortRules>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let rules = Option::<AuthPortRules>::deserialize(deserializer)?;
-    if let Some(rules) = &rules {
-        for client in rules.clients_with_the_named_port_rule() {
-            tracing::warn!(
-                "[auth.clients.{client}] has an allow_ports list but allow_ports_strict is off: \
-                 the list is checked against the port the client names, and a request that \
-                 names no port is not checked at all. Set allow_ports_strict = true to check \
-                 the port the request is served from"
-            );
-        }
-    }
-    Ok(rules)
+    /// Read on its own, so that a refusal names the section that broke — see
+    /// [`deserialize_auth`].
+    #[serde(default, deserialize_with = "deserialize_auth")]
+    pub auth: Option<Auth>,
 }
 
 /// The `[backends]` section: how the proxy reaches the backends themselves.
@@ -861,7 +788,7 @@ where
 /// certificates an `https://` backend is checked against. The transport is
 /// decided per route — an `http://` backend is fetched in the clear, an
 /// `https://` one over a TLS session this process originates.
-#[derive(Debug, Deserialize, Clone, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct BackendsConfig {
@@ -884,7 +811,7 @@ pub struct BackendsConfig {
 /// backend is safe to try again, and one that failed after the backend had it
 /// is not, unless the request was idempotent to begin with. What may be
 /// retried, and what may not, is spelled out in `crate::http`.
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct RetryConfig {
@@ -948,7 +875,7 @@ impl Default for Retry {
 /// refused the last five connections, so stop sending it any until it has had
 /// a chance to come back. The two answer different questions and are meant to
 /// be on at the same time.
-#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[serde(default)]
 pub struct CircuitBreakerConfig {
@@ -1019,7 +946,7 @@ impl Default for CircuitBreaker {
 /// unrestricted, so `allowed = [...]` instead of `allow = [...]` would leave a
 /// server that looks restricted and is not, with nothing in the log to say so.
 /// A typo here is a security change rather than a lost setting.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct PeersConfig {
     /// Node IDs allowed to connect. `None` (the section present but the key
