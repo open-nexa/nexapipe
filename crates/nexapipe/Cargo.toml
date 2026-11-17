@@ -99,6 +99,20 @@ qrcode = { version = "0.14.1", default-features = false }
 # version, so the tree carries one SHA-256 and not two.
 sha2 = "0.11"
 
+# The database store. Behind a feature, because a build that does not carry
+# the driver has to say so rather than pretend to open a database it has no
+# driver for — and because the driver is a dependency a deployment that only
+# ever reads a `config.toml` does not need.
+#
+# `sqlite-bundled` compiles SQLite from the amalgamation the driver ships, so
+# the build does not depend on the SQLite the host happens to have.
+sqlx = { version = '0.9', default-features = false, features = ['runtime-tokio', 'sqlite'], optional = true }
+
+[features]
+# The stores that are not a file. `storage-sqlite` carries the SQLite store;
+# `storage-postgres` is where the PostgreSQL one will arrive.
+storage-sqlite = ['dep:sqlx']
+
 [dev-dependencies]
 # Spawns the built binary in the integration tests (see tests/).
 duct = '1.1.1'

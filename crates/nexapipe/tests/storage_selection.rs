@@ -74,6 +74,11 @@ fn the_default_is_the_file_backend() {
 
 /// A build without the sqlite backend says so, and says which feature
 /// carries it.
+///
+/// The build that has the backend is the other half of this: a build with the
+/// feature opens the store instead of refusing it. Only one of the two can be
+/// true of a given build, so each is behind the gate that names it.
+#[cfg(not(feature = "storage-sqlite"))]
 #[test]
 fn a_backend_this_build_does_not_have_is_refused_by_name() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -97,6 +102,40 @@ fn a_backend_this_build_does_not_have_is_refused_by_name() {
     assert!(
         stderr.contains("storage-sqlite"),
         "the refusal names the feature that would have it: {stderr}"
+    );
+}
+
+/// A build with the sqlite backend opens the store instead of refusing it.
+///
+/// The refusal above is the other half of this: a build without the feature
+/// has to say so by name rather than pretend to open a database it has no
+/// driver for.
+#[cfg(feature = "storage-sqlite")]
+#[test]
+fn a_backend_this_build_has_is_opened() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let config = dir.path().join("config.toml");
+    let database = dir.path().join("nexapipe.db");
+
+    let output = binary()
+        .args([
+            "--config",
+            config.to_str().expect("utf-8 path"),
+            "--storage",
+            "sqlite",
+            "--storage-url",
+            database.to_str().expect("utf-8 path"),
+            "client",
+            "list",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .expect("the binary runs");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("storage-sqlite"),
+        "this build has the backend, so it does not refuse it: {stderr}"
     );
 }
 

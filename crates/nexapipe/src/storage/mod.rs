@@ -50,6 +50,8 @@
 
 pub mod file;
 pub mod open;
+#[cfg(feature = "storage-sqlite")]
+pub mod sqlite;
 
 pub use file::FileStorage;
 pub use open::{choose, open};
@@ -126,6 +128,12 @@ pub enum Stamp {
     /// the same time and a different length, and a file that replaced another
     /// one can be older.
     File { modified: SystemTime, len: u64 },
+    /// A database: a counter the store bumps on every write.
+    ///
+    /// A database has no modification time and no length, so the counter is
+    /// what stands in for both. It moves in the same transaction as the write
+    /// it belongs to, so a reload never sees the row without the revision.
+    Database { revision: u64 },
 }
 
 impl Stamp {
