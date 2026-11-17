@@ -538,4 +538,26 @@ file = false
             "the seed was copied into the configuration: {debug}"
         );
     }
+
+    /// The configuration can be read from another format.
+    ///
+    /// The model's types are the ones a JSON document is read into as well, so
+    /// a store that keeps the configuration as JSON — or as rows, and hands it
+    /// over as JSON — is a store this build can read. The `[auth]` section is
+    /// read through a deserializer of its own, and it used to read the section
+    /// through a TOML value: an intermediate that cannot hold what JSON
+    /// writes, so a configuration that arrived as JSON was refused with a
+    /// message about a TOML value.
+    #[test]
+    fn a_configuration_can_be_read_from_json() {
+        let config = Config::from_toml_text(FULL).expect("the config parses");
+        let json = serde_json::to_string(&config).expect("the config writes as JSON");
+        let again: Config = serde_json::from_str(&json).expect("the JSON parses");
+
+        assert_eq!(
+            again.to_toml_text().expect("the config writes"),
+            config.to_toml_text().expect("the config writes"),
+            "the configuration changed on the way through JSON"
+        );
+    }
 }

@@ -147,13 +147,12 @@ pub fn deserialize_auth<'de, D>(deserializer: D) -> Result<Option<Auth>, D::Erro
 where
     D: serde::Deserializer<'de>,
 {
-    let section = Option::<toml::Value>::deserialize(deserializer)?;
-    let Some(section) = section else {
-        return Ok(None);
-    };
-    section
-        .try_into()
-        .map(Some)
+    // Into its own type, and not through an intermediate value: the
+    // intermediate a TOML document is read through cannot hold what another
+    // format writes — a JSON `null` is not a TOML value — and a configuration
+    // that arrives as JSON is a configuration this build has to be able to
+    // read.
+    Option::<Auth>::deserialize(deserializer)
         .map_err(|e| serde::de::Error::custom(format!("Failed to parse auth config: {e}")))
 }
 
