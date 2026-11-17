@@ -691,8 +691,8 @@ impl Default for HealthCheckConfig {
 ///
 /// One type, and the one place a key is named: the sections below are the
 /// file's own shapes, and a store that keeps the configuration as rows reads
-/// them out of the same types a file is parsed into. The codecs that speak it
-/// live in [`crate::config::model`].
+/// them out of the same types a file is parsed into. The codec that speaks it
+/// is [`Self::from_toml_text`] and [`Self::to_toml_text`].
 ///
 /// **An unknown key is an error.** Every section refuses the keys it does not
 /// know, and so does the top level: a key that is not read is a key the
@@ -777,7 +777,7 @@ pub struct Config {
     /// left 2FA off with nothing in the log to say so.
     ///
     /// Read on its own, so that a refusal names the section that broke — see
-    /// [`deserialize_auth`].
+    /// `deserialize_auth`.
     #[serde(default, deserialize_with = "deserialize_auth")]
     pub auth: Option<Auth>,
 }
