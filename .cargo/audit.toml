@@ -1,0 +1,55 @@
+# cargo-audit configuration for the server workspace.
+#
+# CI runs `cargo audit` at the repository root, and this is the file it
+# reads: cargo-audit looks for `.cargo/audit.toml` next to the directory it
+# runs in, and for `audit.toml` in CARGO_HOME. The same advisories are
+# ignored for `cargo deny` in deny.toml at the root — the two lists have to
+# agree, or the audit step and the deny step disagree about the same
+# lockfile.
+#
+# Vulnerabilities fail the run, informational advisories
+# (unmaintained/unsound/yanked) stay warnings.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0367/0368/0369, RUSTSEC-2026-0429, RUSTSEC-2026-0545 and
+    # RUSTSEC-2026-0548: symlink, SUID/SGID, abort-on-symlink, missing
+    # AES-authentication and local-header/central-directory parsing flaws in
+    # `zip`, fixed only in zip >= 9.0.0 (>= 9.0.5 for the last one). zip
+    # enters the desktop's dependency tree solely through
+    # tauri-plugin-updater, which pins `zip ^4` (2.14.0 and even 3.0.0-alpha.3
+    # still do), so that lockfile cannot move to the patched line yet. Exposure
+    # is narrow in practice: the updater only extracts archives served by our
+    # own release backend after minisign signature verification. Remove these
+    # entries and bump the lockfile as soon as a tauri-plugin-updater release
+    # allows zip >= 9.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
+    "RUSTSEC-2026-0429",
+    "RUSTSEC-2026-0545",
+    "RUSTSEC-2026-0548",
+    # RUSTSEC-2024-0429: unsoundness in the `Iterator` and
+    # `DoubleEndedIterator` impls for `glib::VariantStrIter`, fixed only in
+    # glib >= 0.20. glib reaches the desktop's tree through the GTK stack —
+    # gtk 0.18.2, via tauri 2.12.1's tray-icon and webkit2gtk — and every
+    # published tauri release pins `gtk ^0.18`, which pins `glib ^0.18`, so
+    # that lockfile cannot move to the patched line without a tauri major
+    # bump. Remove this entry and bump the lockfile as soon as a tauri
+    # release allows glib >= 0.20.
+    "RUSTSEC-2024-0429",
+    # RUSTSEC-2026-0459: SQLite before 3.54.0 can return uninitialized
+    # page-cache memory when a process opens a database file together with a
+    # `-wal` sibling whose page size differs from the database's
+    # (CVE-2026-119375). The server's SQLite store is what pulls the crate in:
+    # sqlx links the bundled SQLite, and the fix landed in libsqlite3-sys 0.39.0
+    # (SQLite 3.54.0) — a version sqlx-sqlite 0.9.0 cannot use, because it pins
+    # `libsqlite3-sys >=0.30.1, <0.38.0`. sqlx 0.9.0 is the newest release, so
+    # the lockfile cannot move to the patched line yet. Exposure is narrow: the
+    # crafted `-wal` file has to sit next to the database, which means write
+    # access to the data directory — and that access already reads the client
+    # seeds and the endpoint key straight out of the database. Remove this
+    # entry and bump the lockfile as soon as a sqlx release allows
+    # libsqlite3-sys >= 0.39.
+    "RUSTSEC-2026-0459",
+]

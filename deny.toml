@@ -43,22 +43,25 @@ unsound = "all"
 # reason to refuse to build: the lockfile pins a version that still exists.
 yanked = "warn"
 #
-# The same advisories are ignored for `cargo audit` in
+# The same advisories are ignored for `cargo audit` in .cargo/audit.toml at the
+# root, which is what the audit step of the supply chain job reads, and in
 # ui-desktop/src-tauri/.cargo/audit.toml, which is what a local `cargo audit`
-# run in that directory reads. The two lists have to agree: cargo-deny does
-# not read that file, so an ignore that lives only there is invisible here —
+# run in that directory reads. The lists have to agree: cargo-deny does not
+# read those files, so an ignore that lives only there is invisible here —
 # and the desktop check failed on exactly these until they were written down
 # in both places.
 #
-# RUSTSEC-2026-0367/0368/0369 and RUSTSEC-2026-0429: symlink, SUID/SGID and
-# abort-on-symlink handling flaws in `zip::ZipArchive::extract`, fixed only in
-# zip >= 9.0.0. zip enters this dependency tree solely through
-# tauri-plugin-updater, and every published version of that plugin — 2.14.0 and
-# 3.0.0-alpha.3 included — pins `zip ^4`, so the lockfile cannot move to the
-# patched line. Exposure is narrow in practice: the updater only extracts
-# archives served by our own release backend after minisign signature
-# verification. Remove these four and bump the lockfile as soon as a
-# tauri-plugin-updater release allows zip >= 9.
+# RUSTSEC-2026-0367/0368/0369, RUSTSEC-2026-0429, RUSTSEC-2026-0545 and
+# RUSTSEC-2026-0548: symlink, SUID/SGID, abort-on-symlink, missing
+# AES-authentication and local-header/central-directory parsing flaws in
+# `zip`, fixed only in zip >= 9.0.0 (>= 9.0.5 for the last one). zip enters
+# this dependency tree solely through tauri-plugin-updater, and every
+# published version of that plugin — 2.14.0 and 3.0.0-alpha.3 included — pins
+# `zip ^4`, so the lockfile cannot move to the patched line. Exposure is
+# narrow in practice: the updater only extracts archives served by our own
+# release backend after minisign signature verification. Remove these six and
+# bump the lockfile as soon as a tauri-plugin-updater release allows
+# zip >= 9.
 #
 # RUSTSEC-2024-0429: unsoundness in the `Iterator` and `DoubleEndedIterator`
 # impls for `glib::VariantStrIter`, fixed only in glib >= 0.20. glib reaches
@@ -67,18 +70,35 @@ yanked = "warn"
 # `gtk ^0.18`, which pins `glib ^0.18`, so the lockfile cannot move to the
 # patched line without a tauri major bump. Remove this entry and bump the
 # lockfile as soon as a tauri release allows glib >= 0.20.
+#
+# RUSTSEC-2026-0459: SQLite before 3.54.0 can return uninitialized
+# page-cache memory when a process opens a database file together with a
+# `-wal` sibling whose page size differs from the database's
+# (CVE-2026-119375). The server's SQLite store is what pulls the crate in:
+# sqlx links the bundled SQLite, and the fix landed in libsqlite3-sys 0.39.0
+# (SQLite 3.54.0) — a version sqlx-sqlite 0.9.0 cannot use, because it pins
+# `libsqlite3-sys >=0.30.1, <0.38.0`. sqlx 0.9.0 is the newest release, so
+# the lockfile cannot move to the patched line yet. Exposure is narrow: the
+# crafted `-wal` file has to sit next to the database, which means write
+# access to the data directory — and that access already reads the client
+# seeds and the endpoint key straight out of the database. Remove this entry
+# and bump the lockfile as soon as a sqlx release allows libsqlite3-sys >= 0.39.
 ignore = [
     { id = "RUSTSEC-2026-0367", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
     { id = "RUSTSEC-2026-0368", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
     { id = "RUSTSEC-2026-0369", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
     { id = "RUSTSEC-2026-0429", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
+    { id = "RUSTSEC-2026-0545", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.0, which no published plugin release allows yet" },
+    { id = "RUSTSEC-2026-0548", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.5, which no published plugin release allows yet" },
     { id = "RUSTSEC-2024-0429", reason = "glib 0.18.x via the desktop's GTK stack; fixed only in glib >= 0.20, which needs a tauri major bump" },
+    { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.37.x via sqlx; fixed only in libsqlite3-sys >= 0.39.0, which sqlx-sqlite 0.9.0's range (<0.38.0) excludes" },
 ]
 # An advisory on this list that no crate in the graph matches is worth
 # knowing about — it means the ignore can go. This file is used for two
-# graphs, though: the server's and the desktop app's, and the three above
-# belong to the desktop one, so the signal would fire on every server run
-# and teach people to ignore it.
+# graphs, though: the server's and the desktop app's, and the zip and glib
+# entries belong to the desktop one, so the signal would fire on every server
+# run and teach people to ignore it. The SQLite entry belongs to the server
+# one and fires on every desktop run for the same reason.
 unused-ignored-advisory = "allow"
 
 [bans]
