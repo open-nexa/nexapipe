@@ -7,7 +7,7 @@ use crate::routes::{L4Options, Route};
 
 use super::*;
 
-impl ProxyConfig {
+impl Config {
     /// Logs configuration that no longer has any effect.
     ///
     /// TLS moved to the backend, so a config.toml written for the old layout
@@ -51,7 +51,7 @@ impl ProxyConfig {
     }
 }
 
-impl ProxyConfig {
+impl Config {
     /// Whether this config puts a credential in the file it was read from.
     ///
     /// The 2FA seeds are the obvious one and live in `[auth]`, but this file also
@@ -456,7 +456,7 @@ impl TryFrom<RouteSpec> for crate::routes::Route {
 mod tests {
     use super::*;
 
-    fn parse(source: &str) -> ProxyConfig {
+    fn parse(source: &str) -> Config {
         toml::from_str(source).expect("the config parses")
     }
 

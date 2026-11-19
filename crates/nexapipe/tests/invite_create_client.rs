@@ -97,7 +97,7 @@ fn invite_secret(output: &str) -> Option<String> {
 /// The secret the server would load for `client_id`, read back through the same
 /// loader the server uses.
 fn configured_secret(config: &Path, client_id: &str) -> Option<String> {
-    let (_, auth) = nexapipe::config::ProxyConfig::load_with_auth(config.to_str().unwrap())
+    let (_, auth) = nexapipe::config::Config::load_with_auth(config.to_str().unwrap())
         .expect("config still parses");
     auth.and_then(|auth| {
         auth.clients
@@ -142,7 +142,7 @@ fn creates_a_missing_client_and_puts_a_one_time_token_in_the_invite() {
         "the invite must not carry the secret:\n{output}"
     );
 
-    let (_, auth) = nexapipe::config::ProxyConfig::load_with_auth(path.to_str().unwrap())
+    let (_, auth) = nexapipe::config::Config::load_with_auth(path.to_str().unwrap())
         .expect("config still parses");
     let client = &auth.expect("[auth] exists").clients["client-001"];
     assert!(
@@ -193,7 +193,7 @@ fn creates_a_missing_client_for_an_enrollment_invite() {
         "the link carries a token:\n{output}"
     );
 
-    let (_, auth) = nexapipe::config::ProxyConfig::load_with_auth(path.to_str().unwrap())
+    let (_, auth) = nexapipe::config::Config::load_with_auth(path.to_str().unwrap())
         .expect("config still parses");
     let client = &auth.expect("[auth] exists").clients["client-007"];
     assert!(

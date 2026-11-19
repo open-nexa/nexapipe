@@ -215,7 +215,7 @@ mod tests {
     #[test]
     fn an_absurd_override_is_capped_rather_than_refused() {
         // The cap is a backstop for callers that never ran the config
-        // validation, not the policy: `ProxyConfig::validate_timeouts` refuses
+        // validation, not the policy: `Config::validate_timeouts` refuses
         // anything past `MAX_SECS` (and zero) at load, where the operator is
         // looking. The cap is high enough that no legitimate configuration
         // meets it.

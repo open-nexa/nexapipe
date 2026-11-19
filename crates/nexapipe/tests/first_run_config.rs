@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use nexapipe::config::ProxyConfig;
+use nexapipe::config::Config;
 
 /// How long a start gets to write the config and print its Node ID.
 const STARTUP_DEADLINE: Duration = Duration::from_secs(60);
@@ -191,7 +191,7 @@ fn a_missing_config_is_written_and_the_server_starts() {
         !content.trim().is_empty(),
         "an empty file is not a config: {content:?}"
     );
-    ProxyConfig::from_file(path.to_str().expect("utf-8 path"))
+    Config::from_file(path.to_str().expect("utf-8 path"))
         .expect("the generated config has to load through the normal path");
 }
 
@@ -210,7 +210,7 @@ fn the_generated_config_enables_2fa_with_no_clients() {
     let _ = child.kill();
     let _ = child.wait();
 
-    let (_, auth) = ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+    let (_, auth) = Config::load_with_auth(path.to_str().expect("utf-8 path"))
         .expect("the generated config loads");
     let auth = auth.expect("the generated config declares an [auth] section");
     assert!(
@@ -385,7 +385,7 @@ fn generate_2fa_does_not_create_a_config() {
     );
 }
 
-/// `client list` reads the file via `ProxyConfig::load_with_auth`, which fails
+/// `client list` reads the file via `Config::load_with_auth`, which fails
 /// on a missing one. The subcommand is the write half of the management
 /// surface and shares the file lock with the server, but it should never be
 /// the *reason* a file appears on disk — the operator chose to run a query

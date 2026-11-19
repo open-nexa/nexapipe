@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use nexapipe::config::{
-    AdminConfig, EndpointIdentity, IrohConfig, LocalProxyConfig, ProxyConfig, ServerConfig,
+    AdminConfig, Config, EndpointIdentity, IrohConfig, LocalProxyConfig, ServerConfig,
 };
 use nexapipe::proxy::{Proxy, ProxyOptions, run_local_proxy};
 use nexapipe::routes::RoutingTable;
@@ -366,7 +366,7 @@ async fn main() {
         // Printing a key is not the same thing as giving the endpoint one: this
         // writes nothing, and a copy-paste is still the operator's job. The
         // startup path generates and persists a key on its own
-        // (`ProxyConfig::ensure_iroh_secret_key`); this stays for generating one
+        // (`Config::ensure_iroh_secret_key`); this stays for generating one
         // to move between hosts, or to seed a config before its first run.
         let secret_key_hex = nexapipe::config::generate_secret_key_hex();
         println!("Generated secret key for stable endpoint identity:");
@@ -569,7 +569,7 @@ async fn main() {
 }
 
 async fn run_server_mode(
-    proxy_config: &ProxyConfig,
+    proxy_config: &Config,
     storage: Arc<dyn Storage>,
     identity: Option<&EndpointIdentity>,
     shutdown_signal: &Arc<ShutdownSignal>,
@@ -709,7 +709,7 @@ async fn run_server_mode(
     }
 }
 
-async fn run_local_proxy_mode(proxy_config: &ProxyConfig, shutdown_signal: &Arc<ShutdownSignal>) {
+async fn run_local_proxy_mode(proxy_config: &Config, shutdown_signal: &Arc<ShutdownSignal>) {
     let local_proxy_config: Option<LocalProxyConfig> = proxy_config.local_proxy.clone();
 
     let config = match local_proxy_config {

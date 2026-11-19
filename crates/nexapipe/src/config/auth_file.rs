@@ -10,15 +10,22 @@
 
 use nexapipe_proto::secret::SecretString;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::storage::file::FileStorage;
 
 use super::*;
 
-/// Authentication config in TOML format.
+/// The `[auth]` section, as the file holds it.
+///
+/// **The one shape the credentials have.** There used to be two: this one, for
+/// the file, and the one the server runs on, with every default filled in. They
+/// said the same things in different words, and a change to one of them was a
+/// change the other did not hear about — a key added to the file and not to the
+/// server, or the other way round. This is the file's shape, and the server's
+/// is derived from it in one place (see `crate::config::model`).
 ///
 /// Unknown keys are refused here, and only here. This is the one section where
 /// a typo is a security change rather than a lost setting: `enable = true`
@@ -26,9 +33,9 @@ use super::*;
 /// serde drops what it does not recognise and the default for `enabled` is
 /// false. Every other section stays lenient, the way a config that has carried
 /// a stray key for years expects.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct AuthTomlConfig {
+pub struct Auth {
     pub enabled: Option<bool>,
     pub issuer: Option<String>,
     pub algorithm: Option<String>,
@@ -37,17 +44,22 @@ pub struct AuthTomlConfig {
     pub window: Option<u32>,
     pub max_attempts: Option<u32>,
     pub lockout_duration: Option<u64>,
-    pub clients: Option<HashMap<String, ClientAuthToml>>,
+    /// The clients, by id.
+    ///
+    /// A `BTreeMap` and not a `HashMap`: the order a store writes them out in
+    /// is the order an operator reads them in, and a hash map would give a
+    /// different order on every run.
+    #[serde(default)]
+    pub clients: BTreeMap<String, AuthClient>,
 }
 
 /// One `[auth.clients.<id>]` entry.
 ///
-/// Unknown keys are refused for the same reason as in [`AuthTomlConfig`]: a
-/// misspelled `allow_host` is not "no restriction", but that is what it
-/// quietly became.
-#[derive(Debug, Deserialize, Clone)]
+/// Unknown keys are refused for the same reason as in [`Auth`]: a misspelled
+/// `allow_host` is not "no restriction", but that is what it quietly became.
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct ClientAuthToml {
+pub struct AuthClient {
     /// A [`SecretString`]: the seed is a credential from the moment the file
     /// is read, and the file format is unchanged by the wrapper.
     pub secret: SecretString,
@@ -77,7 +89,8 @@ pub struct ClientAuthToml {
     /// devices, each with a secret of its own so one can be dropped without
     /// rotating the others. Absent means this client has never issued one, and
     /// every device then shares the `secret` above.
-    pub devices: Option<HashMap<String, DeviceAuthToml>>,
+    #[serde(default)]
+    pub devices: BTreeMap<String, AuthDevice>,
     /// Whether a peer that names no device may still answer with the `secret`
     /// above. Defaults to `true`, which is the only spelling a client that
     /// predates the device table can authenticate under.
@@ -96,8 +109,8 @@ pub struct ClientAuthToml {
 
 /// One `[auth.clients.<id>.devices.<name>]` entry.
 ///
-/// Unknown keys are refused for the same reason as in [`ClientAuthToml`]. There
-/// is no `allow_hosts` here on purpose: what a client may reach is answered by
+/// Unknown keys are refused for the same reason as in [`AuthClient`]. There is
+/// no `allow_hosts` here on purpose: what a client may reach is answered by
 /// the client's entry alone, and a second place to say it is a second place for
 /// it to disagree.
 ///
@@ -105,9 +118,9 @@ pub struct ClientAuthToml {
 /// which the loader enforces where the operator can see which entry it is
 /// about; both fields are `Option` so that either spelling parses far enough to
 /// be told what is wrong with it.
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
-pub struct DeviceAuthToml {
+pub struct AuthDevice {
     pub secret: Option<SecretString>,
     /// The device's Ed25519 public key, hex: the credential of a device that
     /// signs its handshake instead of answering with a TOTP code.
@@ -118,6 +131,29 @@ pub struct DeviceAuthToml {
     /// The stamp is written to the server's state file, beside the
     /// configuration, and not here — see [`crate::auth::state`].
     pub last_used: Option<u64>,
+}
+
+/// Reads the `[auth]` section, and names it when it is what broke.
+///
+/// The section is the one where a typo is a security change rather than a lost
+/// setting, so a refusal that does not say which section broke sends the
+/// operator looking for the wrong line. The section is read on its own for
+/// that reason: a type error inside it would otherwise be reported against the
+/// whole file, which names the line but not the section it is in.
+///
+/// The trade is the other way round for the rest of the file, which is read
+/// as a whole and reports a line and a column.
+pub fn deserialize_auth<'de, D>(deserializer: D) -> Result<Option<Auth>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Into its own type, and not through an intermediate value: the
+    // intermediate a TOML document is read through cannot hold what another
+    // format writes — a JSON `null` is not a TOML value — and a configuration
+    // that arrives as JSON is a configuration this build has to be able to
+    // read.
+    Option::<Auth>::deserialize(deserializer)
+        .map_err(|e| serde::de::Error::custom(format!("Failed to parse auth config: {e}")))
 }
 
 /// Checks a credential sidecar file's permissions before its secret becomes
@@ -155,12 +191,12 @@ pub fn check_credential_file_permissions(_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-impl ProxyConfig {
+impl Config {
     /// Writes `secret` under `[auth.clients.<client_id>]` of the config file at
     /// `path`, creating `[auth]` and `[auth.clients]` when they are missing.
     ///
     /// The document is edited as TOML instead of being re-serialized from a
-    /// `ProxyConfig`, so comments, key order and the layout of every other
+    /// `Config`, so comments, key order and the layout of every other
     /// section survive — which is the whole point, this edits the file a human
     /// wrote. `force` is what allows an existing secret to be replaced: a device
     /// that already imported the old one stops authenticating the instant it
@@ -303,7 +339,7 @@ impl ProxyConfig {
     }
 }
 
-/// What [`ProxyConfig::write_client_secret`] did to the config file.
+/// What [`Config::write_client_secret`] did to the config file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClientSecretWrite {
     /// A `[auth.clients.<id>]` section was added, creating `[auth]` if needed.

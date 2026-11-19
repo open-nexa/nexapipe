@@ -179,7 +179,7 @@ impl From<crate::auth::DeviceMaterial<'_>> for DeviceCredential {
 /// after that.
 pub async fn ensure_endpoint_identity(
     storage: &dyn Storage,
-    config: &crate::config::ProxyConfig,
+    config: &crate::config::Config,
 ) -> anyhow::Result<crate::config::EndpointIdentity> {
     use crate::config::{IdentityAction, identity_action, identity_into_file};
 

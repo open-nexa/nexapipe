@@ -16,7 +16,7 @@ use super::*;
 
 use crate::storage::Storage;
 
-/// What [`ProxyConfig::ensure_iroh_secret_key`] resolved the endpoint's
+/// What [`Config::ensure_iroh_secret_key`] resolved the endpoint's
 /// identity to.
 #[derive(Clone, PartialEq, Eq)]
 pub enum EndpointIdentity {
@@ -110,7 +110,7 @@ pub(crate) fn persistence_disabled(value: Option<&str>) -> bool {
     }
 }
 
-impl ProxyConfig {
+impl Config {
     /// Resolves the endpoint's identity for this run, generating and persisting
     /// one when the config has none.
     ///
@@ -134,10 +134,7 @@ impl ProxyConfig {
     /// Takes the already-parsed `config` rather than re-reading `path`: the
     /// caller is about to run on exactly that value, and a second read could
     /// disagree with it if the file changed in between.
-    pub fn ensure_iroh_secret_key(
-        path: &str,
-        config: &ProxyConfig,
-    ) -> anyhow::Result<EndpointIdentity> {
+    pub fn ensure_iroh_secret_key(path: &str, config: &Config) -> anyhow::Result<EndpointIdentity> {
         let storage = crate::storage::file::FileStorage::new(path);
         match identity_action(config, storage.base_dir(), path)? {
             IdentityAction::Configured(key) => Ok(EndpointIdentity::Configured(key)),
@@ -176,7 +173,7 @@ impl ProxyConfig {
 
 /// What the startup path has to do about the endpoint's identity.
 ///
-/// Split out of [`ProxyConfig::ensure_iroh_secret_key`] because the decision —
+/// Split out of [`Config::ensure_iroh_secret_key`] because the decision —
 /// is there a key, is there a file to put one in, may anything be written at
 /// all — is the same whichever store the configuration is in, and only the last
 /// step differs: a key file is written through the file, a configuration
@@ -198,7 +195,7 @@ pub(crate) enum IdentityAction {
 /// `base_dir` is the directory a relative `secret_key_file` is resolved
 /// against.
 pub(crate) fn identity_action(
-    config: &ProxyConfig,
+    config: &Config,
     base_dir: Option<&Path>,
     where_: &str,
 ) -> anyhow::Result<IdentityAction> {
@@ -451,7 +448,7 @@ pub(crate) fn read_credential_file(
 /// [`credential_env`], with `env_file` already made absolute by
 /// [`absolute_env_path`]. `Ok(None)` means nothing named a key — including a
 /// pointed-to file that does not exist yet, which is the first-start case
-/// [`ProxyConfig::ensure_iroh_secret_key`] generates into. The caller folds an
+/// [`Config::ensure_iroh_secret_key`] generates into. The caller folds an
 /// environment-named missing path onto the `secret_key_file` field so the
 /// generation lands in the file the environment named, not back in the config.
 pub(crate) fn resolve_secret_key_source(
@@ -558,7 +555,7 @@ pub(crate) fn resolve_relay_auth_token_source(
         .map(|token| (token, CredentialSource::Inline)))
 }
 
-impl ProxyConfig {
+impl Config {
     /// Resolves the `[iroh]` credentials that name a source outside this file.
     ///
     /// Both parse paths come through here — `from_file` for the server and the
@@ -566,7 +563,7 @@ impl ProxyConfig {
     /// auth reload — so a credential is resolved the same way however the
     /// config was read. The resolved value replaces the field, and the
     /// [`CredentialSource`] it came from is recorded next to it: what
-    /// [`ProxyConfig::holds_credentials`] then asks is not "is there a key"
+    /// [`Config::holds_credentials`] then asks is not "is there a key"
     /// but "is the key in *this file*", which is what the permission gate is
     /// about.
     pub(crate) fn resolve_external_credentials(
@@ -704,7 +701,7 @@ pub(crate) fn create_private_file(path: &Path) -> std::io::Result<std::fs::File>
         .open(path)
 }
 
-impl ProxyConfig {
+impl Config {
     /// Writes a freshly generated `secret_key` into `[iroh]` of the config file
     /// at `path`, and returns the hex key now in it.
     ///
@@ -723,7 +720,7 @@ impl ProxyConfig {
     /// end of the line.
     ///
     /// Comments, key order and every other section survive: the document is
-    /// edited as TOML rather than re-serialized from a `ProxyConfig`, which
+    /// edited as TOML rather than re-serialized from a `Config`, which
     /// would drop the operator's prose along with the config.
     pub fn write_iroh_secret_key(path: &str) -> anyhow::Result<String> {
         // Zeroizing from the moment it exists, so that a write that fails

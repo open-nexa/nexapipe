@@ -11,7 +11,7 @@
 //! survives a restart, and a deployment that was counting in the configuration
 //! file before the state file existed keeps its lockouts.
 
-use nexapipe::config::ProxyConfig;
+use nexapipe::config::Config;
 use nexapipe::config_watcher::save_auth_state;
 use std::path::Path;
 
@@ -52,7 +52,7 @@ fn a_counted_failure_lands_in_the_state_file_and_not_in_the_configuration() {
     let dir = tempfile::tempdir().expect("temp dir");
     let (config_path, state_path) = fixture(dir.path());
 
-    let (_, auth) = ProxyConfig::load_with_auth(&config_path).expect("the configuration loads");
+    let (_, auth) = Config::load_with_auth(&config_path).expect("the configuration loads");
     let mut auth = auth.expect("the configuration declares [auth]");
 
     auth.clients
@@ -92,7 +92,7 @@ fn a_lockout_survives_a_restart() {
     let dir = tempfile::tempdir().expect("temp dir");
     let (config_path, state_path) = fixture(dir.path());
 
-    let (_, auth) = ProxyConfig::load_with_auth(&config_path).expect("the configuration loads");
+    let (_, auth) = Config::load_with_auth(&config_path).expect("the configuration loads");
     let mut auth = auth.expect("the configuration declares [auth]");
 
     let client = auth.clients.get_mut("client-001").expect("one client");
@@ -105,7 +105,7 @@ fn a_lockout_survives_a_restart() {
 
     // The next start: a fresh load of the configuration, with the state file
     // beside it, and the client is still locked out.
-    let (_, reloaded) = ProxyConfig::load_with_auth(&config_path).expect("the configuration loads");
+    let (_, reloaded) = Config::load_with_auth(&config_path).expect("the configuration loads");
     let reloaded = reloaded.expect("the configuration declares [auth]");
     let client = &reloaded.clients["client-001"];
     assert_eq!(client.failed_attempts, 3);
@@ -141,7 +141,7 @@ fn a_configuration_that_carries_counters_still_locks_out() {
     let config_path = config_path.to_string_lossy().into_owned();
 
     // No state file: the counters in the configuration are the answer.
-    let (_, auth) = ProxyConfig::load_with_auth(&config_path).expect("the configuration loads");
+    let (_, auth) = Config::load_with_auth(&config_path).expect("the configuration loads");
     let auth = auth.expect("the configuration declares [auth]");
     let client = &auth.clients["client-001"];
     assert_eq!(client.failed_attempts, 3);
@@ -156,7 +156,7 @@ fn a_configuration_that_carries_counters_still_locks_out() {
     )
     .expect("write the state file");
 
-    let (_, reloaded) = ProxyConfig::load_with_auth(&config_path).expect("the configuration loads");
+    let (_, reloaded) = Config::load_with_auth(&config_path).expect("the configuration loads");
     let reloaded = reloaded.expect("the configuration declares [auth]");
     let client = &reloaded.clients["client-001"];
     assert_eq!(
@@ -172,7 +172,7 @@ fn the_state_file_is_private() {
     let dir = tempfile::tempdir().expect("temp dir");
     let (config_path, state_path) = fixture(dir.path());
 
-    let (_, auth) = ProxyConfig::load_with_auth(&config_path).expect("the configuration loads");
+    let (_, auth) = Config::load_with_auth(&config_path).expect("the configuration loads");
     let mut auth = auth.expect("the configuration declares [auth]");
     auth.clients
         .get_mut("client-001")
@@ -205,7 +205,7 @@ fn a_broken_state_file_refuses_the_start() {
     std::fs::write(&state_path, "this is not TOML at all: \"\n")
         .expect("write a broken state file");
 
-    let error = ProxyConfig::load_with_auth(&config_path)
+    let error = Config::load_with_auth(&config_path)
         .expect_err("a state file that cannot be read stops the start");
     let message = error.to_string();
     assert!(
@@ -221,7 +221,7 @@ fn the_state_file_reads_like_the_configuration() {
     let dir = tempfile::tempdir().expect("temp dir");
     let (config_path, state_path) = fixture(dir.path());
 
-    let (_, auth) = ProxyConfig::load_with_auth(&config_path).expect("the configuration loads");
+    let (_, auth) = Config::load_with_auth(&config_path).expect("the configuration loads");
     let mut auth = auth.expect("the configuration declares [auth]");
     let client = auth.clients.get_mut("client-001").expect("one client");
     client.record_failure(3, 300);
@@ -250,7 +250,7 @@ fn a_client_that_was_never_counted_is_not_written() {
     let dir = tempfile::tempdir().expect("temp dir");
     let (config_path, state_path) = fixture(dir.path());
 
-    let (_, auth) = ProxyConfig::load_with_auth(&config_path).expect("the configuration loads");
+    let (_, auth) = Config::load_with_auth(&config_path).expect("the configuration loads");
     let auth = auth.expect("the configuration declares [auth]");
 
     save_auth_state(&state_path, &auth).expect("the counters are written");

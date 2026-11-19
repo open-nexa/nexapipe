@@ -14,7 +14,7 @@ use tokio::time::Instant;
 
 /// Watches `config.toml` and applies a change to the live routing table.
 ///
-/// Reloading used to stop at re-parsing the file: the new `ProxyConfig` was
+/// Reloading used to stop at re-parsing the file: the new `Config` was
 /// stored, the log said "reloaded successfully", and the routes — built once at
 /// startup — kept serving the old table. An edit to `[[routes]]` only took
 /// effect after a restart, which is exactly how a freshly added route came to

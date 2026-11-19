@@ -307,7 +307,7 @@ pub async fn run_proxy(
         // It used to be a warning and a random key, which put the endpoint on a
         // different Node ID after every restart while looking like a solved
         // problem — every client that had stored the Node ID lost the server,
-        // and nothing in the log said why. `ProxyConfig::ensure_iroh_secret_key`
+        // and nothing in the log said why. `Config::ensure_iroh_secret_key`
         // has already refused this at startup, so reaching the error here means
         // the two checks disagree; failing keeps that from being silent.
         if let Some(secret_key_str) = &iroh_cfg.secret_key {

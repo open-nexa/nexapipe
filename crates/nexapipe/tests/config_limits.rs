@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use nexapipe::config::ProxyConfig;
+use nexapipe::config::Config;
 
 /// How long a start gets to report the ceilings it is running with.
 const STARTUP_DEADLINE: Duration = Duration::from_secs(60);
@@ -167,7 +167,7 @@ fn wait_with_output_and_deadline(
 fn the_shipped_example_config_still_parses() {
     let path = "../../config.toml.example";
 
-    let config = ProxyConfig::from_file(path).expect("the shipped example parses");
+    let config = Config::from_file(path).expect("the shipped example parses");
     assert_eq!(
         config.limits.max_connections_per_peer, None,
         "the example leaves the limits at their defaults"
@@ -180,7 +180,7 @@ fn a_config_without_limits_leaves_every_ceiling_unnamed() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_config(dir.path(), "");
 
-    let config = ProxyConfig::from_file(path.to_str().unwrap()).expect("the config parses");
+    let config = Config::from_file(path.to_str().unwrap()).expect("the config parses");
     assert_eq!(config.limits.max_connections_per_peer, None);
     assert_eq!(config.limits.max_connections_global, None);
     assert_eq!(config.limits.max_streams_global, None);
@@ -200,7 +200,7 @@ fn the_limits_section_parses() {
          max_body_bytes = 44\n",
     );
 
-    let config = ProxyConfig::from_file(path.to_str().unwrap()).expect("the config parses");
+    let config = Config::from_file(path.to_str().unwrap()).expect("the config parses");
     assert_eq!(config.limits.max_connections_per_peer, Some(11));
     assert_eq!(config.limits.max_connections_global, Some(22));
     assert_eq!(config.limits.max_streams_global, Some(33));
@@ -217,8 +217,8 @@ fn an_unknown_key_in_limits_is_refused_at_load() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_config(dir.path(), "\n[limits]\nmax_connections = 10\n");
 
-    let error = ProxyConfig::from_file(path.to_str().unwrap())
-        .expect_err("a misspelled key is not a limit");
+    let error =
+        Config::from_file(path.to_str().unwrap()).expect_err("a misspelled key is not a limit");
     let message = format!("{error:#}");
     assert!(
         message.contains("max_connections"),

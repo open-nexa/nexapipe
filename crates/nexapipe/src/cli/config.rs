@@ -6,7 +6,7 @@
 //! lives is the server's business, not theirs.
 
 use nexapipe::auth::AuthConfig;
-use nexapipe::config::ProxyConfig;
+use nexapipe::config::Config;
 use nexapipe::storage::Storage;
 
 /// `[auth]` as the server reads it, or `None` when the configuration has no
@@ -29,9 +29,7 @@ pub(super) async fn load_auth_or_none(storage: &dyn Storage) -> anyhow::Result<O
 /// A config that cannot be read is not fatal: with `--endpoint-id` and
 /// `--invite-domains` given on the command line everything the invite needs is
 /// already known, so the missing configuration only costs the 2FA lookup.
-pub(super) async fn load_config_pair(
-    storage: &dyn Storage,
-) -> (Option<ProxyConfig>, AuthConfig, bool) {
+pub(super) async fn load_config_pair(storage: &dyn Storage) -> (Option<Config>, AuthConfig, bool) {
     match nexapipe::config::load_config_with_auth(storage).await {
         Ok((proxy, Some(auth))) => (Some(proxy), auth, true),
         Ok((proxy, None)) => {

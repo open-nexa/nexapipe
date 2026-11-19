@@ -6,7 +6,7 @@
 //! nothing at runtime. `allow_ports` has to reach the ACL the handshake
 //! consults, and a port of zero has to be refused rather than silently kept.
 
-use nexapipe::config::ProxyConfig;
+use nexapipe::config::Config;
 
 const EXAMPLE_CONFIG: &str = "../../config.toml.2fa.example";
 
@@ -16,7 +16,7 @@ fn load_with_client_body(body: &str) -> anyhow::Result<nexapipe::auth::AuthConfi
     let path = dir.path().join("config.toml");
     std::fs::write(&path, body).unwrap();
 
-    let (_, auth) = ProxyConfig::load_with_auth(path.to_str().unwrap())?;
+    let (_, auth) = Config::load_with_auth(path.to_str().unwrap())?;
     Ok(auth.expect("the config declares an [auth] section"))
 }
 
@@ -153,7 +153,7 @@ fn a_port_of_zero_is_refused() {
     )
     .unwrap();
 
-    let error = ProxyConfig::load_with_auth(path.to_str().unwrap())
+    let error = Config::load_with_auth(path.to_str().unwrap())
         .expect_err("a port of zero has to be refused");
     let message = error.to_string();
     assert!(
@@ -166,7 +166,7 @@ fn a_port_of_zero_is_refused() {
 /// config that does not mention it must mean what it meant before it existed.
 #[test]
 fn the_example_config_still_loads() {
-    let (_, auth) = ProxyConfig::load_with_auth(EXAMPLE_CONFIG).expect("the example config parses");
+    let (_, auth) = Config::load_with_auth(EXAMPLE_CONFIG).expect("the example config parses");
 
     let auth = auth.expect("the example config declares an [auth] section");
     let acl = auth.clients["client-001"].acl();

@@ -12,7 +12,7 @@
 //! have to bind an iroh endpoint, wait for it, or guess a port that another
 //! test may be between uses of.
 use nexapipe::admin;
-use nexapipe::config::{ProxyConfig, RouteMode};
+use nexapipe::config::{Config, RouteMode};
 use nexapipe::conn::peers::PeerRegistry;
 use nexapipe::lb::LoadBalancingStrategy;
 use nexapipe::routes::{Route, RoutingTable};
@@ -144,7 +144,7 @@ fn auth_with_secret(secret: &str) -> nexapipe::conn::AuthState {
     )
     .expect("write the config");
     let path = path.to_string_lossy().into_owned();
-    let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config parses");
+    let (_, auth) = Config::load_with_auth(&path).expect("the config parses");
     let auth = auth.expect("[auth] is present");
     nexapipe::conn::AuthState::new(
         auth,
@@ -455,7 +455,7 @@ async fn the_port_acl_is_listed_with_the_clients() {
     )
     .expect("write the config");
     let path = path.to_string_lossy().into_owned();
-    let (_, auth) = ProxyConfig::load_with_auth(&path).expect("the config parses");
+    let (_, auth) = Config::load_with_auth(&path).expect("the config parses");
     let auth = auth.expect("[auth] is present");
 
     let admin = spawn_admin_with_clients(
@@ -559,14 +559,14 @@ fn the_admin_and_metrics_sections_round_trip_through_the_config_file() {
         "[admin]\nlisten_addr = \"127.0.0.1:9090\"\n\n[metrics]\nenabled = true\n",
     )
     .unwrap();
-    let config = ProxyConfig::from_file(path.to_str().unwrap()).expect("the config parses");
+    let config = Config::from_file(path.to_str().unwrap()).expect("the config parses");
     let admin = config.admin.as_ref().expect("[admin] is present");
     assert_eq!(admin.listen_addr.as_deref(), Some("127.0.0.1:9090"));
     assert!(config.metrics.enabled, "[metrics] enabled = true");
 
     let empty = dir.path().join("empty.toml");
     std::fs::write(&empty, "[server]\n").unwrap();
-    let config = ProxyConfig::from_file(empty.to_str().unwrap()).expect("the config parses");
+    let config = Config::from_file(empty.to_str().unwrap()).expect("the config parses");
     assert!(
         config.admin.is_none(),
         "no [admin] section means no listener"
@@ -594,7 +594,7 @@ fn a_token_in_the_config_is_refused() {
     )
     .unwrap();
 
-    let error = ProxyConfig::from_file(path.to_str().unwrap())
+    let error = Config::from_file(path.to_str().unwrap())
         .expect_err("a config that names a token does not parse");
     assert!(
         error.to_string().contains("token"),

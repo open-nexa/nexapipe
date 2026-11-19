@@ -7,7 +7,7 @@
 //! last test here pins that.
 
 use nexapipe::auth::OtpAuthUri;
-use nexapipe::config::ProxyConfig;
+use nexapipe::config::Config;
 use std::time::{Duration, Instant};
 
 const EXAMPLE_CONFIG: &str = "../../config.toml.2fa.example";
@@ -24,7 +24,7 @@ const STARTUP_DEADLINE: Duration = Duration::from_secs(10);
 #[test]
 fn loads_the_auth_section_of_the_example_config() {
     let (_, auth) =
-        ProxyConfig::load_with_auth(EXAMPLE_CONFIG).expect("the example config has to parse");
+        Config::load_with_auth(EXAMPLE_CONFIG).expect("the example config has to parse");
 
     let auth = auth.expect("the example config declares an [auth] section");
     assert!(auth.enabled, "the example config enables 2FA");
@@ -52,8 +52,8 @@ fn loads_the_auth_section_of_the_example_config() {
 /// operator copies, so it is the one that has to start secure.
 #[test]
 fn the_general_example_ships_with_two_factor_on() {
-    let (_, auth) = ProxyConfig::load_with_auth("../../config.toml.example")
-        .expect("the general example parses");
+    let (_, auth) =
+        Config::load_with_auth("../../config.toml.example").expect("the general example parses");
 
     let auth = auth.expect("the general example declares an [auth] section");
     assert!(auth.enabled, "the general example starts with 2FA on");
@@ -66,7 +66,7 @@ fn accepts_a_config_without_auth() {
     let path = dir.path().join("config.toml");
     std::fs::write(&path, "").unwrap();
 
-    let (_, auth) = ProxyConfig::load_with_auth(path.to_str().unwrap()).unwrap();
+    let (_, auth) = Config::load_with_auth(path.to_str().unwrap()).unwrap();
     assert!(auth.is_none());
 }
 
@@ -83,7 +83,7 @@ fn reports_a_broken_auth_section() {
     )
     .unwrap();
 
-    let error = ProxyConfig::load_with_auth(path.to_str().unwrap()).unwrap_err();
+    let error = Config::load_with_auth(path.to_str().unwrap()).unwrap_err();
     assert!(
         error.to_string().contains("auth config"),
         "unexpected error: {error:#}"
@@ -163,7 +163,7 @@ fn a_broken_auth_section_refuses_to_start() {
 /// The clients of the example config enroll through the canonical URI.
 #[test]
 fn builds_the_enrollment_uri_from_the_loaded_settings() {
-    let (_, auth) = ProxyConfig::load_with_auth(EXAMPLE_CONFIG).unwrap();
+    let (_, auth) = Config::load_with_auth(EXAMPLE_CONFIG).unwrap();
     let auth = auth.unwrap();
     let client = auth.clients.get("client-001").unwrap();
 

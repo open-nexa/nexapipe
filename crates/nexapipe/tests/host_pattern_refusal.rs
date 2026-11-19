@@ -11,14 +11,14 @@
 //! itself is spelled `*` and is not refused — a config that says every host
 //! means every host.
 
-use nexapipe::config::ProxyConfig;
+use nexapipe::config::Config;
 
 /// Writes a config with the given body and loads it.
-fn load(body: &str) -> anyhow::Result<(ProxyConfig, Option<nexapipe::auth::AuthConfig>)> {
+fn load(body: &str) -> anyhow::Result<(Config, Option<nexapipe::auth::AuthConfig>)> {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("config.toml");
     std::fs::write(&path, body).expect("write the config");
-    ProxyConfig::load_with_auth(path.to_str().expect("utf-8 path"))
+    Config::load_with_auth(path.to_str().expect("utf-8 path"))
 }
 
 /// The spellings that fold into the catch-all.

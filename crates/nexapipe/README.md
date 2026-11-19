@@ -38,10 +38,10 @@ The crate is a library with a thin binary beside it: `run_proxy` is what the
 binary calls, and what an embedder calls too.
 
 ```rust
-use nexapipe::config::ProxyConfig;
+use nexapipe::config::Config;
 use nexapipe::proxy::{ProxyOptions, run_proxy};
 
-let config = ProxyConfig::load("config.toml")?;
+let config = Config::load("config.toml")?;
 run_proxy(config.routing_table()?, "config.toml", shutdown, ProxyOptions {
     /* ... */
 }).await?;
