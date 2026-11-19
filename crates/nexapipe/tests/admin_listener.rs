@@ -46,6 +46,25 @@ async fn spawn_admin_with_clients(
     token: Option<&str>,
     auth: Option<nexapipe::conn::AuthState>,
 ) -> Admin {
+    spawn_admin_inner(routes, metrics_enabled, token, auth, None).await
+}
+
+/// A listener with a console: the page it serves and the API it answers.
+async fn spawn_admin_with_console(
+    routes: Vec<Route>,
+    token: Option<&str>,
+    console: Option<admin::Console>,
+) -> Admin {
+    spawn_admin_inner(routes, false, token, None, console).await
+}
+
+async fn spawn_admin_inner(
+    routes: Vec<Route>,
+    metrics_enabled: bool,
+    token: Option<&str>,
+    auth: Option<nexapipe::conn::AuthState>,
+    console: Option<admin::Console>,
+) -> Admin {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind admin listener");
@@ -62,6 +81,7 @@ async fn spawn_admin_with_clients(
         auth,
         metrics_enabled,
         token.map(|token| SecretString::new(token.to_string())),
+        console,
     ));
     let signal = shutdown.clone();
 
@@ -115,6 +135,308 @@ impl Admin {
 
     fn stop(&self) {
         self.shutdown.request_shutdown();
+    }
+}
+
+/// The console's own rules, over a real socket.
+///
+/// The three rules are the whole of the console's perimeter: the host it was
+/// addressed to, the token, and whether a write says it is a write. Each of
+/// them is a refusal that has to happen *before* the answer, so each of them
+/// is checked here against a request that would otherwise have been answered.
+mod console {
+    use super::*;
+    use nexapipe::storage::FileStorage;
+    use std::path::{Path, PathBuf};
+
+    const TOKEN: &str = "the-admin-token";
+
+    /// A bundle with an index and one asset, the way a built console has them.
+    fn bundle() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let console = dir.path().join("console");
+        std::fs::create_dir_all(console.join("assets")).expect("create the bundle");
+        std::fs::write(
+            console.join("index.html"),
+            "<!doctype html><title>c</title>",
+        )
+        .expect("write the index");
+        std::fs::write(console.join("assets").join("app.js"), "console.log(1)")
+            .expect("write an asset");
+        dir
+    }
+
+    /// A console that writes through a file store of its own.
+    fn console(bundle: &tempfile::TempDir, config: &Path) -> admin::Console {
+        admin::Console {
+            dir: bundle.path().join("console"),
+            storage: Arc::new(FileStorage::new(config.to_path_buf())),
+        }
+    }
+
+    /// The configuration the console writes through.
+    fn config_file(dir: &tempfile::TempDir) -> PathBuf {
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[auth]\nenabled = true\n").expect("write the config");
+        path
+    }
+
+    /// One request, with everything the console's rules look at.
+    async fn ask(
+        admin: &Admin,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        host: &str,
+        write_header: bool,
+        body: &str,
+    ) -> Reply {
+        let mut stream = TcpStream::connect(admin.addr)
+            .await
+            .expect("connect to the admin listener");
+        let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n");
+        if let Some(token) = token {
+            request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        if write_header {
+            request.push_str("X-NexaPipe-Admin: 1\r\n");
+        }
+        request.push_str("Content-Type: application/json\r\n");
+        request.push_str("Connection: close\r\n");
+        request.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+        request.push_str(body);
+
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("write request");
+        let mut raw = String::new();
+        stream
+            .read_to_string(&mut raw)
+            .await
+            .expect("read response");
+
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+        let status = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse().ok())
+            .unwrap_or_else(|| panic!("no status line in:\n{raw}"));
+
+        Reply {
+            status,
+            head: head.to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_with_the_token_is_answered() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        let reply = ask(
+            &admin,
+            "GET",
+            "/api/status",
+            Some(TOKEN),
+            "localhost",
+            false,
+            "",
+        )
+        .await;
+
+        assert_eq!(reply.status, 200, "body: {}", reply.body);
+        assert!(
+            reply.body.contains("uptime_seconds"),
+            "body: {}",
+            reply.body
+        );
+        admin.stop();
+    }
+
+    #[tokio::test]
+    async fn a_read_without_the_token_is_refused() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        let reply = ask(&admin, "GET", "/api/status", None, "localhost", false, "").await;
+
+        assert_eq!(reply.status, 401, "body: {}", reply.body);
+        admin.stop();
+    }
+
+    #[tokio::test]
+    async fn a_request_addressed_elsewhere_is_refused() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        // The host the request was addressed to, not where it came from: a
+        // name that resolves to this machine is still another name.
+        let reply = ask(
+            &admin,
+            "GET",
+            "/api/status",
+            Some(TOKEN),
+            "evil.example",
+            false,
+            "",
+        )
+        .await;
+
+        assert_eq!(reply.status, 403, "body: {}", reply.body);
+        admin.stop();
+    }
+
+    #[tokio::test]
+    async fn a_write_that_does_not_say_it_is_a_write_is_refused() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        let reply = ask(
+            &admin,
+            "POST",
+            "/api/clients",
+            Some(TOKEN),
+            "localhost",
+            false,
+            r#"{"client_id":"laptop"}"#,
+        )
+        .await;
+
+        assert_eq!(reply.status, 400, "body: {}", reply.body);
+        assert!(
+            reply.body.contains("X-NexaPipe-Admin"),
+            "the refusal names the header: {}",
+            reply.body
+        );
+        admin.stop();
+    }
+
+    #[tokio::test]
+    async fn a_write_that_says_it_is_a_write_is_carried_out() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        let reply = ask(
+            &admin,
+            "POST",
+            "/api/clients",
+            Some(TOKEN),
+            "localhost",
+            true,
+            r#"{"client_id":"laptop"}"#,
+        )
+        .await;
+
+        assert_eq!(reply.status, 200, "body: {}", reply.body);
+        assert!(reply.body.contains("laptop"), "body: {}", reply.body);
+        // The credential is in the answer, once: the operator has to be able
+        // to enroll an app with it.
+        assert!(reply.body.contains("issued"), "body: {}", reply.body);
+        admin.stop();
+    }
+
+    #[tokio::test]
+    async fn without_a_console_there_is_no_api() {
+        let admin = spawn_admin(Vec::new(), false, Some(TOKEN)).await;
+
+        let reply = ask(
+            &admin,
+            "GET",
+            "/api/status",
+            Some(TOKEN),
+            "localhost",
+            false,
+            "",
+        )
+        .await;
+
+        assert_eq!(reply.status, 404, "body: {}", reply.body);
+        admin.stop();
+    }
+
+    #[tokio::test]
+    async fn the_index_is_served() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        let reply = ask(&admin, "GET", "/", None, "localhost", false, "").await;
+
+        assert_eq!(reply.status, 200, "body: {}", reply.body);
+        assert!(
+            reply.body.contains("<!doctype html>"),
+            "body: {}",
+            reply.body
+        );
+        admin.stop();
+    }
+
+    #[tokio::test]
+    async fn an_asset_is_served() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        let reply = ask(
+            &admin,
+            "GET",
+            "/assets/app.js",
+            None,
+            "localhost",
+            false,
+            "",
+        )
+        .await;
+
+        assert_eq!(reply.status, 200, "body: {}", reply.body);
+        assert!(reply.body.contains("console.log"), "body: {}", reply.body);
+        admin.stop();
+    }
+
+    #[tokio::test]
+    async fn a_path_that_walks_out_of_the_bundle_is_refused() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        // The path the browser normalises away, and the one it does not.
+        for path in ["/assets/../../../etc/passwd", "/../config.toml"] {
+            let reply = ask(&admin, "GET", path, None, "localhost", false, "").await;
+            assert_eq!(reply.status, 404, "{path} answered {}", reply.status);
+        }
+        admin.stop();
     }
 }
 

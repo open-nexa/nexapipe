@@ -540,6 +540,18 @@ path = "/health"
 # [admin]
 # listen_addr = "127.0.0.1:9090"
 
+# The browser console, served from this listener. A directory, because a
+# bundle is a directory: an index, a script, a stylesheet, and assets with
+# hashed names in them. Build it with `npm run build` in ui-web/ and point
+# this at the result.
+#
+# Absent means no console: the listener serves no page and no /api/*, and is
+# exactly what it was before. The console asks for the token above, and a
+# request it makes has to be addressed to a loopback host -- it manages this
+# machine's instance and not one somewhere else.
+# [admin]
+# console_dir = "/app/console"
+
 # ============================================================
 # [metrics] - whether /metrics is served
 # ============================================================

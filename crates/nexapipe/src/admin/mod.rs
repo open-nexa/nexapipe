@@ -31,6 +31,16 @@
 //! | `GET /v1/connections` | token | The peers connected right now, and which client and device each authenticated as. |
 //! | `GET /v1/health` | token | Backend pools, in and out of rotation. |
 //!
+//! And, when `[admin] console_dir` names a built console:
+//!
+//! | Path | Auth | Purpose |
+//! |---|---|---|
+//! | `GET /` | none | The console's page. |
+//! | `GET /assets/*` | none | The files the page names. |
+//! | `GET /api/*` | token, and a loopback host | What the console reads. |
+//! | `POST /api/clients` | the above, and `X-NexaPipe-Admin: 1` | Issues a credential. |
+//! | `DELETE /api/clients/{id}` | the above | Drops a client's credential. |
+//!
 //! The `/v1/*` half is guarded by a generated token (see [`token`]). It answers
 //! questions and nothing else: adding and revoking are `nexapipe client add` and
 //! `client revoke`, which write the config through the same lock this reads. A
@@ -56,7 +66,13 @@ use tokio::net::TcpListener;
 
 pub mod token;
 
+pub mod console;
+
+pub use console::Console;
 use token::{bearer_token, matches_token};
+
+/// The body every answer on this listener carries.
+pub(super) type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>;
 
 /// The content type a Prometheus scraper expects: plain text, exposition format
 /// 0.0.4, and explicitly UTF-8 so a metric name or label is not read as
@@ -64,10 +80,10 @@ use token::{bearer_token, matches_token};
 const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 /// The content type of every `/v1/*` answer.
-const JSON_CONTENT_TYPE: &str = "application/json";
+pub(super) const JSON_CONTENT_TYPE: &str = "application/json";
 
 /// What a client has to send to be let at `/v1/*`.
-const WWW_AUTHENTICATE: &str = "Bearer realm=\"nexapipe-admin\"";
+pub(super) const WWW_AUTHENTICATE: &str = "Bearer realm=\"nexapipe-admin\"";
 
 /// Whether the auxiliary listener may serve `bound`.
 ///
@@ -102,6 +118,9 @@ pub struct AdminState {
     /// `None` when the token could not be made, which closes `/v1/*` rather
     /// than opening it.
     token: Option<SecretString>,
+    /// `None` when no console is configured. Then the listener is exactly what
+    /// it was before the console existed: no page, and no `/api/*`.
+    console: Option<Console>,
 }
 
 impl AdminState {
@@ -113,6 +132,7 @@ impl AdminState {
         auth: Option<AuthState>,
         metrics_enabled: bool,
         token: Option<SecretString>,
+        console: Option<Console>,
     ) -> Self {
         Self {
             routes,
@@ -121,6 +141,7 @@ impl AdminState {
             auth,
             metrics_enabled,
             token,
+            console,
         }
     }
 }
@@ -185,6 +206,19 @@ async fn handle(
 {
     let path = req.uri().path().to_string();
     let is_get = req.method() == hyper::Method::GET;
+
+    // The console has its own door, and it is the only part of this listener
+    // that is not there without being asked for: no console directory, no
+    // page and no `/api/*`, and the listener is exactly what it was before.
+    if state.console.is_some() {
+        if path.starts_with("/api/") {
+            return Ok(console::api_response(req, state).await);
+        }
+        if path == "/" || path.starts_with("/assets/") {
+            let dir = state.console.as_ref().map(|console| console.dir.as_path());
+            return Ok(console::static_response(dir, &path));
+        }
+    }
 
     // The management half is the only one that authenticates, and it says so
     // before looking at anything else: an unauthenticated request is answered
@@ -264,7 +298,7 @@ async fn managed_response(
 }
 
 /// Everything `GET /v1/status` reports.
-async fn status_json(state: &Arc<AdminState>) -> serde_json::Value {
+pub(super) async fn status_json(state: &Arc<AdminState>) -> serde_json::Value {
     let counters = METRICS.snapshot();
     let view = backend_view(state).await;
     let auth = auth_view(state).await;
@@ -308,7 +342,7 @@ async fn status_json(state: &Arc<AdminState>) -> serde_json::Value {
 }
 
 /// `GET /v1/routes`: the table as it is now, including what a reload changed.
-async fn routes_json(routes: &Arc<RoutingTable>) -> serde_json::Value {
+pub(super) async fn routes_json(routes: &Arc<RoutingTable>) -> serde_json::Value {
     let mut out = Vec::new();
 
     for route in routes.routes().await {
@@ -344,7 +378,7 @@ async fn routes_json(routes: &Arc<RoutingTable>) -> serde_json::Value {
 /// answer at all — not masked, not truncated, absent. `has_secret` is the
 /// question an operator actually asks ("is this client enrolled?"), and it
 /// cannot be used to enrol.
-async fn clients_json(state: &Arc<AdminState>) -> serde_json::Value {
+pub(super) async fn clients_json(state: &Arc<AdminState>) -> serde_json::Value {
     let Some(auth) = &state.auth else {
         return serde_json::json!({ "enabled": false, "clients": [] });
     };
@@ -393,7 +427,7 @@ async fn clients_json(state: &Arc<AdminState>) -> serde_json::Value {
 }
 
 /// `GET /v1/connections`: the peers being served right now.
-fn connections_json(peers: &Arc<PeerRegistry>) -> serde_json::Value {
+pub(super) fn connections_json(peers: &Arc<PeerRegistry>) -> serde_json::Value {
     let mut out: Vec<serde_json::Value> = peers
         .snapshot()
         .into_iter()
@@ -431,7 +465,7 @@ fn connections_json(peers: &Arc<PeerRegistry>) -> serde_json::Value {
 /// Restricted to the routes whose backends are probed, for the same reason
 /// [`backend_view`] is: the others are never marked down, so listing them
 /// would report every one of them as up.
-async fn health_json(routes: &Arc<RoutingTable>) -> serde_json::Value {
+pub(super) async fn health_json(routes: &Arc<RoutingTable>) -> serde_json::Value {
     let mut out = Vec::new();
     let mut up = HashSet::new();
     let mut down = HashSet::new();
@@ -537,13 +571,13 @@ async fn backend_view(state: &Arc<AdminState>) -> InstanceView {
     }
 }
 
-fn json(
+pub(super) fn json(
     body: &serde_json::Value,
 ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>> {
     respond(StatusCode::OK, JSON_CONTENT_TYPE, &body.to_string())
 }
 
-fn text(
+pub(super) fn text(
     status: StatusCode,
     body: &str,
 ) -> Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>> {
@@ -571,7 +605,7 @@ fn respond(
 /// The builder is consumed by `respond`, so this is the way a challenge gets
 /// onto a 401 without a second construction path for every answer that needs
 /// one.
-fn with_header(
+pub(super) fn with_header(
     response: Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>>,
     name: hyper::header::HeaderName,
     value: &'static str,
