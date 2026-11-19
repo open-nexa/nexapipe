@@ -79,7 +79,11 @@ and its meaning.
   listener serves the page at `/` and answers its API at `/api/*`: what the
   instance is doing, the route table, the clients and the devices under them,
   the peers connected right now, and the health of the backends. It can issue
-  a client's credential and drop one.
+  a client's credential and drop one, and it can add a route and remove one.
+  A route it writes goes through the store the server reads — the database
+  beside the configuration, or the configuration file itself — one route at a
+  time, so a running instance picks it up on its next reload and the routes
+  and the comments beside them are left alone.
   Absent `console_dir`, the listener serves no page and no `/api/*` and is
   exactly what it was before.
   A request to the console's API is answered only when it was **addressed to a

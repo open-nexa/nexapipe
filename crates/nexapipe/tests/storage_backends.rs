@@ -11,7 +11,7 @@
 //! store.
 
 use nexapipe::auth::{DeviceInfo, DeviceMaterial};
-use nexapipe::config::{load_config, load_config_with_auth};
+use nexapipe::config::{Config, RouteSpec, load_config, load_config_with_auth};
 use nexapipe::storage::{FileStorage, Storage};
 
 use nexapipe_proto::secret::SecretString;
@@ -574,5 +574,158 @@ secret = \"JBSWY3DPEHPK3PXP\"
         read_back.to_toml_text().expect("it writes"),
         written.as_str(),
         "the configuration survives the round trip"
+    );
+}
+
+/// The route the tests write, parsed by the schema so that the store is
+/// handed the same shape a configuration file would have given it.
+fn route() -> RouteSpec {
+    toml::from_str(
+        "host_pattern = \"console.example\"\npath_pattern = \"/api\"\nbackends = [\"http://127.0.0.1:9090\"]\n",
+    )
+    .expect("the route parses")
+}
+
+/// The configuration a store hands back.
+async fn configuration(store: &Arc<dyn Storage>) -> Config {
+    let text = store
+        .config()
+        .await
+        .expect("the store answers")
+        .expect("the store holds a configuration");
+    Config::from_toml_text(text.expose_secret()).expect("the configuration parses")
+}
+
+/// A route written to a store is in the configuration it hands back — and the
+/// comment the operator wrote beside it is still there, because a write that
+/// re-rendered the document would have taken it with it.
+#[tokio::test]
+async fn a_route_written_to_a_store_is_read_back() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    seed(&dir);
+    let store = store(&dir);
+
+    store
+        .write_route(&route())
+        .await
+        .expect("the route is written");
+
+    let config = configuration(&store).await;
+    let routes = config.routes.unwrap_or_default();
+    assert!(
+        routes
+            .iter()
+            .any(|route| route.host_pattern == "console.example" && route.path_pattern == "/api"),
+        "the route is in the configuration: {routes:?}"
+    );
+
+    let file = std::fs::read_to_string(dir.path().join("config.toml")).expect("the file is read");
+    assert!(
+        file.contains("The operator's own note"),
+        "the operator's comment survived the write: {file}"
+    );
+    assert!(
+        file.contains("console.example"),
+        "and the route is in the file: {file}"
+    );
+}
+
+/// A route written twice is one route, not two.
+#[tokio::test]
+async fn a_route_written_twice_is_one_route() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    seed(&dir);
+    let store = store(&dir);
+
+    store
+        .write_route(&route())
+        .await
+        .expect("the route is written");
+    store
+        .write_route(&route())
+        .await
+        .expect("the route is written again");
+
+    let config = configuration(&store).await;
+    let routes = config.routes.unwrap_or_default();
+    let matching = routes
+        .iter()
+        .filter(|route| route.host_pattern == "console.example")
+        .count();
+    assert_eq!(matching, 1, "the route is one route: {routes:?}");
+}
+
+/// A route dropped from a store is gone from the configuration it hands back.
+#[tokio::test]
+async fn a_route_dropped_from_a_store_is_gone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    seed(&dir);
+    let store = store(&dir);
+
+    store
+        .write_route(&route())
+        .await
+        .expect("the route is written");
+    let dropped = store
+        .remove_route("console.example", "/api")
+        .await
+        .expect("the route is dropped");
+    assert!(dropped, "there was a route to drop");
+
+    let config = configuration(&store).await;
+    let routes = config.routes.unwrap_or_default();
+    assert!(
+        !routes
+            .iter()
+            .any(|route| route.host_pattern == "console.example"),
+        "the route is gone: {routes:?}"
+    );
+
+    // A route that is not there is an answer, not a failure.
+    let again = store
+        .remove_route("console.example", "/api")
+        .await
+        .expect("the store answers");
+    assert!(!again, "there was no route to drop the second time");
+}
+
+/// Two routes on the same host are two routes: the path is part of the name,
+/// so dropping one of them leaves the other one alone.
+#[tokio::test]
+async fn two_routes_on_one_host_are_dropped_one_at_a_time() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    seed(&dir);
+    let store = store(&dir);
+
+    let api = toml::from_str(
+        "host_pattern = \"console.example\"\npath_pattern = \"/api\"\nbackends = [\"http://127.0.0.1:9090\"]\n",
+    )
+    .expect("the route parses");
+    let static_files = toml::from_str(
+        "host_pattern = \"console.example\"\npath_pattern = \"/static\"\nbackends = [\"http://127.0.0.1:9091\"]\n",
+    )
+    .expect("the route parses");
+    store.write_route(&api).await.expect("the route is written");
+    store
+        .write_route(&static_files)
+        .await
+        .expect("the route is written");
+
+    let dropped = store
+        .remove_route("console.example", "/api")
+        .await
+        .expect("the route is dropped");
+    assert!(dropped, "there was a route to drop");
+
+    let config = configuration(&store).await;
+    let routes = config.routes.unwrap_or_default();
+    assert_eq!(
+        routes.len(),
+        1,
+        "the other route is still there: {routes:?}"
+    );
+    assert_eq!(
+        routes[0].path_pattern, "/static",
+        "and it is the one that was not dropped"
     );
 }

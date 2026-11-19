@@ -47,14 +47,18 @@ export async function addRoute(request: RouteRequest): Promise<void> {
 /**
  * Removes a route.
  *
- * The route is named by its host pattern, which is what the instance knows it
- * by. A pattern that is not there is not an error worth a page: the table the
- * instance holds is already the answer.
+ * The route is named by its host pattern and its path pattern, which is how
+ * the instance knows it: two routes on the same host are two routes, and
+ * removing one of them leaves the other one alone.
  */
-export async function removeRoute(hostPattern: string): Promise<void> {
+export async function removeRoute(
+  hostPattern: string,
+  pathPattern: string | null,
+): Promise<void> {
   try {
     const answer = await apiWrite<RoutesAnswer>(
-      `${API.routes}/${encodeURIComponent(hostPattern)}`,
+      `${API.routes}/${encodeURIComponent(hostPattern)}` +
+        `?path_pattern=${encodeURIComponent(pathPattern ?? '/')}`,
       'DELETE',
     );
     routes.value = answer.routes ?? [];

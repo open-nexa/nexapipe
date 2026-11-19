@@ -1271,9 +1271,17 @@ console_dir = "/app/console"
 ```
 
 The console shows what the instance is doing and lets you change the clients
-that may connect to it. It asks for the same admin token `nexapipe status`
-uses, and every request it makes has to be **addressed to a loopback host**:
-it manages this machine's instance and not one somewhere else.
+that may connect to it and the routes it serves. It asks for the same admin
+token `nexapipe status` uses, and every request it makes has to be
+**addressed to a loopback host**: it manages this machine's instance and not
+one somewhere else.
+
+A route it adds or removes goes through the store the server reads — the
+database beside the configuration, or the configuration file itself — so a
+running instance picks it up on its next reload, the same way a route written
+by hand is picked up. It is written one route at a time: a write that
+re-rendered the whole configuration would take every other route, and every
+comment beside it, with it.
 
 Absent `console_dir`, the listener serves no page and no `/api/*` and is
 exactly what it was before — nothing to turn off, nothing to clean up.

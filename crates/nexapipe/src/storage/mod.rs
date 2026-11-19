@@ -63,7 +63,7 @@ pub use file::FileStorage;
 pub use open::{choose, import_legacy_config, open};
 
 use crate::auth::state::RuntimeState;
-use crate::config::{ClientSecretWrite, Config};
+use crate::config::{ClientSecretWrite, Config, RouteSpec};
 
 use futures_util::future::BoxFuture;
 
@@ -402,6 +402,37 @@ pub trait Storage: Send + Sync + 'static {
 
     /// Drops a client and every device under it.
     fn remove_client<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, anyhow::Result<()>>;
+
+    /// Writes one route.
+    ///
+    /// A write by entity, like a client's secret: the backend decides what that
+    /// means in its own terms — an edit of the file for the file backend, an
+    /// update of a row for a database one — and neither of them re-renders the
+    /// whole configuration. So a route somebody added by hand, and the comments
+    /// they wrote beside it, are not taken away by a write of another route.
+    ///
+    /// A route is named by its host pattern and its path pattern: two routes
+    /// with the same host and the same path are the same route, and writing
+    /// one of them replaces the other rather than adding a second one beside
+    /// it. The path is compared the way the schema reads it, so a route that
+    /// does not name a path and one that names it `/` are the same route.
+    ///
+    /// The route is written as it is given: a store does not second-guess the
+    /// backends or the modes, because the caller has already had them
+    /// validated by the same code a cold start validates them with.
+    fn write_route<'a>(&'a self, route: &'a RouteSpec) -> BoxFuture<'a, anyhow::Result<()>>;
+
+    /// Drops one route, and says whether there was one to drop.
+    ///
+    /// `false` is an answer, not a failure: a route that is not there is a
+    /// question the caller asked and the store answered. The two backends
+    /// answer it the same way, so the console does not have to know which one
+    /// it is talking to.
+    fn remove_route<'a>(
+        &'a self,
+        host_pattern: &'a str,
+        path_pattern: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<bool>>;
 
     /// Writes the endpoint's private key.
     ///

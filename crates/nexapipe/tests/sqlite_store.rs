@@ -5,7 +5,7 @@
 
 #![cfg(feature = "storage-sqlite")]
 
-use nexapipe::config::{ClientSecretWrite, Config};
+use nexapipe::config::{ClientSecretWrite, Config, RouteSpec};
 use nexapipe::storage::sqlite::SqliteStorage;
 use nexapipe::storage::{DeviceCredential, Stamp, Storage, StorageKind};
 
@@ -515,4 +515,129 @@ async fn a_whole_configuration_can_be_put() {
         "the rows that were there before are gone: {}",
         text.expose_secret()
     );
+}
+
+/// The route the tests write, parsed by the schema so that the store is
+/// handed the same shape a configuration file would have given it.
+fn route() -> RouteSpec {
+    toml::from_str(
+        "host_pattern = \"console.example\"\npath_pattern = \"/api\"\nbackends = [\"http://127.0.0.1:9090\"]\n",
+    )
+    .expect("the route parses")
+}
+
+/// The configuration the store hands back.
+async fn configuration(store: &SqliteStorage) -> Config {
+    let text = store
+        .config()
+        .await
+        .expect("the store answers")
+        .expect("the store holds a configuration");
+    Config::from_toml_text(text.expose_secret()).expect("the configuration parses")
+}
+
+/// A route written into the store is in the configuration it hands back, and
+/// the revision moves with the write — a watcher comparing stamps sees it.
+#[tokio::test]
+async fn a_route_written_into_the_store_is_read_back() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (store, _) = store(&dir).await;
+    store
+        .put_config(&Config::from_toml_text(CONFIG).expect("the configuration parses"))
+        .await
+        .expect("the configuration is written");
+
+    let before = store.stamp().await.expect("the store answers");
+    store
+        .write_route(&route())
+        .await
+        .expect("the route is written");
+    let after = store.stamp().await.expect("the store answers");
+    assert_ne!(after, before, "the write moved the revision");
+
+    let config = configuration(&store).await;
+    let routes = config.routes.unwrap_or_default();
+    assert!(
+        routes
+            .iter()
+            .any(|route| route.host_pattern == "console.example" && route.path_pattern == "/api"),
+        "the route is in the configuration: {routes:?}"
+    );
+    // The routes that were there before are still there: a write of one route
+    // is a write of one route.
+    assert!(
+        routes
+            .iter()
+            .any(|route| route.host_pattern == "example.com"),
+        "the route that was there before is still there: {routes:?}"
+    );
+}
+
+/// A route written twice is one route, not two.
+#[tokio::test]
+async fn a_route_written_twice_is_one_route() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (store, _) = store(&dir).await;
+    store
+        .put_config(&Config::from_toml_text(CONFIG).expect("the configuration parses"))
+        .await
+        .expect("the configuration is written");
+
+    store
+        .write_route(&route())
+        .await
+        .expect("the route is written");
+    store
+        .write_route(&route())
+        .await
+        .expect("the route is written again");
+
+    let config = configuration(&store).await;
+    let routes = config.routes.unwrap_or_default();
+    let matching = routes
+        .iter()
+        .filter(|route| route.host_pattern == "console.example")
+        .count();
+    assert_eq!(matching, 1, "the route is one route: {routes:?}");
+}
+
+/// A route dropped from the store is gone from the configuration it hands
+/// back, and the revision moves with the drop.
+#[tokio::test]
+async fn a_route_dropped_from_the_store_is_gone() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (store, _) = store(&dir).await;
+    store
+        .put_config(&Config::from_toml_text(CONFIG).expect("the configuration parses"))
+        .await
+        .expect("the configuration is written");
+    store
+        .write_route(&route())
+        .await
+        .expect("the route is written");
+
+    let before = store.stamp().await.expect("the store answers");
+    let dropped = store
+        .remove_route("console.example", "/api")
+        .await
+        .expect("the route is dropped");
+    assert!(dropped, "there was a route to drop");
+    let after = store.stamp().await.expect("the store answers");
+    assert_ne!(after, before, "the drop moved the revision");
+
+    let config = configuration(&store).await;
+    let routes = config.routes.unwrap_or_default();
+    assert!(
+        !routes
+            .iter()
+            .any(|route| route.host_pattern == "console.example"),
+        "the route is gone: {routes:?}"
+    );
+
+    // A route that is not there is an answer, not a failure.
+    let again = store
+        .remove_route("console.example", "/api")
+        .await
+        .expect("the store answers");
+    assert!(!again, "there was no route to drop the second time");
 }

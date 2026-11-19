@@ -438,6 +438,200 @@ mod console {
         }
         admin.stop();
     }
+
+    /// The configuration the console wrote through, read back the way the
+    /// server reads it.
+    async fn stored(path: &Path) -> nexapipe::config::Config {
+        let text = std::fs::read_to_string(path).expect("the configuration is read");
+        nexapipe::config::Config::from_toml_text(&text).expect("the configuration parses")
+    }
+
+    /// A route the console adds is in the store the server reads.
+    #[tokio::test]
+    async fn a_route_added_by_the_console_is_in_the_store() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        let reply = ask(
+            &admin,
+            "POST",
+            "/api/routes",
+            Some(TOKEN),
+            "localhost",
+            true,
+            r#"{"host_pattern":"console.example","path_pattern":"/api","backends":["http://127.0.0.1:9090"]}"#,
+        )
+        .await;
+        assert_eq!(
+            reply.status, 200,
+            "the write was carried out: {}",
+            reply.body
+        );
+
+        let stored = stored(&config).await;
+        let routes = stored.routes.unwrap_or_default();
+        assert!(
+            routes.iter().any(
+                |route| route.host_pattern == "console.example" && route.path_pattern == "/api"
+            ),
+            "the route is in the store the server reads: {routes:?}"
+        );
+        admin.stop();
+    }
+
+    /// A route the console removes is gone from the store the server reads.
+    #[tokio::test]
+    async fn a_route_removed_by_the_console_is_gone_from_the_store() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        let reply = ask(
+            &admin,
+            "POST",
+            "/api/routes",
+            Some(TOKEN),
+            "localhost",
+            true,
+            r#"{"host_pattern":"console.example","backends":["http://127.0.0.1:9090"]}"#,
+        )
+        .await;
+        assert_eq!(
+            reply.status, 200,
+            "the write was carried out: {}",
+            reply.body
+        );
+
+        let reply = ask(
+            &admin,
+            "DELETE",
+            "/api/routes/console.example",
+            Some(TOKEN),
+            "localhost",
+            true,
+            "",
+        )
+        .await;
+        assert_eq!(
+            reply.status, 200,
+            "the removal was carried out: {}",
+            reply.body
+        );
+
+        let stored = stored(&config).await;
+        let routes = stored.routes.unwrap_or_default();
+        assert!(
+            !routes
+                .iter()
+                .any(|route| route.host_pattern == "console.example"),
+            "the route is gone from the store: {routes:?}"
+        );
+        admin.stop();
+    }
+
+    /// A route that is not there is an answer, not a failure.
+    #[tokio::test]
+    async fn a_route_that_is_not_there_is_refused() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        let reply = ask(
+            &admin,
+            "DELETE",
+            "/api/routes/nowhere.example",
+            Some(TOKEN),
+            "localhost",
+            true,
+            "",
+        )
+        .await;
+        assert_eq!(reply.status, 404, "there was no such route: {}", reply.body);
+        admin.stop();
+    }
+
+    /// A route the server would refuse to start with is refused here too, so
+    /// the store never holds one the next reload would choke on.
+    #[tokio::test]
+    async fn a_route_the_server_would_refuse_is_refused() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        // No backends: the route would match and then have nothing to send
+        // the request to.
+        let reply = ask(
+            &admin,
+            "POST",
+            "/api/routes",
+            Some(TOKEN),
+            "localhost",
+            true,
+            r#"{"host_pattern":"console.example","backends":[]}"#,
+        )
+        .await;
+        assert_eq!(reply.status, 400, "the route was refused: {}", reply.body);
+
+        // And a key that is not a key of a route is refused rather than
+        // ignored: the console would answer "written" for a route that is not
+        // the one that was asked for.
+        let reply = ask(
+            &admin,
+            "POST",
+            "/api/routes",
+            Some(TOKEN),
+            "localhost",
+            true,
+            r#"{"host_pattern":"console.example","backends":["http://127.0.0.1:9090"],"priority":3}"#,
+        )
+        .await;
+        assert_eq!(reply.status, 400, "the route was refused: {}", reply.body);
+
+        let stored = stored(&config).await;
+        assert!(
+            stored.routes.unwrap_or_default().is_empty(),
+            "nothing was written"
+        );
+        admin.stop();
+    }
+
+    /// A write without the header that says it is a write is refused, like
+    /// every other write.
+    #[tokio::test]
+    async fn a_route_write_without_the_write_header_is_refused() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        let reply = ask(
+            &admin,
+            "POST",
+            "/api/routes",
+            Some(TOKEN),
+            "localhost",
+            false,
+            r#"{"host_pattern":"console.example","backends":["http://127.0.0.1:9090"]}"#,
+        )
+        .await;
+        assert_eq!(reply.status, 400, "the write was refused: {}", reply.body);
+        admin.stop();
+    }
 }
 
 fn http_route(host: &str, backends: Vec<String>) -> Route {

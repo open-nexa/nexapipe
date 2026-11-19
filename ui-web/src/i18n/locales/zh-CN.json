@@ -75,10 +75,9 @@
     "pathLabel": "路径匹配",
     "backendsLabel": "后端",
     "modesLabel": "模式",
-    "priorityLabel": "优先级",
     "added": "路由已添加。运行中的实例会在下次重载后生效。",
     "removed": "路由已删除。运行中的实例会在下次重载后停止服务该路由。",
-    "confirmRemove": "删除 {host} 的路由？"
+    "confirmRemove": "删除 {host}{path} 的路由？"
   },
   "clients": {
     "title": "客户端",
