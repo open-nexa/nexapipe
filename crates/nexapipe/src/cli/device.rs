@@ -131,19 +131,30 @@ pub(crate) async fn invite_device(
             storage.describe()
         );
     }
-    if matches!(invite.target, EndpointTarget::NodeId(_))
-        && base
-            .proxy_config
-            .as_ref()
-            .and_then(|config| config.iroh.as_ref())
-            .and_then(|iroh| iroh.discovery.as_deref())
-            .is_some_and(|value| value.trim() == "none")
-    {
-        eprintln!(
-            "warning: [iroh] discovery = \"none\" is set, so a Node ID invite cannot be resolved; \
-             generate another one with `nexapipe device invite --client {client_id} \
-             --invite-ticket <TICKET>` to put the addresses in the link"
-        );
+    let discovery_off = base
+        .proxy_config
+        .as_ref()
+        .and_then(|config| config.iroh.as_ref())
+        .and_then(|iroh| iroh.discovery.as_deref())
+        .is_some_and(|value| value.trim() == "none");
+    if discovery_off {
+        match &invite.target {
+            EndpointTarget::NodeId(_) => eprintln!(
+                "warning: [iroh] discovery = \"none\" is set, so a Node ID invite cannot be resolved; \
+                 generate another one with `nexapipe device invite --client {client_id} \
+                 --invite-ticket <TICKET>` to put the addresses in the link"
+            ),
+            // A ticket is the remedy for discovery being off, but only when it
+            // really carries addresses. A ticket built from a bare Node ID
+            // does not, and a link printed from it leaves the recipient with
+            // nowhere to dial — say so instead of printing it silently.
+            EndpointTarget::Ticket(ticket) if !ticket_has_addresses(ticket) => eprintln!(
+                "warning: [iroh] discovery = \"none\" is set and this ticket carries no \
+                 addresses, so the invite may not be resolvable; use the ticket this server \
+                 printed at start-up, which includes its addresses"
+            ),
+            _ => {}
+        }
     }
     if invite.domains.is_empty() {
         eprintln!("warning: the invite carries no domains, pass --domains to route traffic");
@@ -167,6 +178,21 @@ pub(crate) async fn invite_device(
     println!("Scanning imports the endpoint and a one-time invitation. The device enrolls on");
     println!("its first connection; this link stops working once it has been used.");
     Ok(())
+}
+
+/// A ticket makes an invitation resolvable when discovery is off, but only if
+/// it actually carries addresses. One built from a bare Node ID has none, and
+/// a link printed from it would leave the recipient with nowhere to dial.
+fn ticket_has_addresses(ticket: &str) -> bool {
+    use iroh_tickets::endpoint::EndpointTicket;
+    ticket
+        .trim()
+        .parse::<EndpointTicket>()
+        .map(|parsed| {
+            let addr: iroh::EndpointAddr = parsed.into();
+            !addr.addrs.is_empty()
+        })
+        .unwrap_or(false)
 }
 
 /// Seconds since the Unix epoch, shared with the server's deadline rules.

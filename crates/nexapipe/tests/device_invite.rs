@@ -6,29 +6,38 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+
+/// Generated at runtime: the tree holds no credential, not even a test one.
+/// Every fixture in this file shares these, so a ticket built from
+/// `SERVER_SECRET` still names the endpoint its scratch config runs as.
+static SERVER_SECRET: LazyLock<String> = LazyLock::new(nexapipe::config::generate_secret_key_hex);
+static CLIENT_SECRET: LazyLock<String> =
+    LazyLock::new(nexapipe::auth::TotpValidator::generate_secret);
 
 fn scratch_config(name: &str) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join(name);
     fs::write(
         &path,
-        "# my proxy\n\
-         \n\
-         [iroh]\n\
-         secret_key = \"f3d4cade20c162ac5bb9d582b84a10755b1bf61a44c05f4fec4e4282f2f1f9c0\"\n\
-         \n\
-         [auth]\n\
-         enabled = true\n\
-         \n\
-         [auth.clients.alice]\n\
-         secret = \"JBSWY3DPEHPK3PXP\"\n",
+        format!(
+            "# my proxy\n\
+             \n\
+             [iroh]\n\
+             secret_key = \"{}\"\n\
+             \n\
+             [auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.alice]\n\
+             secret = \"{}\"\n",
+            SERVER_SECRET.as_str(),
+            CLIENT_SECRET.as_str()
+        ),
     )
     .expect("write config");
     (dir, path)
 }
-
-/// The identity the scratch configurations run as.
-const SERVER_SECRET: &str = "f3d4cade20c162ac5bb9d582b84a10755b1bf61a44c05f4fec4e4282f2f1f9c0";
 
 /// A scratch config with discovery disabled: a Node ID cannot be resolved
 /// there, so the invite has to carry a ticket with the addresses in it.
@@ -41,27 +50,41 @@ fn scratch_config_without_discovery(name: &str) -> (tempfile::TempDir, PathBuf) 
             "# my proxy\n\
              \n\
              [iroh]\n\
-             secret_key = \"{SERVER_SECRET}\"\n\
+             secret_key = \"{}\"\n\
              discovery = \"none\"\n\
              \n\
              [auth]\n\
              enabled = true\n\
              \n\
              [auth.clients.alice]\n\
-             secret = \"JBSWY3DPEHPK3PXP\"\n"
+             secret = \"{}\"\n",
+            SERVER_SECRET.as_str(),
+            CLIENT_SECRET.as_str()
         ),
     )
     .expect("write config");
     (dir, path)
 }
 
-/// A ticket for the endpoint this scratch config runs as. An invite carrying
-/// a credential is checked against the server's own identity, so the ticket
-/// has to name this endpoint.
+/// A ticket for the endpoint this scratch config runs as, carrying a direct
+/// address the way the ticket the server prints at start-up does. With
+/// `discovery = "none"` a ticket with no addresses cannot be resolved, and
+/// the invite path warns about that.
 fn own_ticket() -> String {
     use iroh::{EndpointAddr, SecretKey};
     use iroh_tickets::endpoint::EndpointTicket;
-    let key: SecretKey = SERVER_SECRET.parse().expect("secret key");
+    let key: SecretKey = SERVER_SECRET.as_str().parse().expect("secret key");
+    let addr = EndpointAddr::new(key.public())
+        .with_ip_addr("192.0.2.1:4242".parse().expect("socket addr"));
+    EndpointTicket::new(addr).to_string()
+}
+
+/// The same endpoint, but an address-free ticket — the degenerate form that
+/// cannot be resolved when discovery is off.
+fn own_ticket_without_addresses() -> String {
+    use iroh::{EndpointAddr, SecretKey};
+    use iroh_tickets::endpoint::EndpointTicket;
+    let key: SecretKey = SERVER_SECRET.as_str().parse().expect("secret key");
     EndpointTicket::new(EndpointAddr::new(key.public())).to_string()
 }
 
@@ -240,13 +263,66 @@ fn a_device_invite_can_carry_an_endpoint_ticket() {
         "the ticket still carries the one-time invitation:\n{output}"
     );
     assert!(
-        !output.contains("cannot be resolved"),
-        "a ticket invite needs no discovery warning:\n{output}"
+        !output.contains("cannot be resolved") && !output.contains("carries no addresses"),
+        "a ticket with addresses needs no discovery warning:\n{output}"
     );
+
+    // Decode the printed target rather than trusting the prefix: the link has
+    // to carry the addresses the ticket was built with, otherwise the invite
+    // is not resolvable with discovery off.
+    let link = output
+        .lines()
+        .find(|line| line.contains("nexapipe://"))
+        .map(str::trim)
+        .expect("the printed invite link");
+    let invite = nexapipe_client::provisioning::EndpointInvite::from_uri(link)
+        .expect("the link parses back into an invite");
+    let encoded = match &invite.target {
+        nexapipe_client::provisioning::EndpointTarget::Ticket(ticket) => ticket,
+        _ => panic!("the link names a ticket target: {link}"),
+    };
+    let parsed: iroh_tickets::endpoint::EndpointTicket =
+        encoded.parse().expect("the ticket in the link parses");
+    let addr: iroh::EndpointAddr = parsed.into();
+    assert!(
+        addr.addrs
+            .iter()
+            .any(|a| a.to_string().contains("192.0.2.1:4242")),
+        "the link carries the direct address from the ticket: {:?}",
+        addr.addrs
+    );
+
     assert!(
         auth_clients(&config).clients["alice"]
             .pending_enrollment_expires_at
             .is_some()
+    );
+}
+
+/// A ticket with no addresses is no better than a bare Node ID when discovery
+/// is off, so the invite has to say the link may not resolve.
+#[test]
+fn an_address_free_ticket_warns_when_discovery_is_off() {
+    let (_dir, config) = scratch_config_without_discovery("empty-ticket.toml");
+    let ticket = own_ticket_without_addresses();
+
+    let (ok, output) = run(
+        &config,
+        &[
+            "device",
+            "invite",
+            "--client",
+            "alice",
+            "--invite-ticket",
+            &ticket,
+        ],
+    );
+
+    assert!(ok, "{output}");
+    assert!(output.contains("nexapipe://ticket/"), "{output}");
+    assert!(
+        output.contains("carries no addresses"),
+        "the operator has to be told the ticket cannot be resolved:\n{output}"
     );
 }
 
@@ -278,5 +354,25 @@ fn an_invite_ticket_without_an_invite_is_rejected() {
     assert!(
         output.contains("is used with --generate-invite or"),
         "{output}"
+    );
+}
+
+/// The stray-ticket check has to run before the other early returns, or a
+/// flag such as --generate-secret would succeed and silently swallow it.
+#[test]
+fn an_invite_ticket_is_rejected_before_other_early_returns() {
+    let (_dir, config) = scratch_config("ticket-with-secret.toml");
+    let ticket = own_ticket();
+
+    let (ok, output) = run(&config, &["--generate-secret", "--invite-ticket", &ticket]);
+
+    assert!(!ok, "the ticket was silently ignored:\n{output}");
+    assert!(
+        output.contains("is used with --generate-invite or"),
+        "{output}"
+    );
+    assert!(
+        !output.contains("Generated secret key"),
+        "the early return must not run first:\n{output}"
     );
 }

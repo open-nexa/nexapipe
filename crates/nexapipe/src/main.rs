@@ -362,6 +362,27 @@ async fn main() {
 
     let cli = Cli::parse();
 
+    // `--invite-ticket` is global so `device invite` can carry a ticket when
+    // discovery is off. On its own it has no invite to act on, so say so
+    // instead of silently dropping it. This has to run before every early
+    // return (`--generate-secret`, `--generate-2fa`, `status`, …), or one of
+    // those branches would accept a stray ticket and ignore it.
+    if cli.invite_ticket.is_some()
+        && cli.generate_invite.is_none()
+        && !matches!(
+            &cli.command,
+            Some(Commands::Device {
+                action: DeviceAction::Invite { .. }
+            })
+        )
+    {
+        eprintln!(
+            "Error: --invite-ticket is used with --generate-invite or \
+             `nexapipe device invite --client <CLIENT_ID>`"
+        );
+        std::process::exit(1);
+    }
+
     // The store the operator asked for. Opened per command rather than once
     // here, because a command that never touches the configuration — asking
     // for a key to paste, say — should not open a database to do it.
@@ -439,25 +460,6 @@ async fn main() {
         eprintln!(
             "Error: --registration has been replaced by `nexapipe device invite --client \
              <CLIENT_ID>`, which issues a one-time token with a deadline"
-        );
-        std::process::exit(1);
-    }
-
-    // `--invite-ticket` is global so `device invite` can carry a ticket when
-    // discovery is off. On its own it has no invite to act on, so say so
-    // instead of silently starting the proxy and dropping the ticket.
-    if cli.invite_ticket.is_some()
-        && cli.generate_invite.is_none()
-        && !matches!(
-            &cli.command,
-            Some(Commands::Device {
-                action: DeviceAction::Invite { .. }
-            })
-        )
-    {
-        eprintln!(
-            "Error: --invite-ticket is used with --generate-invite or \
-             `nexapipe device invite --client <CLIENT_ID>`"
         );
         std::process::exit(1);
     }
