@@ -339,14 +339,14 @@ jobs:
           cargo check -p nexapipe-client --all-targets --features "jni,local-proxy" --locked
           cargo test -p nexapipe-client --features "jni,local-proxy" --locked
 
-  # The server crate's optional features. `storage-sqlite` carries the
-  # database store, and a feature that is never built is a feature that is
-  # never tested: the workspace test job runs default features, and the
-  # default features do not carry the store.
+  # The server's two builds. `storage-sqlite` carries the database store and is
+  # a default feature now, because it is the store a deployment that says
+  # nothing gets — so the default build is the one that ships, and it is built
+  # and tested here.
   #
-  # The store is off by default on purpose — a build without the driver says
-  # so by name rather than pretend to open a database it has no driver for —
-  # which is exactly why it needs a job of its own.
+  # `--no-default-features` is the other build: the server with only the file
+  # store. It has to keep compiling and passing its tests, or "the file store
+  # stays available" becomes a claim about a configuration nobody builds.
   server-features:
     name: server features
     runs-on: ubuntu-latest
@@ -363,11 +363,16 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
         with:
           key: features
-      - name: storage-sqlite
+      - name: default features (the database store)
         if: ${{ !cancelled() }}
         run: |
-          cargo check -p nexapipe --all-targets --features "storage-sqlite" --locked
-          cargo test -p nexapipe --features "storage-sqlite" --locked
+          cargo check -p nexapipe --all-targets --locked
+          cargo test -p nexapipe --locked
+      - name: --no-default-features (the file-only server)
+        if: ${{ !cancelled() }}
+        run: |
+          cargo check -p nexapipe --no-default-features --all-targets --locked
+          cargo test -p nexapipe --no-default-features --locked
 
   # The benchmarks. They exist so that a performance claim in this repository
   # is a measurement rather than an expectation — see docs/benchmarks.md.

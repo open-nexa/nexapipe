@@ -46,7 +46,12 @@ fn empty_dir() -> (tempfile::TempDir, PathBuf) {
 fn start_until_node_id(config: &Path) -> (String, Child) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nexapipe"));
     command
-        .args(["--config", config.to_str().expect("utf-8 path")])
+        .args([
+            "--config",
+            config.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -300,7 +305,12 @@ fn a_broken_config_is_not_replaced_by_a_generated_one() {
     fs::write(&path, broken).expect("write config");
 
     let child = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
-        .args(["--config", path.to_str().expect("utf-8 path")])
+        .args([
+            "--config",
+            path.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -336,7 +346,13 @@ fn status_does_not_create_a_config() {
     let (_dir, path) = empty_dir();
 
     let _ = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
-        .args(["--config", path.to_str().expect("utf-8 path"), "status"])
+        .args([
+            "--config",
+            path.to_str().expect("utf-8 path"),
+            "status",
+            "--storage",
+            "toml",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -365,6 +381,8 @@ fn generate_2fa_does_not_create_a_config() {
         .args([
             "--config",
             path.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
             "--generate-2fa",
             "client-001",
             "--qr-format",
@@ -398,6 +416,8 @@ fn client_list_does_not_create_a_config() {
         .args([
             "--config",
             path.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
             "client",
             "list",
         ])
@@ -431,6 +451,8 @@ fn local_proxy_does_not_create_a_config() {
         .args([
             "--config",
             path.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
             "--local-proxy",
         ])
         .stdin(Stdio::null())
@@ -478,6 +500,9 @@ fn the_env_var_shifts_the_default_config_path() {
     // config lock is released.
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_nexapipe"));
     command
+        // The file store is what this test is about: it asserts the file
+        // lands at `<dir>/config.toml`.
+        .args(["--storage", "toml"])
         .env(
             "NEXAPIPE_CONFIG_DIR",
             config_dir.to_str().expect("utf-8 path"),

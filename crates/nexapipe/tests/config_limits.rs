@@ -60,7 +60,12 @@ fn write_config(dir: &Path, limits: &str) -> PathBuf {
 fn start_until_ceilings(config: &Path, env: &[(&str, &str)]) -> (String, Child) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nexapipe"));
     command
-        .args(["--config", config.to_str().expect("utf-8 path")])
+        .args([
+            "--config",
+            config.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -100,7 +105,12 @@ fn start_until_ceilings(config: &Path, env: &[(&str, &str)]) -> (String, Child) 
 /// said on the way out.
 fn start_until_refused(config: &Path) -> (bool, String) {
     let child = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
-        .args(["--config", config.to_str().expect("utf-8 path")])
+        .args([
+            "--config",
+            config.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

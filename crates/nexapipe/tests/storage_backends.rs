@@ -520,3 +520,59 @@ async fn a_configuration_named_without_a_directory_has_the_working_one() {
         "a store over a file always has a directory: the configuration's own"
     );
 }
+
+/// A store accepts a whole configuration and makes it the one it holds.
+///
+/// This is the one whole-document write, and the one the import of a
+/// `config.toml` written for the file store needs: the store holds nothing and
+/// is handed everything, once.
+#[tokio::test]
+async fn a_store_accepts_a_whole_configuration() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = store(&dir);
+
+    let config = nexapipe::config::Config::from_toml_text(
+        "\
+[server]
+listen_addr = \"127.0.0.1:8080\"
+
+[[routes]]
+host_pattern = \"example.com\"
+backends = [\"http://127.0.0.1:8081\"]
+
+[auth]
+enabled = true
+
+[auth.clients.client-001]
+secret = \"JBSWY3DPEHPK3PXP\"
+",
+    )
+    .expect("the configuration parses");
+
+    store
+        .put_config(&config)
+        .await
+        .expect("the configuration is written");
+
+    let text = store
+        .config()
+        .await
+        .expect("the store is readable")
+        .expect("the store holds a configuration");
+    let written = text.expose_secret();
+    assert!(written.contains("example.com"), "the route came across");
+    assert!(
+        written.contains("JBSWY3DPEHPK3PXP"),
+        "the credential came across"
+    );
+
+    // Reading it back and writing it out again changes nothing: what the store
+    // holds is a configuration, not a copy of some text.
+    let read_back =
+        nexapipe::config::Config::from_toml_text(written).expect("what the store hands out parses");
+    assert_eq!(
+        read_back.to_toml_text().expect("it writes"),
+        written.as_str(),
+        "the configuration survives the round trip"
+    );
+}

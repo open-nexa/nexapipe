@@ -80,10 +80,12 @@ Three properties, and what each one costs, because none of them is free.
   the request, cannot probe `/health`, and its access log records bytes rather
   than a request line. (`mode = "http"` is the exception — there the proxy does
   parse the request. See [Security boundary](#security-boundary).)
-- **There is no control plane.** One binary and one `config.toml`; no account, no
-  coordination server, no third party holding a map of your nodes. What that
-  costs: no central device list, no remote revocation, no SSO — adding a client
-  means editing the config, which the running server picks up within seconds.
+- **There is no control plane.** One binary and one configuration — a
+  `config.toml` or the database beside it; no account, no coordination server,
+  no third party holding a map of your nodes. What that costs: no central
+  device list, no remote revocation, no SSO — adding a client means editing the
+  configuration (or `nexapipe client add`), which the running server picks up
+  within seconds.
 - **There is nothing to rent.** Clients hole-punch straight to your endpoint over
   QUIC. What that costs: hole punching succeeds for roughly 90–95% of
   connections and the rest fall back to a relay, so for anything you depend on
@@ -120,7 +122,7 @@ bindings for Swift/Kotlin/Python. See
 | `ui-android/` | Android app (Kotlin + Compose). |
 | `ui-desktop/` | Tauri 2 desktop app (Vue 3 + TypeScript). |
 | `ui-web/` | The browser console the instance serves (Vue 3 + TypeScript). Built into a directory the server points `[admin] console_dir` at. |
-| `config.toml.example` | Example server + client configuration covering every section. It ships with 2FA **on** and no client enrolled, so a fresh install refuses every connection until one is enrolled. Copy it to `config.toml` — that name is gitignored, it is the operator's live config. The docker compose file uses `config/config.toml` instead, picked up via `NEXAPIPE_CONFIG_DIR=/app/config`. |
+| `config.toml.example` | Example server + client configuration covering every section. It ships with 2FA **on** and no client enrolled, so a fresh install refuses every connection until one is enrolled. Copy it to `config.toml` — that name is gitignored, and the first start imports it into `nexapipe.db` beside it. The docker compose file uses `config/config.toml` instead, found via `NEXAPIPE_CONFIG_DIR=/app/config`, and keeps its database at `config/nexapipe.db`. |
 | `config.toml.2fa.example` | The same, with a `[auth.clients]` entry — a client that is enrolled already. **The secret in it is published**, so it is a demonstration of what an enrolled client looks like rather than one to use: replace it with `nexapipe client enroll client-001 --force` before the listener is reachable. |
 | `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat), for Windows. |
 | `run_android.sh` | The same one-shot Android debug loop for macOS and Linux (bash). |
@@ -138,7 +140,7 @@ host_pattern = "*"
 backends = ["http://127.0.0.1:3000"]    # the service you want to expose
 EOF
 
-nexapipe                                # picks up ./config.toml
+nexapipe                                # imports ./config.toml into ./nexapipe.db, starts
 ```
 
 Three lines is a working server: one catch-all route, one backend, every other key
@@ -149,15 +151,15 @@ section written out, or `config.toml.2fa.example` when you want a client that
 is enrolled already — and replace that client's secret before the listener is
 reachable, because the one in the file is published.
 
-Leave the file out entirely and the server writes a minimal `config.toml` for you
-instead of refusing to start — 2FA on, nothing routed, nothing enrolled. It is a
-starting point to edit, not a working proxy:
+Leave the file out entirely and the server writes a minimal configuration into
+the store instead of refusing to start — 2FA on, nothing routed, nothing
+enrolled. It is a starting point, not a working proxy:
 
 ```bash
-nexapipe                                # writes ./config.toml, then starts
+nexapipe                                # writes ./nexapipe.db, then starts
 ```
 
-Two things are true of that file until you change them, and both are the safe
+Two things are true of that configuration until you change them, and both are the safe
 direction: **no route**, so every host is answered 404; and **no client**, so with
 `[auth] enabled = true` nothing can connect at all. Create the first client and
 invite its first device with
@@ -173,8 +175,9 @@ when it connects and is filed under the fingerprint of its key, so there is no
 name for the operator to choose. Generating a second invitation replaces the
 outstanding token, which is how a link that went astray is revoked.
 
-A config that already exists is never regenerated, and one that exists but does
-not parse still fails the start rather than being replaced.
+A store that already holds a configuration is never overwritten, and a
+`config.toml` that exists but does not parse still fails the start rather than
+being replaced.
 
 On startup the server prints what clients need:
 
@@ -191,9 +194,10 @@ Give clients either the **Node ID** (stable, but it needs discovery) or the
 **Ticket** (carries addresses, so it changes when they do).
 
 **You do not have to set `[iroh] secret_key` yourself.** When it is missing, the
-server generates one on the first start, writes it back into `config.toml` under
-`[iroh]`, and uses it from then on — so the Node ID is stable from the very first
-run without a copy-paste:
+server generates one on the first start, writes it back under `[iroh]` — into
+`config.toml` with `--storage toml`, into the database otherwise — and uses it
+from then on, so the Node ID is stable from the very first run without a
+copy-paste. With the file store it looks like this:
 
 ```toml
 [iroh]
@@ -201,7 +205,7 @@ run without a copy-paste:
 secret_key = "8f2a…"
 ```
 
-The file is rewritten through the same locked, atomic write the 2FA commands
+That file is rewritten through the same locked, atomic write the 2FA commands
 use, so your comments and the rest of the config survive. That write creates
 the file **private** (`0600`) on Unix, but the mode is no longer enforced: a
 `0644` config — a Docker bind mount arrives that way — starts fine. The
@@ -267,9 +271,10 @@ itself holds no private key. Back `secrets/` up with `config/` — losing it
 means a new Node ID on the next start, and clients that stored the old one stop
 finding the server.
 It also sets `NEXAPIPE_CONFIG_DIR=/app/config`, so the binary inside the
-container picks up `/app/config/config.toml` by default — the same file the
-host sees at `config/config.toml`. `--config` still wins, so an operator can
-point at any path. `host.docker.internal` is configured, so backends running
+container finds `/app/config/config.toml` by default — the same file the host
+sees at `config/config.toml`. The database is `/app/config/nexapipe.db`, inside
+the same mount, so the configuration and its counters are backed up together.
+`--config` still wins, so an operator can point at any path. `host.docker.internal` is configured, so backends running
 on the Docker host are reachable. Moving an existing deployment over is one
 command: `mkdir -p config && mv config.toml config/config.toml`.
 
@@ -498,14 +503,15 @@ same one to a different service later, which is why it relocates
 `StateDirectory`, `CacheDirectory` and `LogsDirectory` of its own accord: a
 credential file in `/etc` is not one of them.
 
-**The config directory has to stay writable.** The server writes back into
-`config.toml` — an enrolled device's secret — and writes `config.toml.admin-token`
-beside it the first time it starts. The 2FA counters (`failed_attempts`,
-`locked_until`, `last_used`) go into `config.state.toml` beside it, and the state file
-is the server's own: the configuration is not rewritten for them. On the very
-first start it writes there too, adding `[iroh] secret_key` when the config has
-none: a deployment that never enrolls a client still needs the directory
-writable, or the Node ID changes on every restart. `ReadWritePaths` is that one
+**The config directory has to stay writable.** The server writes back into the
+store: `config.toml` with `--storage toml`, `nexapipe.db` beside it otherwise —
+where an enrolled device's secret, the admin token, the 2FA counters
+(`failed_attempts`, `locked_until`, `last_used`) and the endpoint key all end up.
+With `--storage toml` the token is `config.toml.admin-token` and the counters are
+`config.state.toml`, both beside the file. On the very first start it writes
+there too, adding `[iroh] secret_key` when the configuration has none: a
+deployment that never enrolls a client still needs the directory writable, or
+the Node ID changes on every restart. `ReadWritePaths` is that one
 directory and nothing wider. `NEXAPIPE_NO_PERSIST_IDENTITY=1` is the way to run
 without a writable config, at the cost of a Node ID that does not survive a
 restart.
@@ -579,9 +585,9 @@ The settings that mean the same thing whichever command runs stay global:
 
 | Option | Meaning |
 | --- | --- |
-| `-c, --config <PATH>` | Config file (default `./config.toml`; `NEXAPIPE_CONFIG_DIR` shifts it). |
-| `--storage <KIND>` | `toml` or `sqlite`; `NEXAPIPE_STORAGE` says the same thing. |
-| `--storage-url <URL>` | The database the configuration is kept in; `NEXAPIPE_STORAGE_URL` says the same thing. |
+| `-c, --config <PATH>` | Where the configuration is (default `./config.toml`; `NEXAPIPE_CONFIG_DIR` shifts it). The file store reads this file; the database store derives `nexapipe.db` from its directory. |
+| `--storage <KIND>` | `sqlite` (default) or `toml`; `NEXAPIPE_STORAGE` says the same thing. See [Where the configuration is kept](#where-the-configuration-is-kept). |
+| `--storage-url <URL>` | Where the database is (default: `nexapipe.db` beside `--config`); `NEXAPIPE_STORAGE_URL` says the same thing. |
 | `--issuer <NAME>` | Issuer label shown by the authenticator app. |
 | `--format <FMT>` | How to draw the QR code: `unicode` (default), `plain`, `ascii`, `svg`, `none`. The older spelling is `--qr-format`. |
 | `--invert` | Draw the QR code inverted (light on dark). The older spelling is `--qr-invert`. |
@@ -687,10 +693,16 @@ row of its own answers with the client's `secret`. See [Device keys](#device-key
 
 ## Configuration
 
-`config.toml` is the single source of truth for both the server and client mode.
-Every key is optional.
+`config.toml` describes the server and the client mode. Every key is optional.
 
-The file is re-read every 5 seconds and applied live: `[[routes]]` and the
+**Where that configuration is kept depends on the store.** A deployment that
+says nothing keeps it in a SQLite database called `nexapipe.db`, in the
+directory `--config` names — `./config.toml` puts it in `./nexapipe.db`, and
+`/etc/nexapipe/config.toml` in `/etc/nexapipe/nexapipe.db`. One anchor, so the
+configuration, its lockouts and its token are one directory to back up. See
+[Where the configuration is kept](#where-the-configuration-is-kept).
+
+The configuration is re-read every 5 seconds and applied live: `[[routes]]` and the
 `[auth.clients]` table need no restart, and a config
 that fails to parse or validate is reported and ignored, so a half-saved edit
 cannot take the proxy down. The rest is read once at startup and needs a restart:
@@ -706,13 +718,65 @@ is picked up by the watcher, but turning 2FA *off* is refused (restart to
 disable it), and `enabled = true` together with an exposed plaintext listener is
 refused outright.
 
-### The configuration and the state are two files
+### Where the configuration is kept
 
-`config.toml` is the operator's file: what they wrote, what they read, what they
-keep in version control. The things a running server learns — how many times a
-client mistyped a code, until when it is locked out, when it was last seen —
-are not that, so they live in a state file **beside** the configuration, in the
-same shape and with the same client ids and device ids.
+The store is chosen on the command line, never in the configuration itself — a
+document cannot say where it lives, because it is read from there first.
+
+| Store | How to ask for it | Where it lives |
+| --- | --- | --- |
+| SQLite (default) | nothing, or `--storage sqlite` | `<directory of --config>/nexapipe.db` |
+| File | `--storage toml` | the path `--config` names |
+
+`NEXAPIPE_STORAGE` says the same thing for a deployment that cannot change its
+command line, and `--storage-url` / `NEXAPIPE_STORAGE_URL` moves the database
+somewhere else — that URL wins over the derived path:
+
+```bash
+nexapipe --config /etc/nexapipe/config.toml                       # /etc/nexapipe/nexapipe.db
+nexapipe --config /etc/nexapipe/config.toml --storage toml        # the file, no database
+nexapipe --config /etc/nexapipe/config.toml --storage-url /srv/nexapipe.db
+```
+
+The database holds the whole configuration — routes, clients, devices,
+per-client counters, the admin token and the endpoint key — so there is no
+`config.state.toml` and no `config.toml.admin-token` beside it. The file store
+keeps those two, as it always has (see [the next
+section](#the-file-store-is-three-files)).
+
+**A `config.toml` from an earlier version is imported once.** The first start
+that finds an empty database and a `config.toml` beside the path `--config`
+names writes that file's configuration into the database, and says so in the
+log:
+
+```
+Imported the configuration from /etc/nexapipe/config.toml into /etc/nexapipe/nexapipe.db;
+this instance reads the store from now on. The file is left where it is — `--storage toml`
+reads it again — so editing it no longer changes this configuration
+```
+
+The file is **not** moved or deleted: `--storage toml` still reads it, which is
+what makes going back a flag rather than a recovery. A file that cannot be
+parsed stops the start with the reason and leaves the database empty, rather
+than half-applying it.
+
+The import is a **server-start** step, not something every command does: a
+`client list` against an empty database reports that there is no configuration
+instead of migrating behind your back, because a command that only reads should
+not write.
+
+A build made with `--no-default-features` carries no database driver. It stays
+usable — it is the file-only server — but it has to be told `--storage toml`, and
+it refuses the database by name rather than falling back to a file the
+deployment may not have.
+
+### The file store is three files
+
+With `--storage toml`, `config.toml` is the operator's file: what they wrote,
+what they read, what they keep in version control. The things a running server
+learns — how many times a client mistyped a code, until when it is locked out,
+when it was last seen — are not that, so they live in a state file **beside** the
+configuration, in the same shape and with the same client ids and device ids.
 
 ```
 /etc/nexapipe/
@@ -1385,8 +1449,9 @@ ignored, and reported at startup. See [TLS](#tls).
 
 ### What a reload applies
 
-The config file is watched, and a change is picked up without a restart — but
-not every key can be. Rather than spread that rule over the sections above, it
+The configuration is watched — the file's modification time with `--storage
+toml`, the database's revision otherwise — and a change is picked up without a
+restart, but not every key can be. Rather than spread that rule over the sections above, it
 is one table:
 
 | Key | On reload |
@@ -1845,10 +1910,11 @@ cargo run -p nexapipe -- device invite --client client-001 --create-client
   for a device invitation: it creates the client and an expiring enrollment link
   in one run.
 
-Since the new secret is written to `config.toml`, remember that the TOTP
-parameters are read once at startup: a client added under `[auth.clients]` is
-picked up on its own (the file is re-read every 5 seconds), but changing
-`algorithm`, `time_step` or `digits` still needs a restart.
+Since the new secret is written to the store — `config.toml`, or the database
+with the default store — remember that the TOTP parameters are read once at
+startup: a client added under `[auth.clients]` is picked up on its own (the
+configuration is re-read every 5 seconds), but changing `algorithm`,
+`time_step` or `digits` still needs a restart.
 
 ### Device invitations
 

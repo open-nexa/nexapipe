@@ -75,6 +75,10 @@ fn full_args(config: &Path, args: &[&str]) -> Vec<String> {
     let mut full = vec![
         "--config".to_string(),
         config.to_string_lossy().into_owned(),
+        // The tests in this file are about the file store: the configuration
+        // is a file they write and read, not a database.
+        "--storage".to_string(),
+        "toml".to_string(),
     ];
     full.extend(args.iter().map(|arg| arg.to_string()));
     full

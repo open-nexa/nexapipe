@@ -465,3 +465,54 @@ async fn the_directory_of_the_store_is_created() {
     assert!(path.exists(), "the database is there");
     assert!(store.config().await.expect("the store answers").is_none());
 }
+
+/// A store accepts a whole configuration, and the revision moves with the
+/// write — a watcher comparing stamps sees it.
+#[tokio::test]
+async fn a_whole_configuration_can_be_put() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (store, _) = store(&dir).await;
+
+    let config = Config::from_toml_text(CONFIG).expect("the configuration parses");
+    let before = store.stamp().await.expect("the store answers");
+    store
+        .put_config(&config)
+        .await
+        .expect("the configuration is written");
+    let after = store.stamp().await.expect("the store answers");
+    assert_ne!(after, before, "the write moved the revision");
+
+    let text = store
+        .config()
+        .await
+        .expect("the store is readable")
+        .expect("the store holds a configuration");
+    let written = text.expose_secret();
+    assert!(written.contains("example.com"), "the route came across");
+    assert!(
+        written.contains("JBSWY3DPEHPK3PXP"),
+        "the credential came across"
+    );
+
+    // Writing it a second time replaces the configuration rather than adding
+    // to it, and moves the revision again.
+    let again = Config::from_toml_text("[server]\nlisten_addr = \"127.0.0.1:9090\"\n")
+        .expect("the second configuration parses");
+    store
+        .put_config(&again)
+        .await
+        .expect("the configuration is replaced");
+    let last = store.stamp().await.expect("the store answers");
+    assert_ne!(last, after, "the replacement moved the revision as well");
+
+    let text = store
+        .config()
+        .await
+        .expect("the store is readable")
+        .expect("the store holds a configuration");
+    assert!(
+        !text.expose_secret().contains("example.com"),
+        "the rows that were there before are gone: {}",
+        text.expose_secret()
+    );
+}

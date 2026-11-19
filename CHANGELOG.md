@@ -45,6 +45,11 @@ and its meaning.
 
 ### Added
 
+- **A `config.toml` from an earlier version is imported, once.** The first start
+  that finds an empty store and a `config.toml` beside the path `--config` names
+  writes that configuration into the database, logs which file it read and which
+  database it reads from now, and leaves the file where it is. A file that cannot
+  be parsed stops the start with the reason instead of being half-applied.
 - **Device invitations.** `nexapipe device invite --client <CLIENT_ID> [--ttl
   15m] [--domains a,b] [--relay URL] [--create-client]` prints a `nexapipe://`
   link and QR carrying a one-time `enroll=<token>` and an `exp=<unix>` deadline.
@@ -93,6 +98,18 @@ and its meaning.
 - Every message the binary printed that named one of the flags below now names
   the command instead, and a flag given together with the command that
   replaced it is refused rather than resolved silently.
+- **BREAKING: the configuration lives in a database by default.** A deployment
+  that names no store keeps it in `nexapipe.db`, beside the path `--config`
+  names, and `--storage-url` / `NEXAPIPE_STORAGE_URL` moves it. `storage-sqlite`
+  is a default feature now, so every released binary carries the store. The
+  database holds the configuration, the counters, the admin token and the
+  endpoint key, so there is no `config.state.toml` and no
+  `config.toml.admin-token` beside it.
+- **BREAKING:** `--storage toml` is how the file store is asked for; it reads
+  and writes `config.toml` exactly as before. A build made with
+  `--no-default-features` is the file-only server: it has to be told
+  `--storage toml`, and it refuses the database by name rather than falling back
+  to a file the deployment may not have.
 - Device rows are keyed by that fingerprint and carry the reported details:
   `[auth.clients.<id>.devices.d-9f2c1a4b7e0d3f58]` with `public_key`, `label`,
   `platform`, `model` and `app_version`, instead of a name the operator chose.

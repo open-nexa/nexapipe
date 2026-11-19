@@ -52,7 +52,12 @@ fn scratch_config(discovery: &str) -> (tempfile::TempDir, PathBuf) {
 fn run_until_exit(config: &Path) -> (bool, String) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nexapipe"));
     command
-        .args(["--config", config.to_str().expect("utf-8 path")])
+        .args([
+            "--config",
+            config.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -95,7 +100,12 @@ fn discovery_can_be_switched_off() {
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_nexapipe"));
     command
-        .args(["--config", config.to_str().expect("utf-8 path")])
+        .args([
+            "--config",
+            config.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

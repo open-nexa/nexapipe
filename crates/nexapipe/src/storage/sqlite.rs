@@ -471,6 +471,18 @@ impl Storage for SqliteStorage {
         })
     }
 
+    fn put_config<'a>(&'a self, config: &'a Config) -> BoxFuture<'a, anyhow::Result<()>> {
+        // Laid out before the future is pinned, so a configuration that cannot
+        // be expressed as rows is refused where it was handed over. The write
+        // is `write_rows`, which bumps the revision in its own transaction:
+        // the watcher sees the configuration it was handed.
+        let rows = Rows::of(config);
+        Box::pin(async move {
+            let rows = rows?;
+            self.write_rows(&rows).await
+        })
+    }
+
     fn write_client_secret<'a>(
         &'a self,
         client_id: &'a str,

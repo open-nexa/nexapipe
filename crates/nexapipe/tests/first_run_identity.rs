@@ -70,7 +70,12 @@ fn scratch_config() -> (tempfile::TempDir, PathBuf) {
 fn start_until_node_id(config: &Path, env: &[(&str, &str)]) -> (String, Child) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nexapipe"));
     command
-        .args(["--config", config.to_str().expect("utf-8 path")])
+        .args([
+            "--config",
+            config.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -314,7 +319,12 @@ fn a_broken_key_refuses_to_start() {
     .expect("write config");
 
     let output = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
-        .args(["--config", path.to_str().expect("utf-8 path")])
+        .args([
+            "--config",
+            path.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -421,7 +431,12 @@ fn an_env_key_alongside_an_inline_one_refuses_to_start() {
     .expect("write config");
 
     let output = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
-        .args(["--config", path.to_str().expect("utf-8 path")])
+        .args([
+            "--config",
+            path.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
+        ])
         .env(
             "NEXAPIPE_IROH_SECRET_KEY",
             nexapipe::config::generate_secret_key_hex(),
@@ -537,7 +552,12 @@ fn an_env_value_and_an_env_named_file_refuse_to_start() {
     fs::write(&key_file, nexapipe::config::generate_secret_key_hex()).expect("write the key file");
 
     let output = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
-        .args(["--config", path.to_str().expect("utf-8 path")])
+        .args([
+            "--config",
+            path.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
+        ])
         .env(
             "NEXAPIPE_IROH_SECRET_KEY",
             nexapipe::config::generate_secret_key_hex(),
@@ -597,7 +617,12 @@ fn an_env_named_key_file_is_honoured_without_an_iroh_section() {
     let key_file = secrets_dir.join("iroh.key");
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
-        .args(["--config", path.to_str().expect("utf-8 path")])
+        .args([
+            "--config",
+            path.to_str().expect("utf-8 path"),
+            "--storage",
+            "toml",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
