@@ -173,7 +173,8 @@ pub(crate) async fn invite_device(
     render_qr(
         &link,
         cli,
-        "Scan this with the NexaPipe app (add endpoint -> scan):",
+        Some("Scan this with the NexaPipe app (add endpoint -> scan):"),
+        "NexaPipe 2FA enrollment",
     )?;
     println!("Scanning imports the endpoint and a one-time invitation. The device enrolls on");
     println!("its first connection; this link stops working once it has been used.");

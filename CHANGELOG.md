@@ -60,9 +60,25 @@ and its meaning.
   `model` and `app_version` when it enrolls, and is filed under `d-` plus the
   first 16 hex characters of the SHA-256 of its Ed25519 public key — duplicate
   labels are allowed.
+- **The command line is command groups.** `nexapipe` with nothing on it still
+  starts the server, and `serve`, `status`, `client`, `device`, `invite`, `qr`,
+  `secret` and `config` are the commands it can be asked for. `client` carries
+  `list`, `add`, `revoke`, `enroll` and `qr`; `device invite` is unchanged.
+- `nexapipe qr <TEXT>` draws a QR code carrying any text — a link, a ticket —
+  and writes it to `--out` when that is given.
+- `nexapipe secret` prints a new endpoint key, and writes nothing. It is what
+  `--generate-secret` was.
+- `nexapipe config show` prints the configuration the store holds, and
+  `nexapipe config path` prints the store that holds it.
+- `--format`, `--invert` and `--out` are the drawing options, named for what
+  they do. `--qr-format`, `--qr-invert` and `--qr-out` keep working as aliases
+  of the same arguments.
 
 ### Changed
 
+- Every message the binary printed that named one of the flags below now names
+  the command instead, and a flag given together with the command that
+  replaced it is refused rather than resolved silently.
 - **BREAKING: the configuration lives in a database by default.** A deployment
   that names no store keeps it in `nexapipe.db`, beside the path `--config`
   names, and `--storage-url` / `NEXAPIPE_STORAGE_URL` moves it. `storage-sqlite`
@@ -82,6 +98,25 @@ and its meaning.
 - `client list --json` now includes `invite_expires_at` and each device's
   `label`/`platform`/`model`/`app_version`; admin `GET /v1/auth` now includes
   `enrollment_expires_at`.
+
+### Deprecated
+
+- **Every flag below keeps working for one release, hidden from `--help`, and
+  prints one line on stderr naming the command that replaced it.** A flag that
+  only modified another one is inert on its own, exactly as before.
+
+  | Old flag | Command |
+  | --- | --- |
+  | `--local-proxy` | `nexapipe serve --local-proxy` |
+  | `--generate-secret` | `nexapipe secret` |
+  | `--generate-2fa <CLIENT_ID>` | `nexapipe client enroll <CLIENT_ID>` |
+  | `--force` | `nexapipe client enroll <CLIENT_ID> --force` |
+  | `--show-2fa <CLIENT_ID>` | `nexapipe client qr <CLIENT_ID>` |
+  | `--generate-invite [CLIENT_ID]` | `nexapipe invite [CLIENT_ID]` |
+  | `--create-client` | `nexapipe invite --create-client` |
+  | `--invite-domains <LIST>` | `nexapipe invite --domains <LIST>` |
+  | `--invite-name <NAME>` | `nexapipe invite --name <NAME>` |
+  | `--invite-relay <URL>` | `nexapipe invite --relay <URL>` |
 
 ### Removed
 

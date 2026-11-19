@@ -234,7 +234,7 @@ impl FileStorage {
             if !client.contains_key("secret") {
                 anyhow::bail!(
                     "client \"{client_id}\" has no [auth.clients.{client_id}] secret in {}; \
-                     run --generate-2fa {client_id} first",
+                     run `nexapipe client enroll {client_id}` first",
                     path.display()
                 );
             }
@@ -341,7 +341,7 @@ impl FileStorage {
             if !client.contains_key("secret") {
                 anyhow::bail!(
                     "client \"{client_id}\" has no [auth.clients.{client_id}] secret in {}; \
-                     run --generate-2fa {client_id} first",
+                     run `nexapipe client enroll {client_id}` first",
                     path.display()
                 );
             }

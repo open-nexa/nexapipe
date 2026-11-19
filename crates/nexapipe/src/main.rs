@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, ValueEnum};
 use nexapipe::config::{
     AdminConfig, Config, EndpointIdentity, IrohConfig, LocalProxyConfig, ServerConfig,
 };
@@ -9,9 +9,12 @@ use nexapipe::storage::{Storage, StorageKind};
 use nexapipe_proto::secret::SecretString;
 use std::sync::Arc;
 
-// The credential half of the command line: the 2FA enrollment, the invite, and
-// the `client` subcommand. It is a second product in the same binary, and it
-// was a second product in the same file.
+use cli::Commands;
+
+// The command line: the command groups an operator asks for, and the credential
+// work behind them — the 2FA enrollment, the invites, the `client` subcommand
+// and the configuration read back out. It is a second product in the same
+// binary, and it was a second product in the same file.
 mod cli;
 
 /// The default config path the binary uses when `--config` is not given.
@@ -122,15 +125,22 @@ struct Cli {
     #[arg(long, value_name = "URL", global = true)]
     storage_url: Option<String>,
 
-    #[arg(long, help = "Run in client local proxy mode")]
+    // The legacy spelling. `--local-proxy` is an option of `nexapipe serve`
+    // now, and the fold reports this one as replaced by that command.
+    #[arg(long, hide = true, help = "Run in client local proxy mode")]
     local_proxy: bool,
 
-    #[arg(long, help = "Generate a new secret key for stable endpoint identity")]
+    #[arg(
+        long,
+        hide = true,
+        help = "Generate a new secret key for stable endpoint identity"
+    )]
     generate_secret: bool,
 
     #[arg(
         long,
         value_name = "CLIENT_ID",
+        hide = true,
         help = "Generate a new 2FA secret for a client and print a scannable QR code"
     )]
     generate_2fa: Option<String>,
@@ -138,12 +148,14 @@ struct Cli {
     #[arg(
         long,
         value_name = "CLIENT_ID",
+        hide = true,
         help = "Print the QR code of a client already configured in [auth.clients]"
     )]
     show_2fa: Option<String>,
 
     #[arg(
         long,
+        hide = true,
         help = "With --generate-2fa: issue a new secret even when the client already has \
                 one in [auth.clients], and replace it in the config"
     )]
@@ -157,23 +169,36 @@ struct Cli {
     )]
     issuer: Option<String>,
 
+    // The three drawing options stay global: an operator who already writes
+    // `nexapipe --qr-out f.svg invite phone` has to keep working, and a
+    // per-command copy would break exactly that spelling. They are named for
+    // what they do rather than for what draws them, and the older spellings
+    // remain as aliases.
     #[arg(
-        long,
+        long = "format",
+        alias = "qr-format",
+        value_name = "FORMAT",
         value_enum,
         default_value_t = QrFormat::Unicode,
         global = true,
-        help = "How to draw the QR code"
+        help = "How to draw the QR code (formerly --qr-format)"
     )]
     qr_format: QrFormat,
 
-    #[arg(long, global = true, help = "Draw the QR code light on dark")]
+    #[arg(
+        long = "invert",
+        alias = "qr-invert",
+        global = true,
+        help = "Draw the QR code light on dark (formerly --qr-invert)"
+    )]
     qr_invert: bool,
 
     #[arg(
-        long,
+        long = "out",
+        alias = "qr-out",
         value_name = "PATH",
         global = true,
-        help = "Also write the QR code to a file (.svg, anything else is ASCII)"
+        help = "Also write the QR code to a file, .svg or ASCII (formerly --qr-out)"
     )]
     qr_out: Option<String>,
 
@@ -182,6 +207,7 @@ struct Cli {
         value_name = "CLIENT_ID",
         num_args = 0..=1,
         default_missing_value = "",
+        hide = true,
         help = "Print a scannable nexapipe:// invite for this endpoint; \
                 with a CLIENT_ID the matching [auth.clients] 2FA secret goes in too, \
                 without one the invite only carries the endpoint and its domains"
@@ -190,6 +216,7 @@ struct Cli {
 
     #[arg(
         long,
+        hide = true,
         requires = "generate_invite",
         help = "Replaced by `nexapipe device invite --client CLIENT_ID`, which issues a \
                 one-time token with a deadline"
@@ -198,6 +225,7 @@ struct Cli {
 
     #[arg(
         long,
+        hide = true,
         requires = "generate_invite",
         help = "With --generate-invite CLIENT_ID: create the client when it does not exist \
                 yet, generating and writing its TOTP secret in the same run. Only a client \
@@ -209,6 +237,7 @@ struct Cli {
         long = "invite-domains",
         value_delimiter = ',',
         value_name = "DOMAINS",
+        hide = true,
         help = "Domains to put in the invite (default: [local_proxy] proxy_domains, else the route hosts)"
     )]
     invite_domains: Vec<String>,
@@ -216,6 +245,7 @@ struct Cli {
     #[arg(
         long = "invite-name",
         value_name = "NAME",
+        hide = true,
         help = "Human readable label stored alongside the endpoint in the invite"
     )]
     invite_name: Option<String>,
@@ -223,6 +253,7 @@ struct Cli {
     #[arg(
         long = "invite-relay",
         value_name = "URL",
+        hide = true,
         help = "Relay URL to put in the invite (default: [iroh] relay_url)"
     )]
     invite_relay: Option<String>,
@@ -237,127 +268,18 @@ struct Cli {
 
     #[arg(
         long = "invite-ticket",
+        alias = "ticket",
         value_name = "TICKET",
         global = true,
         conflicts_with = "endpoint_id",
         help = "Put a full endpoint ticket (Node ID + addresses) in the invite instead of a \
-                Node ID. Works with --generate-invite and with `device invite`. Use it with \
+                Node ID. Works with `nexapipe invite` and with `device invite`. Use it with \
                 [iroh] discovery = \"none\", where a Node ID alone cannot be resolved"
     )]
     invite_ticket: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
-}
-
-/// The two things this binary does besides run: ask a running instance how it
-/// is, and — with the flags above — write credentials into a config.
-///
-/// A subcommand rather than another flag because it is a different kind of
-/// thing: the flags are all "do this to the config and exit", while `status`
-/// talks to a process that is already running.
-#[derive(Subcommand, Debug)]
-enum Commands {
-    /// Ask the instance at [admin] listen_addr what it is doing
-    Status {
-        /// Print the whole answer as one JSON document instead of the grouped
-        /// reading, for anything that has to parse it
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// List, add and revoke the 2FA clients in [auth.clients]
-    Client {
-        #[command(subcommand)]
-        action: ClientAction,
-    },
-
-    /// Invite a device to enroll under a client without naming it
-    Device {
-        #[command(subcommand)]
-        action: DeviceAction,
-    },
-}
-
-/// The device invitation replaces the operator-named device join.
-#[derive(Subcommand, Debug)]
-enum DeviceAction {
-    /// Print a one-time invitation link that expires after a short while
-    Invite {
-        /// The client the device will enroll under
-        #[arg(long, value_name = "CLIENT_ID")]
-        client: String,
-
-        /// How long the invitation is good for: 15m by default, e.g. 30m, 2h
-        #[arg(long, value_name = "DURATION")]
-        ttl: Option<String>,
-
-        /// Domains to put in the invite (default: [local_proxy] proxy_domains, else the route hosts)
-        #[arg(long = "domains", value_delimiter = ',', value_name = "DOMAINS")]
-        domains: Vec<String>,
-
-        /// Relay URL to put in the invite (default: the configured pinned relay)
-        #[arg(long = "relay", value_name = "URL")]
-        relay: Option<String>,
-
-        /// Create the client when it does not exist yet
-        #[arg(long)]
-        create_client: bool,
-    },
-}
-
-/// The write half of the management surface.
-///
-/// Subcommands rather than `POST /v1/clients`: the admin token is one opaque
-/// value with no scope and no rotation, and giving it something to change is
-/// how a read-only surface becomes the way into the credential store. A
-/// subcommand writes the same file the server watches instead, and needs no
-/// token — but it does need to be able to write that file, which is the access
-/// an operator adding a client already has.
-#[derive(Subcommand, Debug)]
-enum ClientAction {
-    /// List the clients in [auth.clients], and the devices of each
-    List {
-        /// Print one JSON document instead of the reading below, for anything
-        /// that has to parse it
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Issue a credential to a client, or to one device of it
-    Add {
-        /// The client id: the key under [auth.clients]
-        #[arg(value_name = "CLIENT_ID")]
-        client_id: String,
-
-        /// Replaced by `nexapipe device invite`: a device is identified by its
-        /// key fingerprint, not by a name the operator picks
-        #[arg(long, value_name = "NAME")]
-        device: Option<String>,
-
-        /// Issue a key credential instead of a secret: the public half of an
-        /// Ed25519 key pair, 64 hex characters. The device is filed under the
-        /// fingerprint of this key; no --device is needed or allowed.
-        #[arg(long, value_name = "HEX")]
-        public_key: Option<String>,
-
-        /// Replace the credential that is already there, enrolling out whatever
-        /// is using it now
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Drop a client's credentials, or one device's
-    Revoke {
-        /// The client id: the key under [auth.clients]
-        #[arg(value_name = "CLIENT_ID")]
-        client_id: String,
-
-        /// Drop only this device's credential, keeping the client and every
-        /// other device of it
-        #[arg(long, value_name = "NAME")]
-        device: Option<String>,
-    },
 }
 
 #[tokio::main]
@@ -367,196 +289,25 @@ async fn main() {
         .install_default()
         .expect("Failed to install ring as default CryptoProvider");
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
 
-    // `--invite-ticket` is global so `device invite` can carry a ticket when
-    // discovery is off. On its own it has no invite to act on, so say so
-    // instead of silently dropping it. This has to run before every early
-    // return (`--generate-secret`, `--generate-2fa`, `status`, …), or one of
-    // those branches would accept a stray ticket and ignore it.
-    if cli.invite_ticket.is_some()
-        && cli.generate_invite.is_none()
-        && !matches!(
-            &cli.command,
-            Some(Commands::Device {
-                action: DeviceAction::Invite { .. }
-            })
-        )
-    {
-        eprintln!(
-            "Error: --invite-ticket is used with --generate-invite or \
-             `nexapipe device invite --client <CLIENT_ID>`"
-        );
-        std::process::exit(1);
-    }
-
-    // The store the operator asked for. Opened per command rather than once
-    // here, because a command that never touches the configuration — asking
-    // for a key to paste, say — should not open a database to do it.
-    // The store is opened asynchronously: a database store answers when the
-    // database answers, and a file store answers at once.
-    let open_store = || {
-        nexapipe::storage::choose(
-            cli.storage.map(Into::into),
-            cli.storage_url.clone(),
-            &cli.config,
-        )
+    // One request per run, whatever spelling asked for it: the command, or the
+    // flag that has been replaced by it. The fold refuses two requests in one
+    // run and reports every old flag on stderr, both before a store is opened
+    // and before anything runs.
+    let request = match cli::fold(&mut cli) {
+        Ok(request) => request,
+        Err(e) => {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
     };
 
-    // `status` is handled before anything that loads the config for a *start*:
-    // it is the only command that runs against another process, and it has to
-    // work while that process holds the config. It reads the same file, read
-    // only, for the address and the token.
-    if let Some(Commands::Status { json }) = &cli.command {
-        let store = match open_store().await {
-            Ok(store) => store,
-            Err(e) => {
-                eprintln!("Error: {e:#}");
-                std::process::exit(1);
-            }
-        };
-        if let Err(e) = nexapipe::status::status(store.as_ref(), *json).await {
-            eprintln!("Error: {e:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    // Handle --generate-secret flag
-    if cli.generate_secret {
-        // Printing a key is not the same thing as giving the endpoint one: this
-        // writes nothing, and a copy-paste is still the operator's job. The
-        // startup path generates and persists a key on its own
-        // (`Config::ensure_iroh_secret_key`); this stays for generating one
-        // to move between hosts, or to seed a config before its first run.
-        let secret_key_hex = nexapipe::config::generate_secret_key_hex();
-        println!("Generated secret key for stable endpoint identity:");
-        println!("{}", secret_key_hex);
-        println!();
-        println!("Add this to your config.toml under [iroh] section:");
-        println!("secret_key = \"{}\"", secret_key_hex);
-        println!();
-        println!("To keep the key out of config.toml instead (so the file holds no");
-        println!("credential and can stay world-readable), point [iroh] secret_key_file");
-        println!("at a file holding just the key, or set NEXAPIPE_IROH_SECRET_KEY.");
-        println!();
-        println!("Or skip this entirely: nexapipe writes [iroh] secret_key on first start");
-        println!("when the key is missing.");
-        return;
-    }
-
-    // Handle --generate-2fa / --show-2fa
-    if cli.generate_2fa.is_some() || cli.show_2fa.is_some() {
-        let store = match open_store().await {
-            Ok(store) => store,
-            Err(e) => {
-                eprintln!("Error: {e:#}");
-                std::process::exit(1);
-            }
-        };
-        if let Err(e) = cli::print_2fa_enrollment(&cli, store.as_ref()).await {
-            eprintln!("Error: {e:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    // A named device no longer exists, and neither does a token that never
-    // expires. Both old spellings fail with the command that replaced them.
-    if cli.registration {
-        eprintln!(
-            "Error: --registration has been replaced by `nexapipe device invite --client \
-             <CLIENT_ID>`, which issues a one-time token with a deadline"
-        );
-        std::process::exit(1);
-    }
-
-    // Handle --generate-invite
-    if cli.generate_invite.is_some() {
-        let store = match open_store().await {
-            Ok(store) => store,
-            Err(e) => {
-                eprintln!("Error: {e:#}");
-                std::process::exit(1);
-            }
-        };
-        if let Err(e) = cli::print_endpoint_invite(&cli, store.as_ref()).await {
-            eprintln!("Error: {e:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    if let Some(Commands::Device { action }) = &cli.command {
-        let store = match open_store().await {
-            Ok(store) => store,
-            Err(e) => {
-                eprintln!("Error: {e:#}");
-                std::process::exit(1);
-            }
-        };
-        let outcome = match action {
-            DeviceAction::Invite {
-                client,
-                ttl,
-                domains,
-                relay,
-                create_client,
-            } => {
-                cli::invite_device(
-                    &cli,
-                    store.as_ref(),
-                    client,
-                    ttl.as_deref(),
-                    domains,
-                    relay.as_deref(),
-                    *create_client,
-                )
-                .await
-            }
-        };
-        if let Err(e) = outcome {
-            eprintln!("Error: {e:#}");
-            std::process::exit(1);
-        }
-        return;
-    }
-
-    // `client` reads and writes the config file, which is the other half of the
-    // management surface. It is handled here rather than after the config load
-    // below because it does not start a proxy: a `revoke` has to work while one
-    // is running, and it takes the same lock the server does.
-    if let Some(Commands::Client { action }) = &cli.command {
-        let store = match open_store().await {
-            Ok(store) => store,
-            Err(e) => {
-                eprintln!("Error: {e:#}");
-                std::process::exit(1);
-            }
-        };
-        let outcome = match action {
-            ClientAction::List { json } => cli::list_clients(store.as_ref(), *json).await,
-            ClientAction::Add {
-                client_id,
-                device,
-                public_key,
-                force,
-            } => {
-                cli::add_client(
-                    &cli,
-                    store.as_ref(),
-                    client_id,
-                    device.as_deref(),
-                    public_key.as_deref(),
-                    *force,
-                )
-                .await
-            }
-            ClientAction::Revoke { client_id, device } => {
-                cli::revoke_client(store.as_ref(), client_id, device.as_deref()).await
-            }
-        };
-        if let Err(e) = outcome {
+    // Everything but the server start is a command that returns: it reads or
+    // writes the configuration and exits. Starting the proxy is what a run with
+    // no command — or with `serve` — does, and what follows below.
+    if request != cli::Request::Serve {
+        if let Err(e) = run_command(request, &cli).await {
             eprintln!("Error: {e:#}");
             std::process::exit(1);
         }
@@ -565,7 +316,7 @@ async fn main() {
 
     // Where the configuration is kept: a database beside `--config` unless the
     // operator named a store, and the file store one flag away.
-    let storage: Arc<dyn Storage> = match open_store().await {
+    let storage: Arc<dyn Storage> = match store_for(&cli).await {
         Ok(storage) => storage,
         Err(e) => {
             eprintln!("Error: {e:#}");
@@ -673,7 +424,7 @@ async fn main() {
             "No config at {} — wrote a minimal one: [auth] enabled = true with 0 \
              clients enrolled (nothing can connect), no [[routes]] entry (every \
              host is answered 404). Enroll the first client with: \
-             nexapipe --generate-invite client-001 --create-client --config {}",
+             nexapipe invite client-001 --create-client --config {}",
             cli.config,
             cli.config,
         );
@@ -708,6 +459,137 @@ async fn main() {
     // The server mode has already drained its connections by the time it
     // returns, so there is nothing left to wait for here.
     tracing::info!("Proxy shutdown complete");
+}
+
+/// The store the operator asked for.
+///
+/// Opened per command rather than once in `main`, because a command that never
+/// touches the configuration — asking for a key to paste, say — should not open
+/// a database to do it. The store is opened asynchronously: a database store
+/// answers when the database answers, and a file store answers at once.
+async fn store_for(cli: &Cli) -> anyhow::Result<Arc<dyn Storage>> {
+    nexapipe::storage::choose(
+        cli.storage.map(Into::into),
+        cli.storage_url.clone(),
+        &cli.config,
+    )
+    .await
+}
+
+/// Runs the command the operator asked for.
+///
+/// `Request::Serve` never reaches here; it is the server start below. Every
+/// other request opens the store it needs and returns, so `nexapipe` never
+/// starts a proxy for a command that was meant to exit.
+async fn run_command(request: cli::Request, cli: &Cli) -> anyhow::Result<()> {
+    match request {
+        cli::Request::Serve => Ok(()),
+
+        // `status` is the only command that runs against another process: it
+        // has to work while that process holds the configuration, so it reads
+        // the store read-only for the address and the token.
+        cli::Request::Status { json } => {
+            let store = store_for(cli).await?;
+            nexapipe::status::status(store.as_ref(), json).await
+        }
+
+        cli::Request::Secret => {
+            print_secret_key();
+            Ok(())
+        }
+
+        // `client enroll` and `client qr`, and the two flags that used to be
+        // them: `fold` put the client into `cli.generate_2fa` or
+        // `cli.show_2fa`, so there is one implementation here as well.
+        cli::Request::Enroll | cli::Request::ShowQr => {
+            let store = store_for(cli).await?;
+            cli::print_2fa_enrollment(cli, store.as_ref()).await
+        }
+
+        cli::Request::Invite => {
+            let store = store_for(cli).await?;
+            cli::print_endpoint_invite(cli, store.as_ref()).await
+        }
+
+        cli::Request::Device(invite) => {
+            let store = store_for(cli).await?;
+            cli::invite_device(
+                cli,
+                store.as_ref(),
+                &invite.client_id,
+                invite.ttl.as_deref(),
+                &invite.domains,
+                invite.relay.as_deref(),
+                invite.create_client,
+            )
+            .await
+        }
+
+        // `client` reads and writes the configuration rather than serving it: a
+        // `revoke` has to work while a server is running, and it takes the same
+        // lock the server does.
+        cli::Request::Clients(clients) => {
+            let store = store_for(cli).await?;
+            match clients {
+                cli::Clients::List { json } => cli::list_clients(store.as_ref(), json).await,
+                cli::Clients::Add {
+                    client_id,
+                    device,
+                    public_key,
+                    force,
+                } => {
+                    cli::add_client(
+                        cli,
+                        store.as_ref(),
+                        &client_id,
+                        device.as_deref(),
+                        public_key.as_deref(),
+                        force,
+                    )
+                    .await
+                }
+                cli::Clients::Revoke { client_id, device } => {
+                    cli::revoke_client(store.as_ref(), &client_id, device.as_deref()).await
+                }
+            }
+        }
+
+        cli::Request::Qr(text) => cli::print_qr(&text, cli),
+
+        cli::Request::ConfigShow => {
+            let store = store_for(cli).await?;
+            cli::print_config(store.as_ref()).await
+        }
+
+        cli::Request::ConfigPath => {
+            let store = store_for(cli).await?;
+            cli::print_config_path(store.as_ref());
+            Ok(())
+        }
+    }
+}
+
+/// Prints a key the operator can paste, and writes nothing.
+///
+/// Printing a key is not the same thing as giving the endpoint one: this writes
+/// nothing, and a copy-paste is still the operator's job. The startup path
+/// generates and persists a key on its own (`Config::ensure_iroh_secret_key`);
+/// this stays for generating one to move between hosts, or to seed a
+/// configuration before its first run.
+fn print_secret_key() {
+    let secret_key_hex = nexapipe::config::generate_secret_key_hex();
+    println!("Generated secret key for stable endpoint identity:");
+    println!("{}", secret_key_hex);
+    println!();
+    println!("Add this to your config.toml under [iroh] section:");
+    println!("secret_key = \"{}\"", secret_key_hex);
+    println!();
+    println!("To keep the key out of config.toml instead (so the file holds no");
+    println!("credential and can stay world-readable), point [iroh] secret_key_file");
+    println!("at a file holding just the key, or set NEXAPIPE_IROH_SECRET_KEY.");
+    println!();
+    println!("Or skip this entirely: nexapipe writes [iroh] secret_key on first start");
+    println!("when the key is missing.");
 }
 
 async fn run_server_mode(

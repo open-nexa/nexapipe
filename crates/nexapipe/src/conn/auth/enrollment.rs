@@ -578,11 +578,13 @@ fn device_label(info: &DeviceInfo) -> String {
 /// What an operator has to do about a device that is already enrolled.
 ///
 /// The command that unblocks the enrollment is the one that **removes** the
-/// device's row. The refusal is about the name being taken, and
-/// `client add --device --force` replaces the credential filed under that
-/// name without giving the name back — so the next enrollment is refused the
-/// same way. Naming `--force` first, which is what this hint used to do, sent
-/// the operator down the one path that does not work.
+/// device's row, or the one that hands out a fresh invitation. The refusal is
+/// about the credential being there already, and a command that only replaced
+/// the credential behind the name would leave the next enrollment refused the
+/// same way — which is why the hint used to name `--force` first and sent the
+/// operator down the one path that does not work. Naming a device on
+/// `client add` is retired for the same reason: a device is identified by the
+/// fingerprint of its key now.
 ///
 /// The revoke is the operator's own move either way: a device that is already
 /// enrolled keeps its credential until somebody says otherwise.
@@ -590,9 +592,9 @@ pub(in crate::conn) fn device_taken_hint(client_id: &str, device: &str) -> Strin
     format!(
         "2FA: enrollment for '{client_id}' refused, device '{device}' already has a credential; \
          `nexapipe client revoke {client_id} --device {device}` removes it so that device can \
-         enroll again — `nexapipe client add {client_id} --device {device} --force` replaces \
-         the credential filed under that name but leaves the name taken, so the enrollment is \
-         refused the same way"
+         enroll again, and `nexapipe device invite --client {client_id}` hands out a fresh \
+         one-time invitation — replacing the credential behind a name leaves the name taken, \
+         so it is not a way back in"
     )
 }
 
