@@ -12,6 +12,7 @@
 #   client            the client crate and the wire format it shares
 #   android           the client crate and the Android app
 #   desktop           the client crate and the desktop app
+#   console           the browser console the instance serves
 #   image             the Dockerfiles and the docker ignore file
 #   dependencies      the lockfiles and the policy the audits read
 #   desktop_lockfile  the desktop package.json and the lockfile that pins it
@@ -104,6 +105,11 @@ emit client '^crates/nexapipe-(client|proto)/'
 emit android '^(crates/nexapipe-(client|proto)/|ui-android/)'
 emit desktop '^(crates/nexapipe-(client|proto)/|ui-desktop/)'
 
+# The browser console the instance serves. Its own tree, its own lockfile and
+# its own build, so it gets its own job: a pull request that touches nothing
+# but the console must not make the server's tests run again.
+emit console '^ui-web/'
+
 # The container image is built from the Dockerfiles at the root.
 emit image '^(Dockerfile[^/]*|\.dockerignore$)'
 
@@ -111,7 +117,7 @@ emit image '^(Dockerfile[^/]*|\.dockerignore$)'
 # lockfile, the policy the audits read, and the two the desktop app has.
 # The audits are the jobs that read these, so a change to one of them is
 # what makes them worth running.
-emit dependencies '^(Cargo\.toml$|Cargo\.lock$|deny\.toml$|ui-desktop/package(-lock)?\.json$|ui-desktop/src-tauri/Cargo\.lock$)'
+emit dependencies '^(Cargo\.toml$|Cargo\.lock$|deny\.toml$|ui-desktop/package(-lock)?\.json$|ui-desktop/src-tauri/Cargo\.lock$|ui-web/package(-lock)?\.json$)'
 
 # The desktop frontend's dependency tree, and the release scripts that
 # install it. The lockfile records each platform's native optional package,
@@ -121,9 +127,9 @@ emit dependencies '^(Cargo\.toml$|Cargo\.lock$|deny\.toml$|ui-desktop/package(-l
 emit desktop_lockfile '^(ui-desktop/package(-lock)?\.json$|build_deb\.sh$|build_dmg\.sh$|build_windows\.ps1$)'
 
 # What CodeQL reads: the Rust in crates/, the TypeScript in ui-desktop/ and
-# the workflow files in .github/. A change to ui-android/ alone is Kotlin,
-# which CodeQL analyses in its own job.
-emit codeql '^(crates/|ui-desktop/|\.github/)'
+# ui-web/, and the workflow files in .github/. A change to ui-android/ alone is
+# Kotlin, which CodeQL analyses in its own job.
+emit codeql '^(crates/|ui-desktop/|ui-web/|\.github/)'
 
 # The release pipeline: the workflow that publishes a release and the scripts
 # it calls. A change to either of them can publish a release that reaches
