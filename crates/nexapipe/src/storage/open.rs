@@ -18,7 +18,7 @@ use std::sync::Arc;
 /// `config_path` is the file backend's configuration file — the path
 /// `--config` names. `url` is what a database backend needs: a connection
 /// string for PostgreSQL, a file path for SQLite.
-pub fn open(
+pub async fn open(
     kind: StorageKind,
     url: Option<&str>,
     config_path: &str,
@@ -26,11 +26,26 @@ pub fn open(
     match kind {
         StorageKind::Toml => Ok(Arc::new(FileStorage::new(config_path))),
         StorageKind::Sqlite => {
-            let _ = url;
-            anyhow::bail!(
-                "this build has no sqlite store: it arrives with the `storage-sqlite` feature, \
-                 and this binary was built without it"
-            )
+            #[cfg(feature = "storage-sqlite")]
+            {
+                let url = url.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "a sqlite store needs a path: pass --storage-url, or set \
+                         NEXAPIPE_STORAGE_URL, to say where the database is"
+                    )
+                })?;
+                Ok(Arc::new(
+                    crate::storage::sqlite::SqliteStorage::open(url).await?,
+                ))
+            }
+            #[cfg(not(feature = "storage-sqlite"))]
+            {
+                let _ = url;
+                anyhow::bail!(
+                    "this build has no sqlite store: it arrives with the `storage-sqlite` feature, \
+                     and this binary was built without it"
+                )
+            }
         }
         StorageKind::Postgres => {
             let _ = url;
@@ -48,7 +63,7 @@ pub fn open(
 /// The command line wins over the environment: an operator who typed it meant
 /// it, and the environment is the fallback for a deployment that cannot change
 /// its command line.
-pub fn choose(
+pub async fn choose(
     flag: Option<StorageKind>,
     url_flag: Option<String>,
     config_path: &str,
@@ -63,5 +78,5 @@ pub fn choose(
 
     let url = url_flag.or_else(|| std::env::var("NEXAPIPE_STORAGE_URL").ok());
 
-    open(kind, url.as_deref(), config_path)
+    open(kind, url.as_deref(), config_path).await
 }

@@ -338,6 +338,36 @@ jobs:
           cargo check -p nexapipe-client --all-targets --features "jni,local-proxy" --locked
           cargo test -p nexapipe-client --features "jni,local-proxy" --locked
 
+  # The server crate's optional features. `storage-sqlite` carries the
+  # database store, and a feature that is never built is a feature that is
+  # never tested: the workspace test job runs default features, and the
+  # default features do not carry the store.
+  #
+  # The store is off by default on purpose — a build without the driver says
+  # so by name rather than pretend to open a database it has no driver for —
+  # which is exactly why it needs a job of its own.
+  server-features:
+    name: server features
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable @ 2026-09-03
+        with:
+          toolchain: 1.98.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2 @ 2026-08-06
+        with:
+          key: features
+      - name: storage-sqlite
+        if: ${{ !cancelled() }}
+        run: |
+          cargo check -p nexapipe --all-targets --features "storage-sqlite" --locked
+          cargo test -p nexapipe --features "storage-sqlite" --locked
+
   # The benchmarks. They exist so that a performance claim in this repository
   # is a measurement rather than an expectation — see docs/benchmarks.md.
   #

@@ -334,7 +334,9 @@ async fn main() {
     // The store the operator asked for. Opened per command rather than once
     // here, because a command that never touches the configuration — asking
     // for a key to paste, say — should not open a database to do it.
-    let open_store = || -> anyhow::Result<Arc<dyn Storage>> {
+    // The store is opened asynchronously: a database store answers when the
+    // database answers, and a file store answers at once.
+    let open_store = || {
         nexapipe::storage::choose(
             cli.storage.map(Into::into),
             cli.storage_url.clone(),
@@ -347,7 +349,7 @@ async fn main() {
     // work while that process holds the config. It reads the same file, read
     // only, for the address and the token.
     if let Some(Commands::Status { json }) = &cli.command {
-        let store = match open_store() {
+        let store = match open_store().await {
             Ok(store) => store,
             Err(e) => {
                 eprintln!("Error: {e:#}");
@@ -386,7 +388,7 @@ async fn main() {
 
     // Handle --generate-2fa / --show-2fa
     if cli.generate_2fa.is_some() || cli.show_2fa.is_some() {
-        let store = match open_store() {
+        let store = match open_store().await {
             Ok(store) => store,
             Err(e) => {
                 eprintln!("Error: {e:#}");
@@ -402,7 +404,7 @@ async fn main() {
 
     // Handle --generate-invite
     if cli.generate_invite.is_some() {
-        let store = match open_store() {
+        let store = match open_store().await {
             Ok(store) => store,
             Err(e) => {
                 eprintln!("Error: {e:#}");
@@ -421,7 +423,7 @@ async fn main() {
     // below because it does not start a proxy: a `revoke` has to work while one
     // is running, and it takes the same lock the server does.
     if let Some(Commands::Client { action }) = &cli.command {
-        let store = match open_store() {
+        let store = match open_store().await {
             Ok(store) => store,
             Err(e) => {
                 eprintln!("Error: {e:#}");
@@ -460,7 +462,7 @@ async fn main() {
     // Where the configuration is kept. A file today; a database tomorrow, and
     // the difference is one line here rather than a path threaded through the
     // whole server.
-    let storage: Arc<dyn Storage> = match open_store() {
+    let storage: Arc<dyn Storage> = match open_store().await {
         Ok(storage) => storage,
         Err(e) => {
             eprintln!("Error: {e:#}");
