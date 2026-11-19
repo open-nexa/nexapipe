@@ -212,7 +212,7 @@ pub(crate) fn identity_action(
                 anyhow::anyhow!(
                     "[iroh] secret_key in {where_} is not a valid key ({e}): the Node ID would \
                      change on every restart and every client would lose the server. Delete the \
-                     line to have a working one generated, or run --generate-secret and paste its \
+                     line to have a working one generated, or run `nexapipe secret` and paste its \
                      output"
                 )
             })?;

@@ -42,7 +42,6 @@ import {
   refreshConnectionMasks,
   secretMasks,
 } from './credentials';
-import { ensureDeviceIdFor } from './device';
 import { applyInvite } from './invite';
 import {
   clearNodeTwoFactor,
@@ -93,11 +92,6 @@ export async function initConfigStore(): Promise<void> {
     // above leaves the secrets in `config` empty, and an ungated mirror would
     // empty the store to match.
     markCredentialsHydrated();
-
-    // And only from here may the device name be generated, for the same reason:
-    // generating one writes the config, and a write before the store had
-    // answered is a write that could empty it.
-    await ensureDeviceIdFor(config);
 
     // The legacy key goes now, and only because it can be proved redundant:
     // `persist` swallows a write failure, so the payload is read back rather
@@ -197,11 +191,6 @@ export function useConfigStore() {
     writeRelayAuthToken(config, token);
   }
 
-  /** The name this machine answers as; generated on first use. */
-  async function ensureDeviceId(): Promise<string> {
-    return ensureDeviceIdFor(config);
-  }
-
   function setLoadBalancing(strategy: LoadBalancingStrategy): void {
     config.loadBalancing = strategy;
   }
@@ -230,7 +219,6 @@ export function useConfigStore() {
     removeNode,
     updateNode,
     updateNodeDomains,
-    ensureDeviceId,
     applyInvite,
     completeEnrollment,
     setNodeTwoFactor,

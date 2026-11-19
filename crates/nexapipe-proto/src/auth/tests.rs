@@ -238,6 +238,10 @@ fn every_message_keeps_its_wire_format() {
                 token: SecretString::new("tok".to_string()),
                 device_id: None,
                 public_key: None,
+                label: None,
+                platform: None,
+                model: None,
+                app_version: None,
             },
             r#"{"type":"ENROLL_START","client_id":"c","token":"tok"}"#,
         ),
@@ -247,6 +251,10 @@ fn every_message_keeps_its_wire_format() {
                 token: SecretString::new("tok".to_string()),
                 device_id: Some("laptop".to_string()),
                 public_key: Some("abcd".to_string()),
+                label: None,
+                platform: None,
+                model: None,
+                app_version: None,
             },
             r#"{"type":"ENROLL_START","client_id":"c","token":"tok","device_id":"laptop","public_key":"abcd"}"#,
         ),
@@ -297,6 +305,10 @@ fn enrollment_messages_keep_their_wire_names() {
         token: SecretString::new("tok".to_string()),
         device_id: None,
         public_key: None,
+        label: None,
+        platform: None,
+        model: None,
+        app_version: None,
     };
     let json = json_of(&start);
     assert!(json.contains(r#""type":"ENROLL_START""#), "{json}");
@@ -339,6 +351,10 @@ fn a_credential_travels_as_the_plain_string_it_always_was() {
         token: SecretString::new("tok".to_string()),
         device_id: None,
         public_key: None,
+        label: None,
+        platform: None,
+        model: None,
+        app_version: None,
     };
     let json = json_of(&start);
     assert!(json.contains(r#""token":"tok""#), "{json}");
@@ -381,6 +397,10 @@ fn the_serialized_credential_does_not_survive_in_the_heap() {
         token: SecretString::new(heap::NEEDLE.to_string()),
         device_id: None,
         public_key: None,
+        label: None,
+        platform: None,
+        model: None,
+        app_version: None,
     };
     let issue = AuthMessage::EnrollIssue {
         client_id: "client-001".to_string(),
@@ -398,6 +418,10 @@ fn the_serialized_credential_does_not_survive_in_the_heap() {
         token: SecretString::new(heap::NEEDLE.repeat(400)),
         device_id: None,
         public_key: None,
+        label: None,
+        platform: None,
+        model: None,
+        app_version: None,
     };
 
     let residue = heap::watched(|| {
@@ -447,6 +471,10 @@ fn the_serialized_credential_does_not_survive_when_the_serialization_fails() {
         token: SecretString::new(heap::NEEDLE.to_string()),
         device_id: Some("x".repeat(70_000)),
         public_key: None,
+        label: None,
+        platform: None,
+        model: None,
+        app_version: None,
     };
 
     let residue = heap::watched(|| {
@@ -620,6 +648,10 @@ fn a_named_device_survives_the_round_trip() {
             token: SecretString::new("tok".to_string()),
             device_id: Some("laptop".to_string()),
             public_key: None,
+            label: None,
+            platform: None,
+            model: None,
+            app_version: None,
         },
         AuthMessage::EnrollIssue {
             client_id: "client-001".to_string(),
@@ -678,6 +710,10 @@ fn an_enrollment_that_offers_a_key_carries_it_whole() {
         token: SecretString::new("tok".to_string()),
         device_id: Some("phone".to_string()),
         public_key: Some(key.clone()),
+        label: Some("Pixel 8".to_string()),
+        platform: Some("android".to_string()),
+        model: Some("Pixel 8".to_string()),
+        app_version: Some("1.4.0".to_string()),
     };
 
     let json = json_of(&start);
@@ -707,6 +743,10 @@ fn an_enrollment_from_a_client_with_no_key_still_parses() {
             token: SecretString::new("tok".to_string()),
             device_id: Some("laptop".to_string()),
             public_key: None,
+            label: None,
+            platform: None,
+            model: None,
+            app_version: None,
         }),
         wire,
     );
@@ -761,12 +801,20 @@ fn every_message() -> Vec<AuthMessage> {
             token: SecretString::new("0123456789abcdef".to_string()),
             device_id: None,
             public_key: None,
+            label: None,
+            platform: None,
+            model: None,
+            app_version: None,
         },
         AuthMessage::EnrollStart {
             client_id: "client-001".to_string(),
             token: SecretString::new("0123456789abcdef".to_string()),
             device_id: Some("laptop".to_string()),
             public_key: Some("ab".repeat(32)),
+            label: None,
+            platform: None,
+            model: None,
+            app_version: None,
         },
         AuthMessage::EnrollIssue {
             client_id: "client-001".to_string(),
@@ -813,6 +861,49 @@ fn every_message_survives_the_binary_form() {
             "{message:?} came back as something else"
         );
     }
+}
+
+/// What a device says about itself is data, not an identity: all four labels
+/// have to reach the server in either form, and a client built before they
+/// existed still sends a message that parses.
+#[test]
+fn device_information_survives_both_wire_forms() {
+    let start = AuthMessage::EnrollStart {
+        client_id: "client-001".to_string(),
+        token: SecretString::new("tok".to_string()),
+        device_id: Some("d-9f2c1a4b7e0d3f58".to_string()),
+        public_key: Some("ab".repeat(32)),
+        label: Some("Pixel 8".to_string()),
+        platform: Some("android".to_string()),
+        model: Some("Pixel 8".to_string()),
+        app_version: Some("1.4.0".to_string()),
+    };
+    for format in [Format::Json, Format::Binary] {
+        let payload = start.to_payload(format).expect("writable");
+        let (back, back_format) = AuthMessage::from_payload(&payload).expect("readable");
+        assert_eq!(back_format, format);
+        assert_eq!(
+            back.to_bytes().expect("serializable"),
+            start.to_bytes().expect("serializable"),
+            "the labels changed in {format:?}"
+        );
+    }
+
+    let old = r#"{"type":"ENROLL_START","client_id":"client-001","token":"tok"}"#;
+    let AuthMessage::EnrollStart {
+        label,
+        platform,
+        model,
+        app_version,
+        ..
+    } = AuthMessage::from_bytes(old.as_bytes()).expect("an old client still parses")
+    else {
+        panic!("expected ENROLL_START");
+    };
+    assert_eq!(label, None);
+    assert_eq!(platform, None);
+    assert_eq!(model, None);
+    assert_eq!(app_version, None);
 }
 
 /// The same for the versioned JSON form.

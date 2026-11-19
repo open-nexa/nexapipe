@@ -287,10 +287,6 @@ test('the credential the invite filed stays in the store', async () => {
   const store = freshStore();
   existingNode(store, 'node-old', 'endpoint-old');
 
-  // A machine with no device name yet: asking for one writes the configuration,
-  // and that save is what would see a node with no enrollment on it.
-  store.config.deviceId = '';
-
   answers.set('accept_invite', {
     ...acceptedInvite('node-new'),
     enrollment: { clientId: 'client-1' },

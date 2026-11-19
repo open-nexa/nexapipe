@@ -132,19 +132,22 @@ impl TwoFactorAuth {
 
     /// A credential that proves itself with a device key instead of a secret.
     ///
-    /// The key is this device's own — the server holds its public half under
-    /// `device_id`, and every handshake is proven by a signature only this
-    /// credential can produce. There is no code to read, which is the point:
-    /// an unattended device has nobody to read one.
+    /// The key is this device's own — the server holds its public half, and
+    /// every handshake is proven by a signature only this credential can
+    /// produce. There is no code to read, which is the point: an unattended
+    /// device has nobody to read one.
     ///
-    /// The name is required rather than optional, and not for convenience: a
-    /// key cannot be the credential of the unnamed slot, which is the client's
-    /// own shared secret — the server refuses a key that names no device.
-    pub fn with_key(client_id: &str, key: iroh::SecretKey, device_id: &str) -> Self {
+    /// **The device is known by the fingerprint of that key**, which is what
+    /// the server files it under, and there is nothing for the caller to name:
+    /// a device that could claim an id other than its own would be claiming an
+    /// identity it does not hold the key for. The id is worked out here, from
+    /// the key, by the same rule the server works it out by.
+    pub fn with_key(client_id: &str, key: iroh::SecretKey) -> Self {
+        let device_id = super::device::device_id_of_key(&key);
         Self {
             client_id: client_id.to_string(),
             proof: Proof::Key(key),
-            device_id: Some(device_id.to_string()),
+            device_id: Some(device_id),
         }
     }
 

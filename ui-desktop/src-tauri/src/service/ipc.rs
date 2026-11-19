@@ -243,7 +243,10 @@ impl std::fmt::Debug for NodeInput {
             .field("two_factor_device", &self.two_factor_device)
             .field("enrollment_client_id", &self.enrollment_client_id)
             .field("enrollment_token", &present(&self.enrollment_token))
-            .field("enrollment_device", &self.enrollment_device)
+            .field("enrollment_label", &self.enrollment_label)
+            .field("enrollment_platform", &self.enrollment_platform)
+            .field("enrollment_model", &self.enrollment_model)
+            .field("enrollment_app_version", &self.enrollment_app_version)
             .finish()
     }
 }
@@ -283,11 +286,17 @@ pub struct NodeInput {
     pub enrollment_client_id: Option<String>,
     #[serde(default)]
     pub enrollment_token: Option<String>,
-    /// The name to be enrolled under, when the machine has one. Absent enrolls as
-    /// the unnamed device, which is what a server that predates per-device
-    /// credentials issues.
+    /// What the enrolling device calls itself, for the operator to read. A
+    /// label, not an identity: the device is known by the fingerprint of its
+    /// key, and two devices may carry the same one.
     #[serde(default)]
-    pub enrollment_device: Option<String>,
+    pub enrollment_label: Option<String>,
+    #[serde(default)]
+    pub enrollment_platform: Option<String>,
+    #[serde(default)]
+    pub enrollment_model: Option<String>,
+    #[serde(default)]
+    pub enrollment_app_version: Option<String>,
 }
 
 impl NodeInput {
@@ -310,7 +319,10 @@ impl NodeInput {
         Some(NodeEnrollment {
             client_id: self.enrollment_client_id.clone().unwrap_or_default(),
             token: token.to_string(),
-            device: self.enrollment_device.clone(),
+            label: self.enrollment_label.clone(),
+            platform: self.enrollment_platform.clone(),
+            model: self.enrollment_model.clone(),
+            app_version: self.enrollment_app_version.clone(),
         })
     }
     pub fn two_factor(&self) -> Option<NodeTwoFactor> {
@@ -319,6 +331,22 @@ impl NodeInput {
         // what is there rather than from a flag: a key node stores no seed at
         // all, so an empty secret is not a missing credential.
         if secret.is_empty() && self.device_key.is_none() {
+            return None;
+        }
+        // A device key on its own is not an issued credential: an invite that
+        // has just been imported carries the key it will offer at enrollment
+        // but no client id yet — that arrives with the credential the server
+        // answers with. Reporting `Some` here would make the proxy treat the
+        // pending invite as already enrolled and authenticate as an empty
+        // client id, which no server has an entry for.
+        if secret.is_empty()
+            && self
+                .two_factor_client_id
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        {
             return None;
         }
         Some(NodeTwoFactor {
@@ -574,7 +602,10 @@ mod tests {
             device_key: None,
             enrollment_client_id: None,
             enrollment_token: None,
-            enrollment_device: None,
+            enrollment_label: None,
+            enrollment_platform: None,
+            enrollment_model: None,
+            enrollment_app_version: None,
         }
     }
 
@@ -601,6 +632,28 @@ mod tests {
         assert_eq!(two_factor.secret, "", "a key node stores no seed");
         assert_eq!(two_factor.device.as_deref(), Some("laptop"));
         assert_eq!(node.device_key.as_deref(), Some("ab".repeat(32).as_str()));
+    }
+
+    /// A freshly imported enrollment invite carries the device key it will
+    /// offer but no credential yet: the client id arrives with the answer from
+    /// the server. Reporting `Some` here would make the proxy treat the invite
+    /// as already enrolled, skip the enrollment, and authenticate as an empty
+    /// client id that no server has an entry for.
+    #[test]
+    fn a_pending_key_only_invite_is_not_an_issued_credential() {
+        let mut node = node();
+        node.device_key = Some("ab".repeat(32));
+        node.enrollment_token = Some("0123456789abcdef".to_string());
+        node.enrollment_client_id = Some("client-001".to_string());
+
+        assert!(
+            node.two_factor().is_none(),
+            "a key alone is not a credential the server issued"
+        );
+        assert!(
+            node.enrollment().is_some(),
+            "the invitation still has to be spent"
+        );
     }
 
     #[test]

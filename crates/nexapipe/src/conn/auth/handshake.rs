@@ -168,6 +168,10 @@ pub(in crate::conn) async fn perform_authentication(
             token,
             device_id,
             public_key,
+            label,
+            platform,
+            model,
+            app_version,
         } => {
             enroll_client(
                 auth,
@@ -175,6 +179,15 @@ pub(in crate::conn) async fn perform_authentication(
                 token.expose_secret(),
                 device_id.as_deref(),
                 public_key.as_deref(),
+                // What the device says about itself, kept for the operator to
+                // read. It is not an identity and nothing is refused over it:
+                // two devices may call themselves the same thing.
+                crate::auth::DeviceInfo::new(
+                    label.as_deref(),
+                    platform.as_deref(),
+                    model.as_deref(),
+                    app_version.as_deref(),
+                ),
                 format,
                 &mut send,
             )
@@ -520,6 +533,10 @@ mod tests {
             token: SecretString::new(needle.to_string()),
             device_id: None,
             public_key: None,
+            label: None,
+            platform: None,
+            model: None,
+            app_version: None,
         };
         let payload = start
             .to_payload(Format::Binary)

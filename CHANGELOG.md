@@ -37,6 +37,80 @@ says they are to be answered; and take the delay out of the path a phone's
 traffic takes. Every configuration key that shipped in 1.0.0 keeps its name
 and its meaning.
 
+## [Unreleased]
+
+> Entries in earlier releases describe the flow as it was in *their* release.
+> Named devices and the `client add --device` / `--registration` forms they
+> mention are superseded by the Removed note in this section.
+
+### Added
+
+- **Device invitations.** `nexapipe device invite --client <CLIENT_ID> [--ttl
+  15m] [--domains a,b] [--relay URL] [--create-client]` prints a `nexapipe://`
+  link and QR carrying a one-time `enroll=<token>` and an `exp=<unix>` deadline.
+  The server writes `pending_enrollment` and `pending_enrollment_expires_at`
+  (Unix timestamp) before printing it. The lifetime defaults to 15m and accepts
+  1s..30d; generating another invitation replaces the outstanding token, which
+  revokes a link that went astray. A device reports its own `label`, `platform`,
+  `model` and `app_version` when it enrolls, and is filed under `d-` plus the
+  first 16 hex characters of the SHA-256 of its Ed25519 public key — duplicate
+  labels are allowed.
+- **The command line is command groups.** `nexapipe` with nothing on it still
+  starts the server, and `serve`, `status`, `client`, `device`, `invite`, `qr`,
+  `secret` and `config` are the commands it can be asked for. `client` carries
+  `list`, `add`, `revoke`, `enroll` and `qr`; `device invite` is unchanged.
+- `nexapipe qr <TEXT>` draws a QR code carrying any text — a link, a ticket —
+  and writes it to `--out` when that is given.
+- `nexapipe secret` prints a new endpoint key, and writes nothing. It is what
+  `--generate-secret` was.
+- `nexapipe config show` prints the configuration the store holds, and
+  `nexapipe config path` prints the store that holds it.
+- `--format`, `--invert` and `--out` are the drawing options, named for what
+  they do. `--qr-format`, `--qr-invert` and `--qr-out` keep working as aliases
+  of the same arguments.
+
+### Changed
+
+- Every message the binary printed that named one of the flags below now names
+  the command instead, and a flag given together with the command that
+  replaced it is refused rather than resolved silently.
+- Device rows are keyed by that fingerprint and carry the reported details:
+  `[auth.clients.<id>.devices.d-9f2c1a4b7e0d3f58]` with `public_key`, `label`,
+  `platform`, `model` and `app_version`, instead of a name the operator chose.
+  An expired token is refused without counting as a guessed token.
+- `client list --json` now includes `invite_expires_at` and each device's
+  `label`/`platform`/`model`/`app_version`; admin `GET /v1/auth` now includes
+  `enrollment_expires_at`.
+
+### Deprecated
+
+- **Every flag below keeps working for one release, hidden from `--help`, and
+  prints one line on stderr naming the command that replaced it.** A flag that
+  only modified another one is inert on its own, exactly as before.
+
+  | Old flag | Command |
+  | --- | --- |
+  | `--local-proxy` | `nexapipe serve --local-proxy` |
+  | `--generate-secret` | `nexapipe secret` |
+  | `--generate-2fa <CLIENT_ID>` | `nexapipe client enroll <CLIENT_ID>` |
+  | `--force` | `nexapipe client enroll <CLIENT_ID> --force` |
+  | `--show-2fa <CLIENT_ID>` | `nexapipe client qr <CLIENT_ID>` |
+  | `--generate-invite [CLIENT_ID]` | `nexapipe invite [CLIENT_ID]` |
+  | `--create-client` | `nexapipe invite --create-client` |
+  | `--invite-domains <LIST>` | `nexapipe invite --domains <LIST>` |
+  | `--invite-name <NAME>` | `nexapipe invite --name <NAME>` |
+  | `--invite-relay <URL>` | `nexapipe invite --relay <URL>` |
+
+### Removed
+
+- **BREAKING:** `client add <id> --device <NAME>` and `--generate-invite <id>
+  --registration` now fail with an error pointing to `nexapipe device invite`.
+  Old name-keyed device rows are legacy entries: devices on them must be revoked
+  and re-enrolled with a fresh invitation to move to the new scheme. Plain `--generate-invite <id>` (endpoint
+  share) and `client add <id>` (client secret) remain; `client add <id>
+  --public-key <HEX>` still registers a key but no longer takes `--device`, the
+  id being derived from the key.
+
 ## [1.2.0] — 2026-11-05
 
 A minor release. Nothing on the wire changes: the handshake, the ALPN and the

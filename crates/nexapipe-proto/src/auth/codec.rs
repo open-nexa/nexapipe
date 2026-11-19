@@ -22,6 +22,14 @@ pub(super) mod flag {
     pub const PUBLIC_KEY: u8 = 0b0000_0010;
     /// The message announces the protocol version it speaks.
     pub const VERSION: u8 = 0b0000_0100;
+    /// The message carries the name the device calls itself.
+    pub const LABEL: u8 = 0b0000_1000;
+    /// The message carries the platform the device runs on.
+    pub const PLATFORM: u8 = 0b0001_0000;
+    /// The message carries the model the device runs on.
+    pub const MODEL: u8 = 0b0010_0000;
+    /// The message carries the version of the app the device runs.
+    pub const APP_VERSION: u8 = 0b0100_0000;
 }
 
 /// The flags a message type may carry.
@@ -30,11 +38,30 @@ pub(super) mod flag {
 /// version that adds one would otherwise be read as if the field were
 /// absent, which is the kind of quiet difference a version byte exists to
 /// prevent.
+///
+/// The four `ENROLL_START` description flags deliberately do **not** bump
+/// `VERSION_BINARY`. The enrollment exchange is the first message between two
+/// peers that may not share a build, so it is sent as `Format::LegacyJson`:
+/// the new fields are `#[serde(default)]` and a peer that does not know them
+/// ignores them rather than failing. The binary form of `ENROLL_START` is
+/// exercised only between peers built from the same source, so an older
+/// decoder never meets those flags on the wire. The version byte is a
+/// discriminator, not a negotiated version, so bumping it here would not add
+/// a rejection path — it would make `from_payload` read the new form as
+/// legacy JSON. Binary enrollment, if it is introduced, has to arrive
+/// together with a version bump and an explicit refusal of the old form.
 pub(super) fn allowed_flags(kind: u8) -> u8 {
     match kind {
         kind::START => flag::DEVICE_ID | flag::VERSION,
         kind::RESPONSE => flag::DEVICE_ID,
-        kind::ENROLL_START => flag::DEVICE_ID | flag::PUBLIC_KEY,
+        kind::ENROLL_START => {
+            flag::DEVICE_ID
+                | flag::PUBLIC_KEY
+                | flag::LABEL
+                | flag::PLATFORM
+                | flag::MODEL
+                | flag::APP_VERSION
+        }
         kind::ENROLL_ISSUE => flag::DEVICE_ID,
         _ => 0,
     }

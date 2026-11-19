@@ -460,6 +460,7 @@ mod tests {
             allow_ports: None,
             allow_ports_strict: false,
             pending_enrollment: None,
+            pending_enrollment_expires_at: None,
             devices: HashMap::new(),
             unnamed_device_allowed: true,
             last_used,
@@ -501,6 +502,10 @@ mod tests {
                 created_at: "0".to_string(),
                 last_used: None,
                 last_used_step: None,
+                label: None,
+                platform: None,
+                model: None,
+                app_version: None,
             },
         );
         config.clients.insert("alice".to_string(), alice);
@@ -523,6 +528,10 @@ mod tests {
                 created_at: "0".to_string(),
                 last_used: None,
                 last_used_step: None,
+                label: None,
+                platform: None,
+                model: None,
+                app_version: None,
             },
         );
         restored.clients.insert("alice".to_string(), alice);

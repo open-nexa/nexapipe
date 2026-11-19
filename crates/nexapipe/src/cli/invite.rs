@@ -8,6 +8,7 @@ use iroh_tickets::endpoint::EndpointTicket;
 use nexapipe::auth::AuthConfig;
 use nexapipe::config::Config;
 use nexapipe::storage::Storage;
+use nexapipe_client::provisioning::{EndpointInvite, EndpointTarget};
 use nexapipe_client::relay::RelayModeSpec;
 use nexapipe_proto::secret::SecretString;
 
@@ -24,139 +25,31 @@ use super::qr::render_qr;
 /// worthless, so the flag is required instead of silently printing a throwaway.
 pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> anyhow::Result<()> {
     use nexapipe_client::auth::TotpAlgorithm;
-    use nexapipe_client::provisioning::{
-        EndpointInvite, EndpointTarget, InviteEnrollment, InviteTotp, RECOMMENDED_URI_LIMIT,
-    };
+    use nexapipe_client::provisioning::{InviteEnrollment, InviteTotp, RECOMMENDED_URI_LIMIT};
 
-    let (proxy_config, auth_config, config_loaded) = load_config_pair(storage).await;
-
-    // A ticket invite carries the addresses in the link itself, so it is the
-    // form that still works when the endpoint's address lookup is off. A Node
-    // ID invite needs somebody to resolve it — that is what `discovery = "n0"`
-    // does.
-    let target = match (&cli.invite_ticket, &cli.endpoint_id) {
-        (Some(ticket), _) => EndpointTarget::ticket_target(ticket)?,
-        (None, Some(id)) => EndpointTarget::node_id_target(id)?,
-        (None, None) => {
-            let secret_key = proxy_config
-                .as_ref()
-                .and_then(|config| config.iroh.as_ref())
-                .and_then(|iroh| {
-                    iroh.secret_key
-                        .as_ref()
-                        .map(|key| key.expose_secret().as_str())
-                })
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "no endpoint identity in {}: set [iroh] secret_key \
-                         (see `nexapipe --generate-secret`) or pass --endpoint-id",
-                        storage.describe()
-                    )
-                })?;
-            let public: iroh::PublicKey = secret_key
-                .parse::<SecretKey>()
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "[iroh] secret_key in {} is invalid ({e})",
-                        storage.describe()
-                    )
-                })?
-                .public();
-            EndpointTarget::node_id_target(&public.to_string())?
-        }
-    };
-
-    // The endpoint an invite points at and the credential it carries have to
-    // belong to the same server: a client that scans the link sends the
-    // credential to the endpoint the link names, and a one-time code captured
-    // there can be replayed against this server for as long as it is valid.
-    //
-    // The check is made here, before the credential is touched: writing a
-    // pending enrollment token and then refusing would revoke the token the
-    // operator still holds.
-    //
     // Whether the invite carries a credential at all: without a client id it
     // carries none, and an invite naming another endpoint is then a wrong
-    // address rather than a leaked secret.
+    // address rather than a leaked secret. Computed before the base invite is
+    // built, because the endpoint check is stricter when a credential rides
+    // along.
     let carries_credential = cli
         .generate_invite
         .as_deref()
         .map(str::trim)
         .is_some_and(|id| !id.is_empty());
-    let server_id = config_server_identity(proxy_config.as_ref())?;
-    match &target {
-        // A ticket names the endpoint inside it, next to its addresses: it
-        // claims to be this server's own ticket, so it is checked against the
-        // identity this server runs as.
-        EndpointTarget::Ticket(ticket) => {
-            let ticket_id = ticket_node_id(ticket)?;
-            match server_id.as_deref() {
-                // The configuration says nothing about this server's identity,
-                // so the ticket cannot be checked against it. The endpoint
-                // generates an identity at start-up and writes it back, so
-                // this is the state of a configuration whose server has never
-                // run — and a stale ticket points at another endpoint.
-                None => eprintln!(
-                    "warning: the ticket names endpoint {ticket_id}, and this configuration has \
-                     no [iroh] secret_key to check it against: the endpoint generates its \
-                     identity at start-up, so a stale ticket would point at another endpoint"
-                ),
-                Some(server_id) if ticket_id != server_id => refuse_or_warn(
-                    &ticket_id,
-                    "ticket",
-                    server_id,
-                    carries_credential,
-                    Some("Use the ticket this server printed at start-up."),
-                )?,
-                Some(_) => {}
-            }
-        }
-        // A Node ID names the endpoint the server runs as, unless
-        // `--endpoint-id` overrides it. The override is a deliberate one, so a
-        // mismatch is refused when it would carry a credential and warned
-        // about when it would not.
-        EndpointTarget::NodeId(id) => {
-            if let Some(server_id) = server_id.as_deref()
-                && id != server_id
-            {
-                refuse_or_warn(
-                    id,
-                    "endpoint ID",
-                    server_id,
-                    carries_credential,
-                    Some("Drop --endpoint-id to publish the endpoint this server runs as."),
-                )?;
-            }
-        }
-    }
-
-    let (domains, domains_source) = invite_domains(&cli.invite_domains, proxy_config.as_ref());
-    // Only a relay this endpoint is actually pinned to is worth advertising: with `default`
-    // the home relay is chosen at runtime and can move, and with `disabled` there is none.
-    // Read off the resolved spec rather than the raw strings, so a `"custom"` that is really
-    // unusable (no URL, n0-operated URL) does not end up in the invite.
-    let relay = cli.invite_relay.clone().or_else(|| {
-        let iroh = proxy_config
-            .as_ref()
-            .and_then(|config| config.iroh.as_ref())?;
-        let spec = RelayModeSpec::parse(
-            iroh.relay_mode.as_deref(),
-            iroh.relay_url.as_deref(),
-            iroh.relay_auth_token
-                .as_ref()
-                .map(|token| token.expose_secret().as_str()),
-        )
-        .ok()
-        .flatten()?;
-        match spec {
-            RelayModeSpec::Custom { .. } => iroh.relay_url.clone(),
-            _ => None,
-        }
-    });
-
-    let mut invite = EndpointInvite::new(target, &domains)?
-        .with_relay(relay.as_deref())
-        .with_name(cli.invite_name.as_deref().unwrap_or_default());
+    let base = build_invite_base(
+        cli,
+        storage,
+        carries_credential,
+        &cli.invite_domains,
+        cli.invite_relay.as_deref(),
+    )
+    .await?;
+    let mut invite = base.invite;
+    let proxy_config = base.proxy_config;
+    let auth_config = base.auth_config;
+    let config_loaded = base.config_loaded;
+    let domains_source = base.domains_source;
 
     let mut two_factor_enabled = false;
     // Kept past the block below: the banner has to name the client whose
@@ -204,7 +97,8 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
                 };
                 anyhow::bail!(
                     "client \"{}\" has no [auth.clients.{}] section in {}{}; \
-                     pass --create-client to make one now, or run --generate-2fa {} first",
+                     pass --create-client to make one now, or run `nexapipe client enroll {}` \
+                     first",
                     client_id,
                     toml_key(client_id),
                     storage.describe(),
@@ -242,8 +136,16 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
             // and generating a second one is how a link that went astray is
             // revoked — the old token is replaced, not added to.
             let token = nexapipe::auth::generate_enrollment_token();
+            // An invitation is a link somebody carries around, so even the
+            // one this command issues for a freshly created client has a
+            // deadline: a token that works forever is a credential forever.
+            let expires_at = super::device::now_secs() + super::device::DEFAULT_TTL_SECS;
             storage
-                .write_pending_enrollment(client_id, &SecretString::new(token.clone()))
+                .write_pending_enrollment(
+                    client_id,
+                    &SecretString::new(token.clone()),
+                    Some(expires_at),
+                )
                 .await
                 .map_err(|e| {
                     anyhow::anyhow!(
@@ -252,7 +154,7 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
                         storage.describe()
                     )
                 })?;
-            let enrollment = InviteEnrollment::new(client_id, &token)?;
+            let enrollment = InviteEnrollment::new(client_id, &token)?.with_expiry(expires_at);
             enrolled_client = Some(client_id.to_string());
             // Whether the token was asked for or is the default for a client
             // this run created: the output says which, because the two differ
@@ -279,7 +181,7 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
         }
     } else if cli.registration {
         anyhow::bail!(
-            "--registration needs a CLIENT_ID: --generate-invite <CLIENT_ID> --registration"
+            "use `nexapipe device invite --client <CLIENT_ID>` for a one-time invitation"
         );
     }
 
@@ -359,7 +261,7 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
         );
     }
     if invite.domains.is_empty() {
-        eprintln!("warning: the invite carries no domains, pass --invite-domains to route traffic");
+        eprintln!("warning: the invite carries no domains, pass --domains to route traffic");
     }
     if link.len() > RECOMMENDED_URI_LIMIT {
         eprintln!(
@@ -383,11 +285,11 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
         println!("* copies it can authenticate as \"{client}\" until that secret is");
         println!("* rotated. Hand it to one device over one channel, then let it go.");
         println!("*");
-        println!("* The one-time form: nexapipe --generate-invite {client} --registration");
+        println!("* The one-time form: nexapipe device invite --client {client}");
         println!("* puts an enrollment token in the link instead, and the link stops");
         println!("* being a credential the moment the first device scans it.");
         println!("*");
-        println!("* To revoke it: nexapipe --generate-2fa {client} --force");
+        println!("* To revoke it: nexapipe client enroll {client} --force");
         println!("* That rotates the secret, and every device enrolled with the old");
         println!("* one has to scan again — there is no per-device revocation.");
         println!("*******************************************************************");
@@ -397,8 +299,8 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
         // is a warning nobody reads before the link is shared.
         eprintln!(
             "warning: this invite carries the long-lived TOTP secret of client \"{client}\"; \
-             `nexapipe --generate-invite {client} --registration` prints a one-time enrollment \
-             token instead, and that link stops being a credential once it has been used"
+             `nexapipe device invite --client {client}` prints a one-time enrollment token \
+             with a deadline instead, and that link stops being a credential once it has been used"
         );
         // The one-time form was available and was not used, so the reason is
         // here rather than left to be guessed at.
@@ -421,6 +323,12 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
             enrollment.client_id
         );
         println!(" copy of this link stops being a credential the moment it is used.");
+        if let Some(expires_at) = enrollment.expires_at {
+            println!(
+                " The token expires at {}, and the server refuses it after that.",
+                super::client::stamp(Some(expires_at as i64))
+            );
+        }
         println!(" Enrolling replaces the credential the device that scans it");
         println!(" will use: one that names a device gets a secret of its own,");
         println!(" and one that does not gets this client's shared secret —");
@@ -446,7 +354,8 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
     render_qr(
         &link,
         cli,
-        "Scan this with the NexaPipe app (add endpoint -> scan):",
+        Some("Scan this with the NexaPipe app (add endpoint -> scan):"),
+        "NexaPipe 2FA enrollment",
     )?;
 
     if invite.is_enrollment() {
@@ -457,11 +366,167 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
         println!("step.");
     } else {
         println!("Scanning imports the endpoint and its domains. Pass a client id to");
-        println!("--generate-invite to put that client's 2FA credentials in the code too");
+        println!("`nexapipe invite` to put that client's 2FA credentials in the code too");
         println!("(add --create-client when that client does not exist yet).");
     }
 
     Ok(())
+}
+
+/// The endpoint half of an invite, before a credential is attached.
+///
+/// Both invite commands need the same target, domains, relay and endpoint
+/// checks. The credential is the part that differs, so it is attached by the
+/// caller after this much is agreed on.
+pub(super) struct InviteBase {
+    pub invite: EndpointInvite,
+    pub proxy_config: Option<Config>,
+    pub auth_config: AuthConfig,
+    pub config_loaded: bool,
+    pub domains_source: String,
+}
+
+/// Builds the endpoint half of an invite.
+///
+/// `carries_credential` makes an endpoint mismatch fatal: a token or a secret
+/// sent to the wrong endpoint is a leak, while a wrong address alone is only
+/// a warning.
+pub(super) async fn build_invite_base(
+    cli: &Cli,
+    storage: &dyn Storage,
+    carries_credential: bool,
+    domains: &[String],
+    relay_override: Option<&str>,
+) -> anyhow::Result<InviteBase> {
+    let (proxy_config, auth_config, config_loaded) = load_config_pair(storage).await;
+
+    // A ticket invite carries the addresses in the link itself, so it is the
+    // form that still works when the endpoint's address lookup is off. A Node
+    // ID invite needs somebody to resolve it — that is what `discovery = "n0"`
+    // does.
+    let target = match (&cli.invite_ticket, &cli.endpoint_id) {
+        (Some(ticket), _) => EndpointTarget::ticket_target(ticket)?,
+        (None, Some(id)) => EndpointTarget::node_id_target(id)?,
+        (None, None) => {
+            let secret_key = proxy_config
+                .as_ref()
+                .and_then(|config| config.iroh.as_ref())
+                .and_then(|iroh| {
+                    iroh.secret_key
+                        .as_ref()
+                        .map(|key| key.expose_secret().as_str())
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "no endpoint identity in {}: set [iroh] secret_key \
+                         (see `nexapipe secret`) or pass --endpoint-id",
+                        storage.describe()
+                    )
+                })?;
+            let public: iroh::PublicKey = secret_key
+                .parse::<SecretKey>()
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "[iroh] secret_key in {} is invalid ({e})",
+                        storage.describe()
+                    )
+                })?
+                .public();
+            EndpointTarget::node_id_target(&public.to_string())?
+        }
+    };
+
+    // The endpoint an invite points at and the credential it carries have to
+    // belong to the same server: a client that scans the link sends the
+    // credential to the endpoint the link names, and a one-time code captured
+    // there can be replayed against this server for as long as it is valid.
+    //
+    // The check is made here, before the credential is touched: writing a
+    // pending enrollment token and then refusing would revoke the token the
+    // operator still holds.
+    //
+    let server_id = config_server_identity(proxy_config.as_ref())?;
+    match &target {
+        // A ticket names the endpoint inside it, next to its addresses: it
+        // claims to be this server's own ticket, so it is checked against the
+        // identity this server runs as.
+        EndpointTarget::Ticket(ticket) => {
+            let ticket_id = ticket_node_id(ticket)?;
+            match server_id.as_deref() {
+                // The configuration says nothing about this server's identity,
+                // so the ticket cannot be checked against it. The endpoint
+                // generates an identity at start-up and writes it back, so
+                // this is the state of a configuration whose server has never
+                // run — and a stale ticket points at another endpoint.
+                None => eprintln!(
+                    "warning: the ticket names endpoint {ticket_id}, and this configuration has \
+                     no [iroh] secret_key to check it against: the endpoint generates its \
+                     identity at start-up, so a stale ticket would point at another endpoint"
+                ),
+                Some(server_id) if ticket_id != server_id => refuse_or_warn(
+                    &ticket_id,
+                    "ticket",
+                    server_id,
+                    carries_credential,
+                    Some("Use the ticket this server printed at start-up."),
+                )?,
+                Some(_) => {}
+            }
+        }
+        // A Node ID names the endpoint the server runs as, unless
+        // `--endpoint-id` overrides it. The override is a deliberate one, so a
+        // mismatch is refused when it would carry a credential and warned
+        // about when it would not.
+        EndpointTarget::NodeId(id) => {
+            if let Some(server_id) = server_id.as_deref()
+                && id != server_id
+            {
+                refuse_or_warn(
+                    id,
+                    "endpoint ID",
+                    server_id,
+                    carries_credential,
+                    Some("Drop --endpoint-id to publish the endpoint this server runs as."),
+                )?;
+            }
+        }
+    }
+
+    let (domains, domains_source) = invite_domains(domains, proxy_config.as_ref());
+    // Only a relay this endpoint is actually pinned to is worth advertising: with `default`
+    // the home relay is chosen at runtime and can move, and with `disabled` there is none.
+    // Read off the resolved spec rather than the raw strings, so a `"custom"` that is really
+    // unusable (no URL, n0-operated URL) does not end up in the invite.
+    let relay = relay_override.map(str::to_string).or_else(|| {
+        let iroh = proxy_config
+            .as_ref()
+            .and_then(|config| config.iroh.as_ref())?;
+        let spec = RelayModeSpec::parse(
+            iroh.relay_mode.as_deref(),
+            iroh.relay_url.as_deref(),
+            iroh.relay_auth_token
+                .as_ref()
+                .map(|token| token.expose_secret().as_str()),
+        )
+        .ok()
+        .flatten()?;
+        match spec {
+            RelayModeSpec::Custom { .. } => iroh.relay_url.clone(),
+            _ => None,
+        }
+    });
+
+    let invite = EndpointInvite::new(target, &domains)?
+        .with_relay(relay.as_deref())
+        .with_name(cli.invite_name.as_deref().unwrap_or_default());
+
+    Ok(InviteBase {
+        invite,
+        proxy_config,
+        auth_config,
+        config_loaded,
+        domains_source,
+    })
 }
 
 /// Generates a TOTP secret for a client that does not exist yet, writes it into
@@ -477,7 +542,7 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
 /// riding on the file; an invite with `--create-client` is a promise that the
 /// server will recognise the client, so a secret that never reached the disk
 /// would produce a link that is refused on first connect.
-async fn create_client_for_invite(
+pub(super) async fn create_client_for_invite(
     storage: &dyn Storage,
     client_id: &str,
     auth_config: &AuthConfig,
@@ -581,7 +646,7 @@ pub(super) fn invite_domains(
     config: Option<&Config>,
 ) -> (Vec<String>, String) {
     if !explicit.is_empty() {
-        return (explicit.to_vec(), "from --invite-domains".to_string());
+        return (explicit.to_vec(), "from --domains".to_string());
     }
 
     if let Some(local_proxy) = config.and_then(|config| config.local_proxy.as_ref())

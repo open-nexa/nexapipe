@@ -12,7 +12,7 @@ import { acceptInvite } from '../../api/invite';
 import { takeInvitedNodeCredentials } from '../../api/credentials';
 import type { NodeConfig } from '../../types';
 import { refreshConnectionMasks } from './credentials';
-import { ensureDeviceIdFor } from './device';
+import { deviceInfo } from './device';
 import { createNode } from './nodes';
 import { writeRelayUrl } from './relay';
 import { config } from './state';
@@ -51,12 +51,12 @@ export async function applyInvite(
   // had just filed back out of the store.
   const stored = await takeInvitedNodeCredentials(accepted.nodeId);
 
-  // The name this machine answers as, asked for before the node is in the configuration. It is
-  // what makes the credential that comes back this machine's and nobody else's, and asking for
-  // it writes the configuration when the name had to be generated — a save that ran while the
-  // node was in the configuration but had no enrollment on it yet would take the pending token
-  // back out of the store.
-  const device = accepted.enrollment ? await ensureDeviceIdFor(config) : '';
+  // What this machine calls itself, read before the node is in the configuration
+  // so a save cannot take the pending token back out of the store. These are
+  // labels only: the id the server files this device under is the fingerprint
+  // of its key, worked out from the public half on both sides — nothing here is
+  // claimed as an identity.
+  const info = accepted.enrollment ? await deviceInfo() : undefined;
 
   const name = accepted.name?.trim() || undefined;
 
@@ -92,7 +92,7 @@ export async function applyInvite(
         // at all — the server answered every connection with "2FA
         // required" and nothing was proxied.
         token: stored.enrollment ?? '',
-        device,
+        ...(info && Object.keys(info).length ? { deviceInfo: info } : {}),
         // The public half of the key the backend minted for this enrollment. The
         // private one never comes here — it is in the store, and the enrollment
         // offers it from there.

@@ -61,6 +61,11 @@ if (!releaseSigningComplete) {
 
 android {
     namespace = "com.nexa.pipe"
+    // The enrollment reports this app's version as a label. BuildConfig is off
+    // by default, so ask for the generated class explicitly.
+    buildFeatures {
+        buildConfig = true
+    }
     // Compose 1.12.x (BOM 2026.09) refuses to compile against anything older
     // than API 37; AGP resolves 37 to platforms;android-37.0. targetSdk stays
     // at 36 so the app's runtime behaviour is unchanged.

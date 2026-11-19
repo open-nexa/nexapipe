@@ -546,6 +546,31 @@ fn an_enrollment_invite_round_trips_as_v2() {
     assert!(parsed.totp.is_none());
 }
 
+/// The deadline is a hint for whoever scanned the link; the server keeps the
+/// one that decides. It still has to survive the QR code, or a client cannot
+/// tell an old invitation from a live one.
+#[test]
+fn an_enrollment_deadline_round_trips_with_the_token() {
+    let enrollment = InviteEnrollment::new("client-001", "token-abc")
+        .unwrap()
+        .with_expiry(1_900_000_000);
+    let invite = EndpointInvite::new(EndpointTarget::NodeId(node_id().to_string()), &[])
+        .unwrap()
+        .with_enrollment(Some(enrollment.clone()));
+
+    let uri = invite.to_uri();
+    assert!(uri.contains("exp=1900000000"), "{uri}");
+    let parsed = EndpointInvite::from_uri(&uri).unwrap();
+    assert_eq!(parsed, invite);
+    assert_eq!(parsed.enrollment.unwrap().expires_at, Some(1_900_000_000));
+
+    let bare = InviteEnrollment::new("client-001", "tok").unwrap();
+    assert!(!bare.is_expired(1_900_000_000));
+    let expired = bare.clone().with_expiry(1_900_000_000);
+    assert!(!expired.is_expired(1_899_999_999));
+    assert!(expired.is_expired(1_900_000_000));
+}
+
 /// v=1 apps ignore parameters they do not know, so a token in a v=1 code
 /// would be dropped and the scan would import a credential-less endpoint
 /// that looks like it worked.

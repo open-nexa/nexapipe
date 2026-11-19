@@ -154,7 +154,6 @@ object BootConnector {
             relayUrl = settings.loadRelayUrl(),
             relayAuthToken = settings.loadRelayAuthToken(),
             discoveryMode = settings.loadDiscoveryMode(),
-            deviceId = settings.deviceId(),
             // Read when the sequence asks for it, and for the endpoints it
             // carries: the boot path has nothing to wait for — the key was
             // sealed in an earlier session — but the sequence is the one that

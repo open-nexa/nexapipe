@@ -11,8 +11,8 @@ pub mod state;
 pub mod totp;
 
 pub use config::{
-    AuthConfig, ClientAcl, ClientAuth, DeviceAuth, DeviceMaterial, StepVerdict, TotpAlgorithm,
-    generate_enrollment_token,
+    AuthConfig, ClientAcl, ClientAuth, DeviceAuth, DeviceInfo, DeviceMaterial, StepVerdict,
+    TotpAlgorithm, generate_enrollment_token,
 };
 pub use device_key::{parse_public_key, public_key_hex};
 pub use otpauth::{DEFAULT_ISSUER, OtpAuthUri};
@@ -21,7 +21,7 @@ pub use otpauth::{DEFAULT_ISSUER, OtpAuthUri};
 // each side, and the comment in each copy saying "keep in sync with the
 // other one" was the only thing keeping them in step.
 pub use nexapipe_proto::auth::{
-    AuthMessage, MAX_CLIENT_ID_LEN, MAX_DEVICE_ID_LEN, is_presentable_client_id,
-    is_presentable_device_id,
+    AuthMessage, MAX_CLIENT_ID_LEN, MAX_DEVICE_ID_LEN, device_id_from_public_key,
+    is_derived_device_id, is_presentable_client_id, is_presentable_device_id,
 };
 pub use totp::{AuthError, TotpValidator, Verified};

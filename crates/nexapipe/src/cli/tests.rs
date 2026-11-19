@@ -67,7 +67,7 @@ fn the_domains_of_an_invite_come_from_the_first_source_that_has_any() {
 
     let (domains, source) = invite_domains(&explicit, Some(&with_local));
     assert_eq!(domains, explicit);
-    assert_eq!(source, "from --invite-domains");
+    assert_eq!(source, "from --domains");
 
     let (domains, source) = invite_domains(&[], Some(&with_local));
     assert_eq!(domains, vec!["from-local.example".to_string()]);

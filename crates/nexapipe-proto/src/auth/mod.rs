@@ -61,6 +61,23 @@
 //! field ignores it rather than failing, so a client and a server built either
 //! side of the change still complete a handshake.
 //!
+//! ## What a device id is
+//!
+//! A device that holds a key is known by the **fingerprint of that key** —
+//! see [`device_id_from_public_key`]. Both sides work it out on their own, so
+//! nobody has to name the device: the operator hands out an invitation, and the
+//! device says what it is when it connects.
+//!
+//! The name a device calls itself is a *label*, not an identity: it rides
+//! along in the enrollment (`label`, `platform`, `model`, `app_version`) and is
+//! kept for the operator to read. Two devices may carry the same label, which
+//! is what makes the identity a fingerprint and not a name.
+//!
+//! It is `None` for a device that was never given a name — every client that
+//! existed before per-device credentials — and a peer that does not know the
+//! field ignores it rather than failing, so a client and a server built either
+//! side of the change still complete a handshake.
+//!
 //! # The two forms
 //!
 //! A message travels in one of two forms, and the payload's first byte says
@@ -100,9 +117,11 @@
 
 mod challenge;
 mod codec;
+mod device;
 mod message;
 
 pub use challenge::{ChallengeError, challenge_message, close_code, hmac_challenge};
+pub use device::{device_id_from_public_key, is_derived_device_id};
 pub use message::AuthMessage;
 
 use std::fmt;

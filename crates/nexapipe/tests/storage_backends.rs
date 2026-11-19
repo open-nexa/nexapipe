@@ -10,7 +10,7 @@
 //! the same scenario, the same answers, whether the caller names a path or a
 //! store.
 
-use nexapipe::auth::DeviceMaterial;
+use nexapipe::auth::{DeviceInfo, DeviceMaterial};
 use nexapipe::config::{load_config, load_config_with_auth};
 use nexapipe::storage::{FileStorage, Storage};
 
@@ -143,6 +143,7 @@ async fn a_device_credential_is_written_beside_the_clients_own() {
             nexapipe::storage::DeviceCredential::Secret(SecretString::new(
                 "MZXW6YTBOI======".to_string(),
             )),
+            DeviceInfo::default(),
         )
         .await
         .expect("the device credential is written");

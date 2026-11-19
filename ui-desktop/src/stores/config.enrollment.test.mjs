@@ -101,7 +101,8 @@ globalThis.window = {
  *
  * The payload is the *shape* of the configuration: the token itself is in the
  * credential store, and the payload says only that this node is waiting for a
- * credential and under which device name.
+ * credential and what this device says about itself. The id is not a claim in
+ * the payload: it is the fingerprint of the key, worked out on both sides.
  */
 payloads.set(
   'nexapipe.config',
@@ -116,11 +117,14 @@ payloads.set(
         domains: ['example.com'],
         deviceKey: '',
         twoFactor: { clientId: '', secret: '', algorithm: 'sha1' },
-        enrollment: { clientId: 'client-1', token: '', device: 'device-1' },
+        enrollment: {
+          clientId: 'client-1',
+          token: '',
+          deviceInfo: { label: 'laptop', platform: 'linux' },
+        },
       },
     ],
     domains: [],
-    deviceId: 'nexa-test-device',
   }),
 );
 
@@ -168,25 +172,21 @@ function freshStore() {
   return store;
 }
 
-test('a restart keeps the device the enrollment names', () => {
+test('a restart keeps the labels the enrollment reported', () => {
   const store = useConfigStore();
 
   const node = store.config.nodes.find((candidate) => candidate.id === 'node-1');
   assert.ok(node, 'the node is in the configuration');
   assert.equal(node.enrollment.token, 'token-1', 'the token is read back from the store');
-  assert.equal(
-    node.enrollment.device,
-    'device-1',
-    'the device the enrollment names is kept: enrolling without one answers with the ' +
-      "client's own secret, which is what makes a revocation rotate every other device",
+  assert.deepEqual(
+    node.enrollment.deviceInfo,
+    { label: 'laptop', platform: 'linux' },
+    'the labels travel with the token: the id comes from the key, not from a name in the payload',
   );
 });
 
 test('the enrollment token the backend filed reaches the node the proxy is given', async () => {
   const store = freshStore();
-  // A machine that already has a name, so the import does not have to ask the
-  // operating system for one.
-  store.config.deviceId = 'nexa-test-device';
 
   answers.set('accept_invite', {
     nodeId: 'node-2',
@@ -233,7 +233,7 @@ test('the persisted payload holds no token', async () => {
     ticket: '',
     endpointId: '',
     domains: [],
-    enrollment: { clientId: 'client-token', token: 'token-secret', device: 'device-1' },
+    enrollment: { clientId: 'client-token', token: 'token-secret', deviceInfo: { label: 'laptop' } },
   });
 
   // The save is debounced, so the mirror that writes the payload runs a

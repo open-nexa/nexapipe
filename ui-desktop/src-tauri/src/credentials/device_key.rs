@@ -1,19 +1,19 @@
-//! The device key: one for the machine, as there is one name for it.
+//! The device key: one for the machine, as there is one identity for it.
 //!
 //! A key belongs to the *machine*, not to the node that happens to enroll
-//! with it. The server files a credential under a device name, and that name is
-//! the machine's (`ensureDeviceIdFor` in the frontend keeps one for the life of
-//! the install), while the node is a server: it is named by the Node ID of the
-//! backend, and that changes when the backend is rebuilt.
+//! with it. The server files a credential under the fingerprint of its public
+//! key, and that fingerprint is the machine's, while the node is a server: it
+//! is named by the Node ID of the backend, and that changes when the backend is
+//! rebuilt.
 //!
 //! So a key filed per node is a key that changes with the server, and a
 //! machine that answers a rebuilt server with a different key is a different
-//! device to it — the server sees the same name with another public half and
-//! refuses the enrollment as a takeover, for a reason that names nothing on
-//! this side.
+//! device to it — the server sees a fingerprint it already holds with another
+//! public half and refuses the enrollment as a takeover, for a reason that
+//! names nothing on this side.
 //!
 //! Two entries, then: the key a node enrolled with, and the key the machine
-//! answers with. The first is what the server holds under the machine's name;
+//! answers with. The first is what the server holds under that fingerprint;
 //! the second is what every node without a key of its own offers. They are the
 //! same key in the ordinary case, and the machine's is never replaced once it
 //! exists — the servers holding it are the ones that would stop recognising

@@ -86,12 +86,25 @@ pub struct ClientAuth {
     ///
     /// `None` means no enrollment is outstanding, so a client with no token
     /// cannot talk the server into issuing one: enrollment is only ever opened
-    /// by `--generate-invite --registration`, which writes it here.
+    /// by `nexapipe device invite`, which writes it here.
     ///
     /// A [`SecretString`]: an unspent token is a credential, and it is wiped
     /// when it is spent or when the config is dropped.
     #[serde(default)]
     pub pending_enrollment: Option<SecretString>,
+    /// When the pending enrollment token stops being good, as a Unix
+    /// timestamp.
+    ///
+    /// An invitation is a link somebody carries around, and a link that works
+    /// forever is a link that is still working when it is found by somebody
+    /// else. So an invitation has a deadline, and this is where it is kept:
+    /// beside the token it belongs to, in the configuration, so that a restart
+    /// does not hand the link a new life.
+    ///
+    /// `None` is a token without a deadline — what an invitation written by
+    /// hand says, and what every invitation issued before this one said.
+    #[serde(default)]
+    pub pending_enrollment_expires_at: Option<u64>,
     /// Credentials issued to individual devices under this client.
     ///
     /// A device here has a secret of its own, and the `secret` above is the
@@ -185,6 +198,10 @@ impl std::fmt::Debug for ClientAuth {
                 "pending_enrollment",
                 &crate::config::redacted(&self.pending_enrollment),
             )
+            .field(
+                "pending_enrollment_expires_at",
+                &self.pending_enrollment_expires_at,
+            )
             .field("devices", &self.devices)
             .field("unnamed_device_allowed", &self.unnamed_device_allowed)
             .field("last_used", &self.last_used)
@@ -245,6 +262,16 @@ impl ClientAuth {
     pub fn is_enrollment_locked_out(&self) -> bool {
         self.enrollment_locked_until
             .is_some_and(|until| unix_now() < until)
+    }
+
+    /// Whether the pending enrollment token is past its deadline.
+    ///
+    /// A token without a deadline never expires: that is what an invitation
+    /// written by hand says, and it is the older arrangement, not the one an
+    /// issued invitation uses.
+    pub fn enrollment_expired(&self, now: u64) -> bool {
+        self.pending_enrollment_expires_at
+            .is_some_and(|at| now >= at)
     }
 
     /// Clears an enrollment lockout whose time has run out.

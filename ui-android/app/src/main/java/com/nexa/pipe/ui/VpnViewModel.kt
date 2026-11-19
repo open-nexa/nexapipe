@@ -99,17 +99,6 @@ class VpnViewModel : ViewModel() {
     val relayToken = kotlinx.coroutines.flow.MutableStateFlow(RelayToken())
 
     /**
-     * What this install calls itself when it authenticates.
-     *
-     * Generated once on the device and then kept: a server can only revoke, or
-     * rate-limit, one device of a client if that device has a name of its own,
-     * and a name that changed between runs would leave a stale row behind on
-     * every single connect. Empty until [loadSettings] has run, which is also
-     * what leaves nothing to send on a handshake made before then.
-     */
-    val deviceId = kotlinx.coroutines.flow.MutableStateFlow("")
-
-    /**
      * Whether the credentials on this device are actually encrypted at rest.
      *
      * Refreshed wherever a credential is written, which is the only moment the
@@ -465,7 +454,6 @@ class VpnViewModel : ViewModel() {
             vpnTakeoverChoice.value = manager.loadVpnTakeoverChoice()
             autoConnectOnBoot.value = manager.autoConnectOnBoot()
             vpnConsentMissing.value = manager.vpnConsentMissing()
-            deviceId.value = manager.deviceId()
             // Read after the load, because building a SettingsManager runs the
             // migration that re-seals whatever older versions left in plaintext —
             // on a device with a broken keystore that is the write that fails.
@@ -1237,7 +1225,6 @@ class VpnViewModel : ViewModel() {
                                     // the sequence cannot see a value that changed
                                     // underneath it.
                                     discoveryMode = discoveryMode.value,
-                                    deviceId = deviceId.value,
                                     // Read after the wait below, not here: the
                                     // key is sealed by the import that armed the
                                     // enrollment, and a map built before that

@@ -82,3 +82,27 @@ pub(super) async fn load_auth_config(storage: &dyn Storage) -> (AuthConfig, bool
 pub(super) fn toml_key(key: &str) -> String {
     toml_edit::Key::new(key).to_string()
 }
+
+/// `nexapipe config show`: the text the store holds as its configuration,
+/// exactly as the server is handed it.
+///
+/// The store speaks text and the server parses it, so printing the text rather
+/// than re-rendering a parsed model is what makes this the configuration the
+/// server reads — comments the file store keeps included.
+pub(crate) async fn print_config(storage: &dyn Storage) -> anyhow::Result<()> {
+    let Some(text) = storage.config().await? else {
+        anyhow::bail!("{} holds no configuration", storage.describe());
+    };
+    let text = text.expose_secret();
+    print!("{text}");
+    if !text.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+/// `nexapipe config path`: the store's own description of itself — the file,
+/// or the database, that the instance is reading.
+pub(crate) fn print_config_path(storage: &dyn Storage) {
+    println!("{}", storage.describe());
+}

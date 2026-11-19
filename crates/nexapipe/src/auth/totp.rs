@@ -413,6 +413,7 @@ mod tests {
             allow_ports: None,
             allow_ports_strict: false,
             pending_enrollment: None,
+            pending_enrollment_expires_at: None,
             devices: HashMap::new(),
             unnamed_device_allowed: true,
             last_used: None,
@@ -441,6 +442,7 @@ mod tests {
             allow_ports: None,
             allow_ports_strict: false,
             pending_enrollment: None,
+            pending_enrollment_expires_at: None,
             devices: HashMap::from([(
                 "laptop".to_string(),
                 crate::auth::DeviceAuth {
@@ -449,6 +451,10 @@ mod tests {
                     created_at: String::new(),
                     last_used: None,
                     last_used_step: None,
+                    label: None,
+                    platform: None,
+                    model: None,
+                    app_version: None,
                 },
             )]),
             unnamed_device_allowed: true,
@@ -482,6 +488,10 @@ mod tests {
                 created_at: String::new(),
                 last_used: None,
                 last_used_step: None,
+                label: None,
+                platform: None,
+                model: None,
+                app_version: None,
             },
         );
         (config, key)

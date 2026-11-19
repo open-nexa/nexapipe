@@ -78,6 +78,69 @@ impl DeviceKey {
     pub fn secret_key(&self) -> &iroh::SecretKey {
         &self.key
     }
+
+    /// The id this device is known by: the fingerprint of its public half.
+    ///
+    /// The same key always gives the same id, and the server works the same id
+    /// out of the public half it is offered — so a device knows its own
+    /// identity before it connects, and nobody has to name it.
+    pub fn device_id(&self) -> String {
+        device_id_of_key(&self.key)
+    }
+}
+
+/// The id a key is known by, worked out the way the server works it out.
+///
+/// One place, so the two cannot disagree: a device that enrolled under one id
+/// and handshakes under another is a device the server refuses, and it looks
+/// exactly like a takeover.
+pub(crate) fn device_id_of_key(key: &iroh::SecretKey) -> String {
+    nexapipe_proto::auth::device_id_from_public_key(key.public().as_bytes())
+}
+
+/// What a device says about itself, for the server to keep and the operator to
+/// read.
+///
+/// Four labels and no identity: the device is known by the fingerprint of its
+/// key, and two devices may call themselves the same thing — which is the
+/// point of the labels being labels.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceInfo {
+    /// The name the device calls itself: the hostname on a desktop, the model
+    /// on a phone.
+    pub label: Option<String>,
+    /// The platform the device runs on: `android`, `macos`, `windows`, `linux`.
+    pub platform: Option<String>,
+    /// The model the device runs on: the phone's model, the operating
+    /// system's version.
+    pub model: Option<String>,
+    /// The version of the app the device runs.
+    pub app_version: Option<String>,
+}
+
+impl DeviceInfo {
+    /// The four labels, in the order they are asked for.
+    pub fn new(
+        label: Option<&str>,
+        platform: Option<&str>,
+        model: Option<&str>,
+        app_version: Option<&str>,
+    ) -> Self {
+        Self {
+            label: label.map(str::to_string),
+            platform: platform.map(str::to_string),
+            model: model.map(str::to_string),
+            app_version: app_version.map(str::to_string),
+        }
+    }
+
+    /// Whether this says anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.label.is_none()
+            && self.platform.is_none()
+            && self.model.is_none()
+            && self.app_version.is_none()
+    }
 }
 
 impl fmt::Debug for DeviceKey {

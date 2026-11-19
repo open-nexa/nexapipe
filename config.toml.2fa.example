@@ -17,8 +17,8 @@
 #
 # Every command in the comments below takes `--config config.toml` rather than
 # `--config config.toml.2fa.example` on purpose: `--generate-2fa` and
-# `--generate-invite --registration` **write back into the file they are pointed
-# at**, so aiming them at this example would rotate the secrets in git.
+# `device invite` **write back into the file they are pointed at**, so aiming
+# them at this example would rotate the secrets in git.
 #
 # The secrets below are the only credential gating the iroh listener, so keep
 # the file private: `chmod 600` it. The server does **not** refuse to start on
@@ -157,49 +157,52 @@ issuer = "NexaPipe"
 #
 # That code carries the TOTP secret in the clear — it is a password that happens
 # to be shaped like an address, and it stays a password for as long as the
-# secret lives. The enrollment form below is the one that is not:
+# secret lives. `--registration` used to be the one-time form; it is removed now
+# and fails with a pointer to the device invitation, which also has a deadline:
 #
-#   nexapipe --generate-invite client-001 --registration --config config.toml
+#   nexapipe device invite --client client-001 --config config.toml
+#   nexapipe device invite --client client-001 --ttl 2h --config config.toml
 #
 # It writes a one-time enrollment token into this file as
-# `[auth.clients.client-001] pending_enrollment` and puts the token in the link
-# instead of the secret. The first device to connect trades it for a freshly
-# generated secret, and the server burns the token and stores that secret in the
-# same write, so a copy of the link stops being a credential the moment it is
-# used. Until then it is one: an unspent link hands out this client's secret to
-# whoever holds it, so deliver it to the device over a channel you already
-# trust and do not leave it sitting in a chat log or a ticket. Two consequences:
-# which secret enrollment rotates depends on whether the device named itself — a
-# named device is filed under `[auth.clients.client-001.devices.<name>]`, so only
-# its own credential changes, while one that names none is filed under this
-# client's `secret` and takes every device sharing it along, so they all have to
-# scan again; and generating another `--registration` invite replaces the
-# outstanding token, which is how a link that never arrived gets revoked. Never
-# write the key by hand — let the command own it.
+# `[auth.clients.client-001] pending_enrollment`, with its deadline in
+# `pending_enrollment_expires_at` (a Unix timestamp), and puts the token and the
+# deadline in the link as `enroll=` and `exp=`. The first device to connect
+# before the deadline is filed under the fingerprint of its key, and the server
+# burns the token in the same write, so a copy of the link stops being a
+# credential the moment it is used. The lifetime defaults to 15m (1s..30d);
+# after it passes the server refuses the token without counting it as a guess.
+# Until it is used, an unspent link is still a credential: deliver it to the
+# device over a channel you already trust and do not leave it sitting in a chat
+# log or a ticket. Generating another invitation replaces the outstanding token,
+# which is how a link that never arrived gets revoked. Never write the key by
+# hand — let the command own it.
+#
+# The device reports its own `label`, `platform`, `model` and `app_version` when
+# it enrolls; there is no device name for an operator to pick, and two devices
+# may carry the same label. The device is filed under `d-` plus the first 16 hex
+# characters of the SHA-256 of its Ed25519 public key. Old rows keyed by a name
+# are no longer recognised — those devices have to scan a fresh invitation.
 #
 # The token is only worth anything while the server runs the 2FA handshake, so
-# the enrollment form needs `enabled = true` here — which is what this file
+# the device invitation needs `enabled = true` here — which is what this file
 # ships. With 2FA off the server never asks anybody for a credential, and the
-# invite falls back to carrying the secret, with a warning saying so.
+# invitation can never be exchanged.
 #
 # Warning: changing algorithm, time_step or digits here does NOT change what the
 # app does once it has scanned the code. Those values are only read when the
 # enrollment QR code is generated; keep them stable after clients are enrolled.
 #
-# Both invite forms above need the client to exist already, since they hand out
-# the secret this file holds. To create one and invite it in a single run, add
-# --create-client — it generates the secret, writes it here and prints an
-# invite for it, which is two commands folded into one:
+# The endpoint invite above needs the client to exist already, since it hands
+# out the secret this file holds. To create one and invite a device in a single
+# run, add --create-client to the device invitation — it generates the client's
+# secret, writes it here and prints an expiring enrollment link, which is two
+# commands folded into one:
+#
+#   nexapipe device invite --client client-003 --create-client --config config.toml
+#
+# --generate-invite has its own --create-client for the endpoint-share form:
 #
 #   nexapipe --generate-invite client-003 --create-client --config config.toml
-#   nexapipe --generate-invite client-003 --create-client --registration
-#
-# A client that this run creates is the one case where the enrollment form is
-# the default: the secret it mints was in nobody's hands a moment earlier, so
-# nothing is lost by the first device trading the token for a fresh one — and
-# the link stops being a credential the moment it is scanned. A client that
-# exists already keeps the secret it has, and the link that carries it is a
-# password for as long as that secret lives.
 #
 # It only ever creates a client that is missing entirely: run against one that
 # already has a secret it reuses that secret rather than issuing a second, so an
@@ -208,6 +211,10 @@ issuer = "NexaPipe"
 [auth.clients.client-001]
 secret = "JBSWY3DPEHPK3PXP" # Base32-encoded secret
 created_at = "1723756800"
+# While a device invitation is outstanding, `device invite` writes these two
+# alongside the secret; the deadline is a Unix timestamp:
+# pending_enrollment = "one-time-token"
+# pending_enrollment_expires_at = 1763577600
 # Optional per-client host authorization. Patterns use the same spelling as a
 # route's host_pattern — an exact name or a "*.suffix" wildcard,
 # case-insensitively. Left unset, the client may reach every route (the
@@ -258,58 +265,77 @@ created_at = "1723756800"
 # operator's, and the server does not rewrite it for its own counters. They are
 # still read from here, so a file written before the state file existed keeps
 # its lockouts.
-# Nothing to configure; and `pending_enrollment`, written by the enrollment
-# command above, should never be edited by hand either.
+# Nothing to configure; and `pending_enrollment` with its
+# `pending_enrollment_expires_at`, written by `device invite` above, should never
+# be edited by hand either.
 #
-# A device that named itself at enrollment is filed below rather than in the
-# `secret` above, which is what lets one be revoked without touching the rest —
-# including the devices still answering as nobody, which is what that one is for.
-# Nothing here is written by hand either: enrollment files a device on its own,
-# and so does `nexapipe client add client-001 --device <name>`. A client with no
-# `devices` table at all — which is every client written before this existed —
-# authenticates exactly as it always did.
+# A device that enrolls is filed below rather than in the `secret` above, which
+# is what lets one be revoked without touching the rest — including devices with
+# no row of their own, which is what that secret is for. The row is keyed by the
+# device id: `d-` plus the first 16 hex characters of the SHA-256 of the device's
+# Ed25519 public key. The `label`, `platform`, `model` and `app_version` are what
+# the device reported when it enrolled — for reading, not for addressing; two
+# devices may carry the same label. An old row keyed by a name is a legacy
+# entry: to move that device onto the new scheme, revoke the old row and scan a
+# fresh invitation. Nothing here is written by hand either: enrollment files a
+# device on its own. A client with no
+# `devices` table at all authenticates exactly as it always did.
 #
 # An entry below carries exactly one credential, and it is one of two kinds.
-# The `secret` on the laptop is a TOTP seed issued at enrollment, and that device
-# answers each handshake the way clients always have — an HMAC keyed by the seed
-# plus a code. A `public_key` is the other kind: the half of an Ed25519 pair
-# whose private half stays on the device, which proves itself by signing the
-# same challenge instead. What the server holds then cannot be replayed: a copy
-# of this file is no way in "as that device", where a copied `secret` is the
+# The usual kind is `public_key`: the half of an Ed25519 pair whose private half
+# stays on the device, which proves itself by signing the same challenge instead
+# of returning a code. What the server holds then cannot be replayed: a copy of
+# this file is no way in "as that device", where a copied `secret` is the
 # credential itself. That is not the same as no way in at all — this file still
 # holds the client's own `secret`, and the paragraph below says what that one is
 # worth. And no code has to come from anywhere, which is what a device that runs
 # unattended wants. A wrong signature counts toward the lockout exactly like a
-# wrong code. Exactly one kind per entry: both, or neither, is refused at load
-# rather than one of two credentials being silently ignored.
+# wrong code. The other kind is a TOTP `secret` seed, which answers the way
+# clients always have — an HMAC keyed by the seed plus a code. Exactly one kind
+# per entry: both, or neither, is refused at load rather than one of two
+# credentials being silently ignored.
 #
-# The shell has the same two forms — `client add client-001 --device <name>`
-# issues a seed; the key kind is one word more:
+# The shell registers the key kind directly; the device id is derived from it:
 #
-#   nexapipe client add client-001 --device phone --public-key <64 hex chars>
+#   nexapipe client add client-001 --public-key <64 hex chars>
 #
 # The public half is what an operator registers; the device generates the pair,
 # and the private half never travels. `client list` marks such a device `key`.
 #
-# The `secret` above is still a credential of its own: it is what a device that
-# names none answers with. Revoking a device strikes one entry out of the table
-# below and leaves it standing, so a secret that has been handed out — in an
-# invite link, or to every install that enrolled before this table existed —
-# keeps working for anyone who simply leaves the device name out. Set
-# `unnamed_device_allowed = false` once every device of this client has one of
+# The `secret` above is still a credential of its own: it is what a device with
+# no row of its own answers with. Revoking a device strikes one entry out of the
+# table below and leaves it standing, so a secret that has been handed out — in
+# an invite link, or to every install that enrolled before this table existed —
+# keeps working for anyone who simply leaves the device unnamed. Set
+# `unnamed_device_allowed = false` once every device of this client has a row of
 # its own, and that shared secret stops being a way in:
 #
 #   unnamed_device_allowed = false
 #
 # Left out, or true, the client answers as it always has. Turning it off before
-# every device is enrolled locks out the ones that never named themselves.
-[auth.clients.client-001.devices.laptop]
-secret = "LAPTOPSECRET"     # Base32-encoded TOTP seed, issued at enrollment
+# every device is enrolled locks out the ones that have no row.
+[auth.clients.client-001.devices.d-d2a8b0ae050f678c]
+public_key = "47247688f12eb332514f7af72b362dd4cb9b63321794d62408d503ce52812837"  # 64 hex characters; the row key is the fingerprint of this key
+label = "laptop"            # what the device calls itself, not an identity
+platform = "linux"
+model = "ThinkPad X1"
+app_version = "1.2.0"
 created_at = "1723756800"
 
-# The same table, one device later, carrying the other kind of credential:
-# [auth.clients.client-001.devices.phone]
-# public_key = "a1b2c3…"    # 64 hex characters, the public half of an Ed25519 key
+# A second device, with the same label — allowed, because the label is not the
+# key the row is filed under:
+# [auth.clients.client-001.devices.d-7b3e9d1c4a6f8052]
+# public_key = "f0e9d8…"
+# label = "laptop"
+# platform = "android"
+# model = "Pixel 9"
+# app_version = "1.2.0"
+# created_at = "1723756800"
+
+# The other credential kind is still supported — a TOTP seed instead of a key:
+# [auth.clients.client-001.devices.d-2c4e6a8b0d1f3579]
+# secret = "DEVICESEED"      # Base32-encoded TOTP seed
+# label = "old-phone"
 # created_at = "1723756800"
 
 [auth.clients.client-002]

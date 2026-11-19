@@ -19,7 +19,7 @@
 //! `with_env_or` for the ones that need an `Env` first, `catching_panic`
 //! for the ones that do not.
 
-use crate::auth::{DeviceKey, Enrollment, TotpAlgorithm, TwoFactorAuth};
+use crate::auth::{DeviceInfo, DeviceKey, Enrollment, TotpAlgorithm, TwoFactorAuth};
 use crate::discovery::DiscoveryMode;
 use crate::relay::RelayModeSpec;
 #[cfg(all(feature = "tun-proxy", target_os = "android"))]
@@ -78,9 +78,10 @@ pub(crate) static TWO_FACTOR: Mutex<Option<(String, SecretString, String)>> = Mu
 /// One endpoint's TOTP credentials, as Kotlin filed them: client id, secret,
 /// algorithm, and the device the secret was issued to.
 ///
-/// The last field is what decides whether a handshake claims a device name, so
-/// it travels with the triple rather than being read from `DEVICE_ID` at apply
-/// time: a pair issued to the client has to keep answering as the client.
+/// The last field is what decides whether a handshake claims a device id, so
+/// it travels with the triple rather than being read from a machine-wide name
+/// at apply time: a pair issued to the client has to keep answering as the
+/// client.
 ///
 /// The secret is a [`SecretString`], for the reason the table above gives.
 type NodeCredential = (String, SecretString, String, Option<String>);
@@ -113,16 +114,16 @@ pub(crate) static NODE_ENROLLMENT: Lazy<Mutex<HashMap<String, (String, SecretStr
 // yet is one that is about to enroll.
 pub(crate) static NODE_DEVICE_KEYS: Lazy<Mutex<HashMap<String, iroh::SecretKey>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-/// The name this install answers as, injected once by Kotlin
-/// (`nativeSetDeviceId`) rather than per credential.
+/// What this install says about itself, injected once by Kotlin
+/// (`nativeSetDeviceInfo`) rather than per credential.
 ///
-/// One name for the whole install, because the device is the phone and not the
-/// server. It names **enrollments only** — see `two_factor_auth` for why every
-/// other credential answers unnamed — and it is set from its own entry point
-/// rather than as one more argument on the calls that already exist, so a
-/// Kotlin side that has never heard of devices keeps calling them as it does
-/// and simply enrolls as the unnamed one.
-pub(crate) static DEVICE_ID: Mutex<Option<String>> = Mutex::new(None);
+/// These four are labels and not an identity: the device is known by the
+/// fingerprint of its key, worked out from the public half on both sides. One
+/// set for the whole install, because the device is the phone and not the
+/// server, and the same description goes with every enrollment this phone
+/// spends. An older Kotlin side that has never heard of this simply sends none,
+/// and the labels are omitted from the enrollment.
+pub(crate) static DEVICE_INFO: Mutex<Option<DeviceInfo>> = Mutex::new(None);
 
 // Generation counter: incremented each time nativeStopProxy releases the endpoint.
 // nativeStartIroh compares this before/after bind(); if a stop happened in between, the late
@@ -457,18 +458,17 @@ pub(crate) fn read_jstring(env: &Env<'_>, s: &JString<'_>) -> Option<String> {
     s.try_to_string(env).ok()
 }
 
-/// The name this install answers as, if Kotlin gave it one.
+/// What this install says about itself, when Kotlin gave it a description.
 ///
-/// An empty name is not a name: it is a field left blank, and sending it would
-/// have the server refuse the handshake for a reason about printable ASCII
-/// rather than about this side.
-pub(crate) fn device_id() -> Option<String> {
-    DEVICE_ID
+/// Labels only: the id a device is filed under is the fingerprint of its key,
+/// derived on both sides from the public half. Nothing here is a claim about
+/// identity, and an empty description is simply no description.
+pub(crate) fn device_info() -> Option<DeviceInfo> {
+    DEVICE_INFO
         .lock()
         .ok()
         .and_then(|guard| guard.clone())
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty())
+        .filter(|info| !info.is_empty())
 }
 
 // ============================================================
