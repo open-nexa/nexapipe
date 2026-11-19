@@ -767,8 +767,12 @@ jobs:
             runner: ubuntu-22.04-arm
           - label: macos-x64
             runner: macos-15-intel
+          # The arm64 half of the same image: `macos-15` is arm64 by default,
+          # and `macos-15-intel` is the x64 one. `macos-14` used to be the
+          # arm64 label and no longer has a runner — the job was cancelled
+          # while queued, which a required check reads as a failure.
           - label: macos-arm64
-            runner: macos-14
+            runner: macos-15
           - label: windows-x64
             runner: windows-latest
           - label: windows-arm64
