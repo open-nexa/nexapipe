@@ -333,6 +333,22 @@ impl NodeInput {
         if secret.is_empty() && self.device_key.is_none() {
             return None;
         }
+        // A device key on its own is not an issued credential: an invite that
+        // has just been imported carries the key it will offer at enrollment
+        // but no client id yet — that arrives with the credential the server
+        // answers with. Reporting `Some` here would make the proxy treat the
+        // pending invite as already enrolled and authenticate as an empty
+        // client id, which no server has an entry for.
+        if secret.is_empty()
+            && self
+                .two_factor_client_id
+                .as_deref()
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        {
+            return None;
+        }
         Some(NodeTwoFactor {
             client_id: self.two_factor_client_id.clone().unwrap_or_default(),
             secret: secret.to_string(),
@@ -616,6 +632,28 @@ mod tests {
         assert_eq!(two_factor.secret, "", "a key node stores no seed");
         assert_eq!(two_factor.device.as_deref(), Some("laptop"));
         assert_eq!(node.device_key.as_deref(), Some("ab".repeat(32).as_str()));
+    }
+
+    /// A freshly imported enrollment invite carries the device key it will
+    /// offer but no credential yet: the client id arrives with the answer from
+    /// the server. Reporting `Some` here would make the proxy treat the invite
+    /// as already enrolled, skip the enrollment, and authenticate as an empty
+    /// client id that no server has an entry for.
+    #[test]
+    fn a_pending_key_only_invite_is_not_an_issued_credential() {
+        let mut node = node();
+        node.device_key = Some("ab".repeat(32));
+        node.enrollment_token = Some("0123456789abcdef".to_string());
+        node.enrollment_client_id = Some("client-001".to_string());
+
+        assert!(
+            node.two_factor().is_none(),
+            "a key alone is not a credential the server issued"
+        );
+        assert!(
+            node.enrollment().is_some(),
+            "the invitation still has to be spent"
+        );
     }
 
     #[test]

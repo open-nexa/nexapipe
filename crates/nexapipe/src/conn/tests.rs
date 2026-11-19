@@ -374,9 +374,30 @@ fn an_outstanding_token_is_accepted() {
             &cfg,
             "alice",
             "0123456789abcdef",
-            &enrollment_identity(None, None)
+            // A named device: a request that offers neither a name nor a key
+            // is refused on its own account, before the token is spent.
+            &enrollment_identity(Some("laptop"), None)
         ),
         EnrollmentVerdict::Accept
+    );
+}
+
+/// A request that offers neither a key nor a name has nowhere to be filed but
+/// the client's own `secret` — the credential every other device of that
+/// client answers with. Spending the token there would rotate it and lock all
+/// of them out, so the request is refused before anything is issued, and it is
+/// not counted as a guess at the token.
+#[test]
+fn an_enrollment_with_neither_a_key_nor_a_name_is_refused() {
+    let cfg = auth_with_pending(Some("0123456789abcdef"));
+    assert_eq!(
+        enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcdef",
+            &enrollment_identity(None, None)
+        ),
+        EnrollmentVerdict::Refuse { counted: false }
     );
 }
 
@@ -520,6 +541,65 @@ fn a_failed_write_puts_the_clients_secret_back() {
     undo_enrolled_secret(&mut cfg, "alice", slot, "0123456789abcdef");
 
     assert_eq!(cfg.clients["alice"].secret, shared);
+}
+
+/// The deadline is part of the invitation, not of the credential: a failed
+/// write has to put it back with the token, or an invitation that had already
+/// run out becomes one that never expires.
+#[test]
+fn a_failed_write_puts_the_invitation_deadline_back() {
+    let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+    // A deadline in the past, so the restored invitation is still refused.
+    let deadline = 1_700_000_000;
+    cfg.clients
+        .get_mut("alice")
+        .unwrap()
+        .pending_enrollment_expires_at = Some(deadline);
+
+    let slot = issue_enrolled_secret(&mut cfg, "alice", &device_secret("laptop", "NEWSECRET"));
+    assert!(
+        cfg.clients["alice"].pending_enrollment_expires_at.is_none(),
+        "a successful enrollment clears the deadline"
+    );
+
+    undo_enrolled_secret(&mut cfg, "alice", slot, "0123456789abcdef");
+
+    let alice = &cfg.clients["alice"];
+    assert_eq!(alice.pending_enrollment_expires_at, Some(deadline));
+    assert_eq!(
+        enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcdef",
+            &enrollment_identity(Some("laptop"), None)
+        ),
+        EnrollmentVerdict::Refuse { counted: false },
+        "the restored invitation is still past its deadline"
+    );
+}
+
+/// The unnamed slot clears the deadline on success too, so it has to restore
+/// it on failure just like the device slot does.
+#[test]
+fn a_failed_write_puts_the_deadline_back_on_the_unnamed_slot() {
+    let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+    let deadline = 1_700_000_000;
+    cfg.clients
+        .get_mut("alice")
+        .unwrap()
+        .pending_enrollment_expires_at = Some(deadline);
+
+    let slot = issue_enrolled_secret(
+        &mut cfg,
+        "alice",
+        &IssuedCredential::SharedSecret(SecretString::new("NEWSECRET".to_string())),
+    );
+    undo_enrolled_secret(&mut cfg, "alice", slot, "0123456789abcdef");
+
+    assert_eq!(
+        cfg.clients["alice"].pending_enrollment_expires_at,
+        Some(deadline)
+    );
 }
 
 /// The token is a credential like any other: guessing at it has to cost
@@ -704,7 +784,9 @@ fn an_enrollment_may_not_take_over_a_device_that_is_already_there() {
 
 /// The same table, a name that is not in it: an enrollment is how a device
 /// that is not there yet gets one, and refusing those would make the table
-/// impossible to grow past the first device.
+/// impossible to grow past the first device. An unnamed request is not such a
+/// device — it would land on the client's own secret instead — so it is
+/// refused even when the table has room.
 #[test]
 fn an_enrollment_may_still_add_a_device_that_is_not_there() {
     let cfg = auth_with_device("laptop", Some("0123456789abcdef"));
@@ -724,7 +806,8 @@ fn an_enrollment_may_still_add_a_device_that_is_not_there() {
             "0123456789abcdef",
             &enrollment_identity(None, None)
         ),
-        EnrollmentVerdict::Accept
+        EnrollmentVerdict::Refuse { counted: false },
+        "an unnamed request is not a second device"
     );
 }
 

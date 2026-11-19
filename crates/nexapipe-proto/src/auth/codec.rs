@@ -38,6 +38,18 @@ pub(super) mod flag {
 /// version that adds one would otherwise be read as if the field were
 /// absent, which is the kind of quiet difference a version byte exists to
 /// prevent.
+///
+/// The four `ENROLL_START` description flags deliberately do **not** bump
+/// `VERSION_BINARY`. The enrollment exchange is the first message between two
+/// peers that may not share a build, so it is sent as `Format::LegacyJson`:
+/// the new fields are `#[serde(default)]` and a peer that does not know them
+/// ignores them rather than failing. The binary form of `ENROLL_START` is
+/// exercised only between peers built from the same source, so an older
+/// decoder never meets those flags on the wire. The version byte is a
+/// discriminator, not a negotiated version, so bumping it here would not add
+/// a rejection path — it would make `from_payload` read the new form as
+/// legacy JSON. Binary enrollment, if it is introduced, has to arrive
+/// together with a version bump and an explicit refusal of the old form.
 pub(super) fn allowed_flags(kind: u8) -> u8 {
     match kind {
         kind::START => flag::DEVICE_ID | flag::VERSION,

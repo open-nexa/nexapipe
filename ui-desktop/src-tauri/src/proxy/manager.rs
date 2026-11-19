@@ -148,6 +148,25 @@ pub struct NodeTwoFactor {
     pub device: Option<String>,
 }
 
+/// Whether this node already holds a credential the server issued.
+///
+/// A device key on its own is *not* one: an invite that has just been imported
+/// carries the key it will offer at enrollment but no `client_id` yet — that
+/// arrives with the credential the server answers with. Counting the key as an
+/// issued credential here skips the enrollment and authenticates as an empty
+/// client id, which no server has an entry for, so a key-only invite can never
+/// enroll. The frontend's `hasTwoFactor` and Android's `node_has_two_factor`
+/// use the same rule: the key counts once the enrollment has been answered.
+fn has_issued_credential(node: &ProxyNodeConfig) -> bool {
+    let Some(two_factor) = node.two_factor.as_ref() else {
+        return false;
+    };
+    if !two_factor.secret.trim().is_empty() {
+        return true;
+    }
+    !two_factor.client_id.trim().is_empty() && node.device_key.is_some()
+}
+
 /// A one-time enrollment token, which is what a `--registration` invite carries.
 ///
 /// A token is a credential in transit but not one at rest: the server replaces the
@@ -454,12 +473,10 @@ impl ProxyManager {
             // missing.
             let two_factor = node.two_factor.as_ref();
             let has_secret = two_factor.is_some_and(|tf| !tf.secret.trim().is_empty());
-            // A key is a credential by itself: the id it answers under is the
-            // fingerprint of that key, so no stored name is needed to recognise
-            // one. A secret still needs its device name to be told apart from
-            // the client's own.
-            let has_key = two_factor.is_some() && !has_secret && node.device_key.is_some();
-            let has_credential = has_secret || has_key;
+            // A key is a credential only once the enrollment that offered it
+            // has been answered. A pending invite has the key but no client id,
+            // and counting it here would skip the enrollment below.
+            let has_credential = has_issued_credential(node);
             if !has_credential && node.enrollment.is_none() {
                 continue;
             }
@@ -1201,5 +1218,72 @@ mod tests {
             manager.take_issued_credential().await.is_none(),
             "a second read must not report the same credential again"
         );
+    }
+
+    fn node_with(
+        two_factor: Option<NodeTwoFactor>,
+        device_key: Option<String>,
+    ) -> ProxyNodeConfig {
+        ProxyNodeConfig {
+            connection: ConnectionConfig::EndpointId("node".to_string()),
+            domains: Vec::new(),
+            two_factor,
+            enrollment: None,
+            device_key,
+        }
+    }
+
+    /// The shape an invite has just after it is imported: a device key and an
+    /// empty `two_factor` record. It is not a credential yet.
+    #[test]
+    fn a_pending_key_only_invite_is_not_an_issued_credential() {
+        let node = node_with(
+            Some(NodeTwoFactor {
+                client_id: String::new(),
+                secret: String::new(),
+                algorithm: "sha1".to_string(),
+                device: None,
+            }),
+            Some("ab".repeat(32)),
+        );
+        assert!(!has_issued_credential(&node));
+    }
+
+    /// Once the server has answered, the record carries the client id and the
+    /// key is what authenticates every later handshake.
+    #[test]
+    fn a_completed_key_enrollment_is_a_credential() {
+        let node = node_with(
+            Some(NodeTwoFactor {
+                client_id: "client-001".to_string(),
+                secret: String::new(),
+                algorithm: "sha1".to_string(),
+                device: Some("d-0123456789abcdef".to_string()),
+            }),
+            Some("ab".repeat(32)),
+        );
+        assert!(has_issued_credential(&node));
+    }
+
+    #[test]
+    fn a_secret_is_a_credential_on_its_own() {
+        let node = node_with(
+            Some(NodeTwoFactor {
+                client_id: "client-001".to_string(),
+                secret: "JBSWY3DPEHPK3PXP".to_string(),
+                algorithm: "sha1".to_string(),
+                device: None,
+            }),
+            None,
+        );
+        assert!(has_issued_credential(&node));
+    }
+
+    /// A node carrying nothing but the key it will offer at enrollment has no
+    /// credential at all, so the enrollment branch is still the one it takes.
+    #[test]
+    fn a_node_with_no_two_factor_record_has_no_issued_credential() {
+        let node = node_with(None, Some("ab".repeat(32)));
+        assert!(!has_issued_credential(&node));
     }
 }

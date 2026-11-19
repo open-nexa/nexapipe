@@ -2659,8 +2659,11 @@ async fn a_wrong_enrollment_token_is_counted_against_the_enrollment_only() {
         spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth.clone()).await;
     let tunnel = Tunnel::dial(proxy.addr).await;
 
-    // The guess: a token that is not the one that is outstanding.
+    // The guess: a token that is not the one that is outstanding. The key is
+    // what a device offers at a real enrollment, so the refusal is about the
+    // token rather than about a request that names no device.
     let outcome = Enrollment::new(CLIENT_ID, "0123456789abcde0")
+        .with_key(iroh::SecretKey::generate())
         .exchange(&tunnel.conn)
         .await;
     assert!(
@@ -2713,12 +2716,14 @@ async fn a_spent_token_takes_its_guesses_with_it() {
 
     let tunnel = Tunnel::dial(proxy.addr.clone()).await;
     let outcome = Enrollment::new(CLIENT_ID, "0123456789abcde0")
+        .with_key(iroh::SecretKey::generate())
         .exchange(&tunnel.conn)
         .await;
     assert!(outcome.is_err(), "the wrong token is refused");
 
     let tunnel = Tunnel::dial(proxy.addr).await;
     Enrollment::new(CLIENT_ID, "0123456789abcdef")
+        .with_key(iroh::SecretKey::generate())
         .exchange(&tunnel.conn)
         .await
         .expect("the right token enrolls");
@@ -2759,6 +2764,7 @@ async fn the_enrollment_token_has_a_ceiling_of_its_own() {
     for _ in 0..3 {
         let tunnel = Tunnel::dial(proxy.addr.clone()).await;
         let outcome = Enrollment::new(CLIENT_ID, "0123456789abcde0")
+            .with_key(iroh::SecretKey::generate())
             .exchange(&tunnel.conn)
             .await;
         assert!(outcome.is_err(), "a wrong token is refused");
@@ -2767,6 +2773,7 @@ async fn the_enrollment_token_has_a_ceiling_of_its_own() {
     // The right token does not get in either: the slot is closed.
     let tunnel = Tunnel::dial(proxy.addr.clone()).await;
     let outcome = Enrollment::new(CLIENT_ID, "0123456789abcdef")
+        .with_key(iroh::SecretKey::generate())
         .exchange(&tunnel.conn)
         .await;
     assert!(

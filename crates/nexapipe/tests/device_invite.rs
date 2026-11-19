@@ -27,6 +27,44 @@ fn scratch_config(name: &str) -> (tempfile::TempDir, PathBuf) {
     (dir, path)
 }
 
+/// The identity the scratch configurations run as.
+const SERVER_SECRET: &str = "f3d4cade20c162ac5bb9d582b84a10755b1bf61a44c05f4fec4e4282f2f1f9c0";
+
+/// A scratch config with discovery disabled: a Node ID cannot be resolved
+/// there, so the invite has to carry a ticket with the addresses in it.
+fn scratch_config_without_discovery(name: &str) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join(name);
+    fs::write(
+        &path,
+        format!(
+            "# my proxy\n\
+             \n\
+             [iroh]\n\
+             secret_key = \"{SERVER_SECRET}\"\n\
+             discovery = \"none\"\n\
+             \n\
+             [auth]\n\
+             enabled = true\n\
+             \n\
+             [auth.clients.alice]\n\
+             secret = \"JBSWY3DPEHPK3PXP\"\n"
+        ),
+    )
+    .expect("write config");
+    (dir, path)
+}
+
+/// A ticket for the endpoint this scratch config runs as. An invite carrying
+/// a credential is checked against the server's own identity, so the ticket
+/// has to name this endpoint.
+fn own_ticket() -> String {
+    use iroh::{EndpointAddr, SecretKey};
+    use iroh_tickets::endpoint::EndpointTicket;
+    let key: SecretKey = SERVER_SECRET.parse().expect("secret key");
+    EndpointTicket::new(EndpointAddr::new(key.public())).to_string()
+}
+
 fn run(config: &Path, args: &[&str]) -> (bool, String) {
     let mut full = vec![
         "--config".to_string(),
@@ -173,4 +211,72 @@ fn client_list_shows_the_deadline() {
     let (ok, output) = run(&config, &["client", "list", "--json"]);
     assert!(ok, "{output}");
     assert!(output.contains("invite_expires_at"), "{output}");
+}
+
+/// `discovery = "none"` is the case the ticket exists for, and `device invite`
+/// has to accept it: `--invite-ticket` used to be tied to `--generate-invite`,
+/// whose early return meant the ticket could never reach this command.
+#[test]
+fn a_device_invite_can_carry_an_endpoint_ticket() {
+    let (_dir, config) = scratch_config_without_discovery("ticket.toml");
+    let ticket = own_ticket();
+
+    let (ok, output) = run(
+        &config,
+        &[
+            "device",
+            "invite",
+            "--client",
+            "alice",
+            "--invite-ticket",
+            &ticket,
+        ],
+    );
+
+    assert!(ok, "the ticket invitation was refused:\n{output}");
+    assert!(output.contains("nexapipe://ticket/"), "{output}");
+    assert!(
+        output.contains("enroll=") && output.contains("exp="),
+        "the ticket still carries the one-time invitation:\n{output}"
+    );
+    assert!(
+        !output.contains("cannot be resolved"),
+        "a ticket invite needs no discovery warning:\n{output}"
+    );
+    assert!(
+        auth_clients(&config).clients["alice"]
+            .pending_enrollment_expires_at
+            .is_some()
+    );
+}
+
+/// The warning has to name a command that actually accepts the ticket, not a
+/// flag that only the endpoint invite defines.
+#[test]
+fn the_discovery_warning_points_at_a_command_that_accepts_the_ticket() {
+    let (_dir, config) = scratch_config_without_discovery("warn.toml");
+
+    let (ok, output) = run(&config, &["device", "invite", "--client", "alice"]);
+
+    assert!(ok, "{output}");
+    assert!(
+        output.contains("device invite --client alice --invite-ticket"),
+        "the warning has to name a command that accepts the ticket:\n{output}"
+    );
+}
+
+/// Making the flag global must not let a stray ticket be silently dropped on
+/// a plain proxy start.
+#[test]
+fn an_invite_ticket_without_an_invite_is_rejected() {
+    let (_dir, config) = scratch_config("ticket-alone.toml");
+    let ticket = own_ticket();
+
+    let (ok, output) = run(&config, &["--invite-ticket", &ticket]);
+
+    assert!(!ok, "a stray ticket was silently ignored:\n{output}");
+    assert!(
+        output.contains("is used with --generate-invite or"),
+        "{output}"
+    );
 }

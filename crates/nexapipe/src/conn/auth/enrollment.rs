@@ -159,6 +159,14 @@ pub(in crate::conn) fn enrollment_identity(
 /// A client that offers no key is the older arrangement and keeps the older
 /// rule: a name that is already in the table is refused, because the token
 /// proves the invitation reached *someone*, not which device it reached.
+///
+/// **A request that offers neither a key nor a name is refused outright.** Its
+/// only possible slot is the client's own `secret`, which every other device
+/// of that client answers with; spending the token there rotates that secret
+/// out from under them and locks them all out. A device invited under the new
+/// rule always offers its key, so this rejects only a request that cannot be
+/// recorded as a device of its own — and it is refused before the token is
+/// spent, so the invitation stays usable.
 pub(in crate::conn) fn enrollment_verdict(
     cfg: &AuthConfig,
     client_id: &str,
@@ -226,15 +234,22 @@ pub(in crate::conn) fn enrollment_verdict(
             EnrollmentVerdict::Accept
         }
         EnrollmentIdentity::Named(name) => {
+            // A request that names no device and offers no key has nowhere to
+            // be filed but the client's own `secret` — the credential every
+            // other device of this client answers with. Spending the token
+            // there would rotate that secret and lock all of them out, so it
+            // is refused before anything is issued. The device has to come
+            // back with its key, which is what a device invitation is for.
+            let Some(name) = name else {
+                return EnrollmentVerdict::Refuse { counted: false };
+            };
             // A name that is already in the table is refused: the token proves
             // the invitation reached *someone*, not which device it reached, so
             // accepting any name would let a copied link take the place of the
             // real device. Replacing an existing device's credential is the
             // operator's move and has its own `--force`; an enrollment is for a
             // device that is not there yet.
-            if let Some(name) = name
-                && client.devices.contains_key(name)
-            {
+            if client.devices.contains_key(name) {
                 return EnrollmentVerdict::Refuse { counted: false };
             }
             EnrollmentVerdict::Accept
@@ -340,6 +355,12 @@ impl PeerRegistration {
 /// a device that sends a name wants an entry of its own, and a device that
 /// sends none is one that predates the table, for whom the client's `secret` is
 /// the only credential there is.
+///
+/// Both slots also carry the invitation's deadline. A successful enrollment
+/// clears the token *and* the deadline; if the write that spends it fails, both
+/// have to go back — putting only the token back would leave an invitation that
+/// never expires, because a token with no deadline is one the verdict treats as
+/// valid forever.
 pub(in crate::conn) enum EnrollmentSlot {
     /// A named device. The client's `secret` is left alone, so the other
     /// devices keep theirs — which is the whole point of the table.
@@ -354,12 +375,16 @@ pub(in crate::conn) enum EnrollmentSlot {
         /// operator's move, `client add --device <name> --force`. What this
         /// carries is what a failed write has to put back.
         previous: Option<DeviceAuth>,
+        /// The deadline the invitation carried before it was spent.
+        expires_at: Option<u64>,
     },
     /// The device that has no name: the client's own `secret`, which is also
     /// what every peer that predates the device table answers with.
     Shared {
         /// The secret this enrollment rotated away.
         previous: SecretString,
+        /// The deadline the invitation carried before it was spent.
+        expires_at: Option<u64>,
     },
 }
 
@@ -410,8 +435,14 @@ pub(in crate::conn) fn issue_enrolled_secret(
         // caller's rollback simple rather than making it handle a third case.
         return EnrollmentSlot::Shared {
             previous: SecretString::default(),
+            expires_at: None,
         };
     };
+
+    // Read before both fields are cleared below: a failed write has to put the
+    // deadline back together with the token, or the restored invitation would
+    // have no deadline at all.
+    let expires_at = client.pending_enrollment_expires_at;
 
     let slot = match issued {
         IssuedCredential::DeviceSecret { name, secret, info } => EnrollmentSlot::Device {
@@ -430,6 +461,7 @@ pub(in crate::conn) fn issue_enrolled_secret(
                 },
             ),
             name: name.clone(),
+            expires_at,
         },
         IssuedCredential::DeviceKey { name, key, info } => EnrollmentSlot::Device {
             previous: client.devices.insert(
@@ -447,9 +479,11 @@ pub(in crate::conn) fn issue_enrolled_secret(
                 },
             ),
             name: name.clone(),
+            expires_at,
         },
         IssuedCredential::SharedSecret(secret) => EnrollmentSlot::Shared {
             previous: std::mem::replace(&mut client.secret, secret.clone()),
+            expires_at,
         },
     };
     client.pending_enrollment = None;
@@ -457,11 +491,15 @@ pub(in crate::conn) fn issue_enrolled_secret(
     slot
 }
 
-/// Puts back what [`issue_enrolled_secret`] replaced, and the token with it.
+/// Puts back what [`issue_enrolled_secret`] replaced: the credential, the
+/// token, and the invitation's deadline.
 ///
 /// The token goes back because the write that would have spent it failed: the
 /// link is still the only credential the client has for this enrollment, and
-/// dropping it would leave a client that cannot enroll at all.
+/// dropping it would leave a client that cannot enroll at all. The deadline
+/// goes back with it for the same reason: a restored token with no deadline is
+/// one that never expires, so an invitation that had already run out would
+/// become usable again after a disk error.
 pub(in crate::conn) fn undo_enrolled_secret(
     cfg: &mut AuthConfig,
     client_id: &str,
@@ -472,18 +510,32 @@ pub(in crate::conn) fn undo_enrolled_secret(
         return;
     };
 
-    match slot {
-        EnrollmentSlot::Device { name, previous } => match previous {
-            Some(previous) => {
-                client.devices.insert(name, previous);
+    let expires_at = match slot {
+        EnrollmentSlot::Device {
+            name,
+            previous,
+            expires_at,
+        } => {
+            match previous {
+                Some(previous) => {
+                    client.devices.insert(name, previous);
+                }
+                None => {
+                    client.devices.remove(&name);
+                }
             }
-            None => {
-                client.devices.remove(&name);
-            }
-        },
-        EnrollmentSlot::Shared { previous } => client.secret = previous,
-    }
+            expires_at
+        }
+        EnrollmentSlot::Shared {
+            previous,
+            expires_at,
+        } => {
+            client.secret = previous;
+            expires_at
+        }
+    };
     client.pending_enrollment = Some(SecretString::new(token.to_string()));
+    client.pending_enrollment_expires_at = expires_at;
 }
 
 /// The counted refusal: what a wrong guess at a token moves.

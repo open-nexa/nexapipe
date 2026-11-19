@@ -646,13 +646,24 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
                 };
                 // A device key is offered rather than asked for: the server
                 // records the public half under the fingerprint and issues no
-                // secret, so the private half never leaves this phone. A server
-                // that predates keys ignores the offer and issues a secret as
-                // it always has, which is what the credential then is.
-                let enrollment = match node_device_key_for(&node_id) {
-                    Some(key) => enrollment.with_key(key),
-                    None => enrollment,
+                // secret, so the private half never leaves this phone.
+                //
+                // Without a key there is no device identity to file. Sending
+                // the token anyway would make an older server rotate the
+                // client's shared secret — the credential every other device
+                // of that client answers with — and lock them all out, while a
+                // current server refuses the request outright. Leave the
+                // invitation unspent until the key is available instead of
+                // arming an enrollment that cannot be recorded.
+                let Some(key) = node_device_key_for(&node_id) else {
+                    jni_log!(
+                        "[WARN:jni] enrollment for node '{}' skipped: no device key; \
+                         a keyless enrollment cannot be filed as its own device",
+                        node_id
+                    );
+                    continue;
                 };
+                let enrollment = enrollment.with_key(key);
                 endpoint_group
                     .set_enrollment_for(&node_id, Some(enrollment))
                     .await;

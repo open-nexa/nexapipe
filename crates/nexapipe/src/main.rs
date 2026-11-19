@@ -223,6 +223,7 @@ struct Cli {
     #[arg(
         long = "endpoint-id",
         value_name = "NODE_ID",
+        global = true,
         help = "Endpoint ID to advertise (default: derived from [iroh] secret_key)"
     )]
     endpoint_id: Option<String>,
@@ -230,11 +231,11 @@ struct Cli {
     #[arg(
         long = "invite-ticket",
         value_name = "TICKET",
-        requires = "generate_invite",
+        global = true,
         conflicts_with = "endpoint_id",
         help = "Put a full endpoint ticket (Node ID + addresses) in the invite instead of a \
-                Node ID. Use it with [iroh] discovery = \"none\", where a Node ID alone cannot \
-                be resolved"
+                Node ID. Works with --generate-invite and with `device invite`. Use it with \
+                [iroh] discovery = \"none\", where a Node ID alone cannot be resolved"
     )]
     invite_ticket: Option<String>,
 
@@ -438,6 +439,25 @@ async fn main() {
         eprintln!(
             "Error: --registration has been replaced by `nexapipe device invite --client \
              <CLIENT_ID>`, which issues a one-time token with a deadline"
+        );
+        std::process::exit(1);
+    }
+
+    // `--invite-ticket` is global so `device invite` can carry a ticket when
+    // discovery is off. On its own it has no invite to act on, so say so
+    // instead of silently starting the proxy and dropping the ticket.
+    if cli.invite_ticket.is_some()
+        && cli.generate_invite.is_none()
+        && !matches!(
+            &cli.command,
+            Some(Commands::Device {
+                action: DeviceAction::Invite { .. }
+            })
+        )
+    {
+        eprintln!(
+            "Error: --invite-ticket is used with --generate-invite or \
+             `nexapipe device invite --client <CLIENT_ID>`"
         );
         std::process::exit(1);
     }

@@ -141,7 +141,8 @@ pub(crate) async fn invite_device(
     {
         eprintln!(
             "warning: [iroh] discovery = \"none\" is set, so a Node ID invite cannot be resolved; \
-             pass --invite-ticket <TICKET> to put the addresses in the link"
+             generate another one with `nexapipe device invite --client {client_id} \
+             --invite-ticket <TICKET>` to put the addresses in the link"
         );
     }
     if invite.domains.is_empty() {
