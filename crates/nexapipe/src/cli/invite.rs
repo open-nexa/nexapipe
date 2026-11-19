@@ -97,7 +97,8 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
                 };
                 anyhow::bail!(
                     "client \"{}\" has no [auth.clients.{}] section in {}{}; \
-                     pass --create-client to make one now, or run --generate-2fa {} first",
+                     pass --create-client to make one now, or run `nexapipe client enroll {}` \
+                     first",
                     client_id,
                     toml_key(client_id),
                     storage.describe(),
@@ -260,7 +261,7 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
         );
     }
     if invite.domains.is_empty() {
-        eprintln!("warning: the invite carries no domains, pass --invite-domains to route traffic");
+        eprintln!("warning: the invite carries no domains, pass --domains to route traffic");
     }
     if link.len() > RECOMMENDED_URI_LIMIT {
         eprintln!(
@@ -288,7 +289,7 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
         println!("* puts an enrollment token in the link instead, and the link stops");
         println!("* being a credential the moment the first device scans it.");
         println!("*");
-        println!("* To revoke it: nexapipe --generate-2fa {client} --force");
+        println!("* To revoke it: nexapipe client enroll {client} --force");
         println!("* That rotates the secret, and every device enrolled with the old");
         println!("* one has to scan again — there is no per-device revocation.");
         println!("*******************************************************************");
@@ -353,7 +354,8 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
     render_qr(
         &link,
         cli,
-        "Scan this with the NexaPipe app (add endpoint -> scan):",
+        Some("Scan this with the NexaPipe app (add endpoint -> scan):"),
+        "NexaPipe 2FA enrollment",
     )?;
 
     if invite.is_enrollment() {
@@ -364,7 +366,7 @@ pub(crate) async fn print_endpoint_invite(cli: &Cli, storage: &dyn Storage) -> a
         println!("step.");
     } else {
         println!("Scanning imports the endpoint and its domains. Pass a client id to");
-        println!("--generate-invite to put that client's 2FA credentials in the code too");
+        println!("`nexapipe invite` to put that client's 2FA credentials in the code too");
         println!("(add --create-client when that client does not exist yet).");
     }
 
@@ -417,7 +419,7 @@ pub(super) async fn build_invite_base(
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "no endpoint identity in {}: set [iroh] secret_key \
-                         (see `nexapipe --generate-secret`) or pass --endpoint-id",
+                         (see `nexapipe secret`) or pass --endpoint-id",
                         storage.describe()
                     )
                 })?;
@@ -644,7 +646,7 @@ pub(super) fn invite_domains(
     config: Option<&Config>,
 ) -> (Vec<String>, String) {
     if !explicit.is_empty() {
-        return (explicit.to_vec(), "from --invite-domains".to_string());
+        return (explicit.to_vec(), "from --domains".to_string());
     }
 
     if let Some(local_proxy) = config.and_then(|config| config.local_proxy.as_ref())

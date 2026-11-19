@@ -840,6 +840,10 @@ fn the_refusal_hint_names_the_command_that_unblocks_the_enrollment() {
         hint.contains("nexapipe client revoke xm17 --device phone"),
         "{hint}"
     );
+    assert!(
+        hint.contains("nexapipe device invite --client xm17"),
+        "{hint}"
+    );
 }
 
 /// A device that still holds the key the table records may enroll again.
