@@ -1,0 +1,43 @@
+schema: spec-driven
+
+context: |
+  All artifacts, code, comments, log messages, docs and commit messages are
+  written in English, even when the conversation with the user is in Chinese.
+  The only exceptions are real i18n resources (the Android `values-zh-rCN`
+  strings, the desktop `zh-CN.json` locale, and tests whose point is handling
+  non-ASCII text).
+
+  Rust edition 2024. Errors are `anyhow`; logging is gated behind the
+  `tracing` feature or the `jni_log!` macro. Platform-specific code stays
+  behind the `jni`, `local-proxy`, `tun-proxy` and `uniffi` features.
+
+  The configuration has one naming authority: `crates/nexapipe/src/config/schema.rs`.
+  A key is named once there; the TOML codec and the SQLite store both read
+  that one definition, and neither invents a second spelling for it.
+
+  `crates/nexapipe/src/storage/mod.rs` holds the `Storage` trait, the seam
+  every store implements. A new capability in the configuration goes through
+  that trait rather than around it, so the file store and the database store
+  stay interchangeable.
+
+  The admin listener is loopback only and has no escape hatch: a non-loopback
+  `listen_addr` is refused at startup. Its `/v1/*` half answers questions and
+  changes nothing — adding and revoking credentials are `nexapipe client add`
+  and `nexapipe client revoke`, which write the configuration through the same
+  lock the server takes.
+
+  Comments explain why a thing is the way it is, not what the next line does.
+
+  Verification for a change: `cargo fmt --check`,
+  `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+  `cargo test --workspace --locked`, and `cargo deny check` for the dependency
+  policy. A change that touches the desktop bundle also runs `npm run build`
+  and `npm run test:stores` in `ui-desktop/`.
+
+rules:
+  proposal:
+    - Say what is out of scope as plainly as what is in it.
+  design:
+    - Name the file that changes for every decision, not just the module.
+  tasks:
+    - One commit per logical step, each with the command that verifies it.
