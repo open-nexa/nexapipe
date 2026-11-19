@@ -150,6 +150,34 @@ impl FileStorage {
         })
     }
 
+    /// Replaces the configuration file with `config`, rendered as TOML.
+    ///
+    /// The whole-document write, and the one place a file that an operator
+    /// wrote comments in is rendered from the model rather than edited: the
+    /// caller is the import of a `config.toml` into another store, and the
+    /// file store only reaches here when it is itself the empty store being
+    /// handed one. Every other write is by entity and keeps the file's
+    /// comments.
+    pub fn put_config(&self, config: &crate::config::Config) -> anyhow::Result<()> {
+        let path = &self.config_path;
+
+        // The lock lives in a file beside this one, and opening it fails when
+        // the directory does not exist yet — so the directory is created
+        // first, the way `ensure_config` does it.
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("cannot create {}: {e}", parent.display()))?;
+        }
+
+        // The rendered text holds the 2FA seeds in the clear, and so does the
+        // model it came from; the text is zeroized with the `SecretString` on
+        // drop, which is the treatment every other copy on a write path gets.
+        let text = SecretString::new(config.to_toml_text()?);
+        with_lock(path, || write_file(path, text.expose_secret()))
+    }
+
     /// Writes a client's secret.
     pub fn write_client_secret(
         &self,
@@ -545,6 +573,18 @@ impl Storage for FileStorage {
         let this = self.clone();
         let template = template.to_string();
         Box::pin(async move { blocking(move || this.ensure_config(&template)).await })
+    }
+
+    fn put_config<'a>(
+        &'a self,
+        config: &'a crate::config::Config,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        let this = self.clone();
+        // Owned, because the work runs on a blocking thread and outlives the
+        // borrow. The other write methods clone the one secret they need; a
+        // whole-document write needs the whole document.
+        let config = config.clone();
+        Box::pin(async move { blocking(move || this.put_config(&config)).await })
     }
 
     fn write_client_secret<'a>(

@@ -95,21 +95,28 @@ struct Cli {
     // by default and a local dev that omits `--config` keeps the old behaviour.
     // `--config` always wins, so an operator can still point the binary at any
     // path they like.
+    //
+    // It also anchors the database: the default store is `nexapipe.db` in this
+    // file's directory, so one path decides where everything is kept.
     #[arg(short, long, default_value_t = compute_default_config(), global = true)]
     config: String,
 
     /// Where the configuration is kept: a TOML file, a SQLite database or a
     /// PostgreSQL one.
     ///
-    /// The default is the file, and it is the default for the same reason it
-    /// always was: a deployment that says nothing about where its
-    /// configuration lives is a deployment with a `config.toml` next to it.
+    /// The default is the database, and its path is derived from `--config`:
+    /// `nexapipe.db` in the directory the configuration file is in. A
+    /// deployment that says nothing keeps one directory — the configuration,
+    /// its counters and its token — rather than a file and a database in two
+    /// places. `--storage toml` is the file store, and it reads and writes
+    /// exactly what it always has.
     #[arg(long, value_enum, global = true)]
     storage: Option<StorageChoice>,
 
     /// The database the configuration is kept in: a connection string for
     /// PostgreSQL, a file path for SQLite.
     ///
+    /// A path given here wins over the one derived from `--config`, and
     /// `NEXAPIPE_STORAGE_URL` says the same thing when the command line
     /// cannot.
     #[arg(long, value_name = "URL", global = true)]
@@ -556,9 +563,8 @@ async fn main() {
         return;
     }
 
-    // Where the configuration is kept. A file today; a database tomorrow, and
-    // the difference is one line here rather than a path threaded through the
-    // whole server.
+    // Where the configuration is kept: a database beside `--config` unless the
+    // operator named a store, and the file store one flag away.
     let storage: Arc<dyn Storage> = match open_store().await {
         Ok(storage) => storage,
         Err(e) => {
@@ -566,6 +572,24 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // A `config.toml` written for the file store is imported once, into a
+    // store that holds no configuration: the configuration moves without the
+    // operator having to do anything, and the file stays where it is so
+    // `--storage toml` still reads it. It runs before the first-run template
+    // below, because the operator's own file has to win over the template.
+    //
+    // The path is carried to the advisory after `log::init` rather than
+    // printed here, for the same reason the "wrote a minimal one" notice is:
+    // server-mode advisories go through the log channel.
+    let legacy_import =
+        match nexapipe::storage::import_legacy_config(storage.as_ref(), &cli.config).await {
+            Ok(path) => path,
+            Err(e) => {
+                eprintln!("Failed to import the configuration: {e:#}");
+                std::process::exit(1);
+            }
+        };
 
     // A first start with no config file gets a minimal one written for it,
     // rather than a refusal to start with nothing to act on. Server mode only:
@@ -645,6 +669,18 @@ async fn main() {
              nexapipe --generate-invite client-001 --create-client --config {}",
             cli.config,
             cli.config,
+        );
+    }
+
+    if let Some(path) = &legacy_import {
+        // The file is still there and is no longer read, which is the one
+        // thing an operator would not guess: say so, and say how to go back.
+        tracing::info!(
+            "Imported the configuration from {} into {}; this instance reads the store from \
+             now on. The file is left where it is — `--storage toml` reads it again — so \
+             editing it no longer changes this configuration",
+            path.display(),
+            storage.describe(),
         );
     }
 

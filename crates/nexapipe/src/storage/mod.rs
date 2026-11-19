@@ -38,6 +38,12 @@
 //! terms: an edit of the file for the file backend, an update of a row for a
 //! database one.
 //!
+//! There is exactly one exception, and it is named for what it is:
+//! [`Storage::put_config`] replaces the whole document. It exists for the
+//! import of a `config.toml` written before the configuration lived in a
+//! database, where there is no "entity" to speak of — the store holds nothing
+//! and is being handed everything, once.
+//!
 //! # Why the interface is asynchronous
 //!
 //! Because a database is. The file backend does its work in a blocking task
@@ -54,10 +60,10 @@ pub mod open;
 pub mod sqlite;
 
 pub use file::FileStorage;
-pub use open::{choose, open};
+pub use open::{choose, import_legacy_config, open};
 
 use crate::auth::state::RuntimeState;
-use crate::config::ClientSecretWrite;
+use crate::config::{ClientSecretWrite, Config};
 
 use futures_util::future::BoxFuture;
 
@@ -309,6 +315,20 @@ pub trait Storage: Send + Sync + 'static {
     ///
     /// Whether one was written.
     fn ensure_config(&self, template: &str) -> BoxFuture<'_, anyhow::Result<bool>>;
+
+    /// Makes `config` the configuration the store holds.
+    ///
+    /// The one whole-document write, and the only method here that speaks the
+    /// model rather than the text: the caller — the import of a `config.toml`
+    /// written for the file store — has already parsed and validated it with
+    /// [`Config::from_toml_text`], and handing over the raw text would have
+    /// the store parse and validate the same document a second time. Reading
+    /// still answers with text, because a reader is a reader of a document.
+    ///
+    /// A database store moves its revision in the same transaction as the
+    /// write, so the watcher reloads the configuration it has just been
+    /// handed.
+    fn put_config<'a>(&'a self, config: &'a Config) -> BoxFuture<'a, anyhow::Result<()>>;
 
     /// Writes a client's secret, replacing an existing one only with `force`.
     ///

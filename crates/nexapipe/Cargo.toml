@@ -109,6 +109,12 @@ sha2 = "0.11"
 sqlx = { version = '0.9', default-features = false, features = ['runtime-tokio', 'sqlite'], optional = true }
 
 [features]
+# The database store is in every server binary, because it is the store a
+# deployment that says nothing gets: a store that has to be switched on at
+# build time is a store nobody ends up using. `--no-default-features` still
+# builds the file-only server, and that build refuses the sqlite store by name.
+default = ['storage-sqlite']
+
 # The stores that are not a file. `storage-sqlite` carries the SQLite store;
 # `storage-postgres` is where the PostgreSQL one will arrive.
 storage-sqlite = ['dep:sqlx']

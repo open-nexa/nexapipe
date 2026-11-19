@@ -1,27 +1,36 @@
 # Nexapipe configuration example
 #
 # Usage:
-#   cp config.toml.example config.toml     # config.toml is gitignored: it is the operator's live config
-#   nexapipe                                # picks up ./config.toml by default
+#   cp config.toml.example config.toml     # config.toml is gitignored: it is the operator's config
+#   nexapipe                               # imports ./config.toml into ./nexapipe.db, then starts
+#
+# The configuration is kept in a SQLite database by default: `nexapipe.db`,
+# beside the path `--config` names. This file is the interchange format — the
+# first start that finds an empty database and a `config.toml` beside it imports
+# that file once and leaves it where it is. `--storage toml` reads and writes the
+# file directly instead, with no database.
 #
 # This is the general example: every section written out, with 2FA on - the
-# same setting the generated first-run template and config.toml.2fa.example
+# same setting the generated first-run configuration and config.toml.2fa.example
 # ship. See config.toml.2fa.example for the short file that is only about 2FA.
 #
-# No file at the path? On a first server start, the binary writes a minimal
-# `config.toml` for you (2FA on, no routes, no clients) instead of refusing to
-# start. This file is the long version of that — every section written out —
-# for when you want to read it instead of running it. The auto-generated file
-# itself is heavily commented at the top of the template, with the same
-# shape and the same next step: enroll the first client with
+# No configuration anywhere? On a first server start the binary writes a minimal
+# one into the store (2FA on, no routes, no clients) instead of refusing to
+# start. This file is the long version of that — every section written out — for
+# when you want to read it instead of running it. The generated configuration is
+# heavily commented at the top of the template, with the same shape and the same
+# next step: enroll the first client with
 # `nexapipe --generate-invite client-001 --create-client --config config.toml`.
 #
 # The docker setup uses a different default: docker-compose.yaml binds
 # `./config` to `/app/config` and sets `NEXAPIPE_CONFIG_DIR=/app/config`, so the
-# container picks up `/app/config/config.toml` by default. Locally this file
-# is what you want; in the container you want `config/config.toml`.
+# container finds `/app/config/config.toml` and keeps its database at
+# `/app/config/nexapipe.db`. Locally this file is what you want; in the
+# container you want `config/config.toml`.
 #
-# Reloading: the file is re-read every 5 seconds. `[[routes]]` is applied live;
+# Reloading: the configuration is re-read every 5 seconds — the file's
+# modification time with `--storage toml`, the database's revision otherwise.
+# `[[routes]]` is applied live;
 # a config that fails to parse or validate is reported and ignored, so a
 # half-saved edit cannot take the proxy down. `[auth]` and `[auth.clients]` are
 # applied live too — see the `[auth]` section below for what that does and does

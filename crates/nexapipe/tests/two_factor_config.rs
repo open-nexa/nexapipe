@@ -112,7 +112,7 @@ fn a_broken_auth_section_refuses_to_start() {
     .unwrap();
 
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_nexapipe"))
-        .args(["--config", path.to_str().unwrap()])
+        .args(["--config", path.to_str().unwrap(), "--storage", "toml"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

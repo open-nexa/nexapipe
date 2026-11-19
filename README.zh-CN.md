@@ -71,9 +71,10 @@ UDP 流。对于 HTTP，服务端按 `Host` 路由，与普通反向代理完全
   你的后端之间端到端运行。代价：不透明的管道无法改写路径、无法基于请求做决策、
   无法探测 `/health`，访问日志记录的是字节数而不是请求行。（`mode = "http"` 是
   例外 —— 那里代理确实会解析请求。见[安全边界](#安全边界)。）
-- **没有控制平面。** 一个二进制加一份 `config.toml`；不用注册账号，没有协调服务器，
-  也没有第三方掌握着你的节点清单。代价：没有中心化的设备列表、没有远程吊销、没有
-  SSO —— 新增客户端意味着编辑配置（运行中的服务端会在数秒内拾取）。
+- **没有控制平面。** 一个二进制加一份配置 —— 一个 `config.toml`，或它旁边的数据库；
+  不用注册账号，没有协调服务器，也没有第三方掌握着你的节点清单。代价：没有中心化的
+  设备列表、没有远程吊销、没有 SSO —— 新增客户端意味着编辑配置（或 `nexapipe client
+  add`），运行中的服务端会在数秒内拾取。
 - **没有什么需要租。** 客户端通过 QUIC 直接打洞连到你的端点。代价：打洞大约只对
   90–95% 的连接成功，其余回落中继，所以凡是要依赖的服务都应自建中继 —— 而一旦你
   无论如何都要维护一台公网机器，"不用租服务器"就不再是什么明显优势。
@@ -105,7 +106,7 @@ Android JNI 用的 `cdylib`，以及面向 Swift/Kotlin/Python 的 UniFFI 绑定
 | `crates/nexapipe-proto/` | L4 线格式：`preface.rs` 与 `udp.rs`。零依赖，因此服务端与客户端都能链接它。 |
 | `ui-android/` | Android 应用（Kotlin + Compose）。 |
 | `ui-desktop/` | Tauri 2 桌面应用（Vue 3 + TypeScript）。 |
-| `config.toml.example` | 覆盖全部配置项的示例（服务端 + 客户端）。它出厂即开启 2FA 且没有任何已 enrolled 的客户端，因此全新安装在 enrolled 第一个客户端之前会拒绝所有连接。复制成 `config.toml` —— 该文件名已被 gitignore，它是运维者的实际配置。Docker compose 用的是 `config/config.toml`，通过 `NEXAPIPE_CONFIG_DIR=/app/config` 让二进制默认读取。 |
+| `config.toml.example` | 覆盖全部配置项的示例（服务端 + 客户端）。它出厂即开启 2FA 且没有任何已 enrolled 的客户端，因此全新安装在 enrolled 第一个客户端之前会拒绝所有连接。复制成 `config.toml` —— 该文件名已被 gitignore，首次启动会把它导入旁边的 `nexapipe.db`。Docker compose 用的是 `config/config.toml`，通过 `NEXAPIPE_CONFIG_DIR=/app/config` 找到它，数据库则在 `config/nexapipe.db`。 |
 | `config.toml.2fa.example` | 同一个文件，但更短：它不含日志、健康检查和指标这三段，并带有一个 `[auth.clients]` 条目 —— 一个已经 enrolled 的客户端。两份示例都是 2FA 开启。 |
 | `run_android.ps1` | 一键 Android 调试循环（构建 → 安装 → 启动 → logcat），Windows 版。 |
 | `run_android.sh` | 同一个一键 Android 调试循环的 macOS/Linux（bash）版本。 |
@@ -123,7 +124,7 @@ host_pattern = "*"
 backends = ["http://127.0.0.1:3000"]    # 你想暴露出去的服务
 EOF
 
-nexapipe                                # 默认读取 ./config.toml
+nexapipe                                # 把 ./config.toml 导入 ./nexapipe.db 后启动
 ```
 
 三行就是一个能跑的服务端：一条全捕获路由、一个后端，其余配置全部取默认值。客户端
@@ -136,11 +137,11 @@ nexapipe                                # 默认读取 ./config.toml
 2FA **关闭**：没有 `[auth]` 段的配置保持关闭，所以升级中的部署不会突然被要求一个它的
 客户端从未拿到过的凭证。示例文件才是全新安装的默认值所在之处。
 
-完全不写这个文件也可以：服务端会自己生成一份最简的 `config.toml`，而不是直接拒绝启动 ——
-2FA 开启、没有路由、没有 enrolled 客户端。它是一个供你编辑的起点，还不是能用的服务：
+完全不写这个文件也可以：服务端会把一份最简配置写进存储，而不是直接拒绝启动 ——
+2FA 开启、没有路由、没有 enrolled 客户端。它是一个起点，还不是能用的服务：
 
 ```bash
-nexapipe                                # 生成 ./config.toml 并启动
+nexapipe                                # 生成 ./nexapipe.db 并启动
 ```
 
 在你修改之前，这份文件有两件事成立，且都是偏安全的方向：**没有路由**，所以所有 host
@@ -168,8 +169,9 @@ Ticket (for clients):                 endpoint:...
 交给客户端。
 
 **`[iroh] secret_key` 不需要你手动填。** 它缺失时，服务端会在首次启动时生成一个、
-写回 `config.toml` 的 `[iroh]` 段，并从那时起一直使用它 —— 于是 Node ID 从第一次
-运行起就是稳定的，无需任何复制粘贴：
+写回 `[iroh]` —— `--storage toml` 下写进 `config.toml`，否则写进数据库 —— 并从那时
+起一直使用它，于是 Node ID 从第一次运行起就是稳定的，无需任何复制粘贴。文件存储下
+它长这样：
 
 ```toml
 [iroh]
@@ -177,7 +179,7 @@ Ticket (for clients):                 endpoint:...
 secret_key = "8f2a…"
 ```
 
-写回走的是和 2FA 命令同一条加锁 + 原子替换的路径，所以你的注释和其余配置都会保留。
+那次写回走的是和 2FA 命令同一条加锁 + 原子替换的路径，所以你的注释和其余配置都会保留。
 这次写入在 Unix 上会把文件建成**私有**（`0600`），但权限不再被强制检查：
 `0644` 的配置（Docker bind mount 往往就是这样）也能正常启动。代价是文件里的
 凭据任何账号都能读到，所以要么保持文件私有，要么按下面的方式把密钥移出配置文件。
@@ -233,8 +235,9 @@ logs 卷。`secrets/` 挂载配合 `NEXAPIPE_IROH_SECRET_KEY_FILE=/app/secrets/i
 使用：端点密钥在首次启动时生成进这个文件（`0600`），因此 `config.toml` 本身不再
 持有私钥。`secrets/` 请和 `config/` 一起备份 —— 丢了它意味着下次重启 Node ID 会变，
 存过旧 Node ID 的客户端将找不到服务器。同时 compose 还设置
-`NEXAPIPE_CONFIG_DIR=/app/config`，让容器里的二进制默认读取
+`NEXAPIPE_CONFIG_DIR=/app/config`，让容器里的二进制默认找到
 `/app/config/config.toml`，与宿主机看到的 `config/config.toml` 是同一个文件。
+数据库是同一个挂载里的 `/app/config/nexapipe.db`，因此配置和它的计数一起备份。
 `--config` 仍然优先生效，所以运维者随时可以指向任意路径。`host.docker.internal`
 已配置好，因此运行在 Docker 宿主机上的后端可以被访问到。已有部署迁移过来只需一条：
 `mkdir -p config && mv config.toml config/config.toml`。
@@ -428,11 +431,11 @@ systemd 替它建的目录外什么都不拥有」的服务准备的：那个 UI
 之后可能交给另一个服务，所以 systemd 会把 `StateDirectory`、`CacheDirectory`
 和 `LogsDirectory` 自行挪到别处。`/etc` 下的凭据文件不在这三者之中。
 
-**配置目录必须保持可写。** 服务端会把已注册设备的密钥写回 `config.toml`，
-并在首次启动时在旁边写出 `config.toml.admin-token`。2FA 的计数
-（`failed_attempts`、`locked_until`、`last_used`）落在旁边的 `config.state.toml` 里 ——
-那个文件归服务端自己所有，配置不会因为它被重写。首次启动时服务端也会写配置
-这个文件 —— 配置里没有 `[iroh] secret_key` 就会补上：所以即使从不注册客户端，目录
+**配置目录必须保持可写。** 服务端会把东西写回存储：`--storage toml` 下是
+`config.toml`，否则是旁边的 `nexapipe.db` —— 已注册设备的密钥、admin 令牌、2FA 计数
+（`failed_attempts`、`locked_until`、`last_used`）和端点密钥都在那里。文件存储下令牌
+是旁边的 `config.toml.admin-token`，计数在 `config.state.toml` 里。首次启动时服务端
+也会写存储 —— 配置里没有 `[iroh] secret_key` 就会补上：所以即使从不注册客户端，目录
 也必须可写，否则 Node ID 每次重启都会变。`ReadWritePaths` 只放开这一个目录。
 想在不可写的配置下运行，请设 `NEXAPIPE_NO_PERSIST_IDENTITY=1`，代价是 Node ID
 无法跨重启保持。
@@ -478,7 +481,9 @@ relay 那份也是同样的声明。这些指令不是同一时期引入的，sy
 
 | 参数 | 说明 |
 | --- | --- |
-| `-c, --config <PATH>` | 配置文件（默认 `./config.toml`；`NEXAPIPE_CONFIG_DIR` 可调整）。 |
+| `-c, --config <PATH>` | 配置所在的位置（默认 `./config.toml`；`NEXAPIPE_CONFIG_DIR` 可调整）。文件存储读这个文件；数据库存储由它所在目录推导出 `nexapipe.db`。 |
+| `--storage <KIND>` | `sqlite`（默认）或 `toml`；环境变量 `NEXAPIPE_STORAGE` 表达同一件事。见[配置存放在哪里](#配置存放在哪里)。 |
+| `--storage-url <URL>` | 数据库的位置（默认：`--config` 旁边的 `nexapipe.db`）；`NEXAPIPE_STORAGE_URL` 表达同一件事。 |
 | `--local-proxy` | 以客户端本地 HTTP 代理运行，而非服务端。 |
 | `--generate-secret` | 打印一个新的 iroh 密钥。通常不需要 —— 服务端会在首次启动时自行写入 `[iroh] secret_key`；这条命令用于把身份搬到另一台机器。 |
 | `--generate-2fa <CLIENT_ID>` | 生成 TOTP 密钥，写入配置并打印注册用二维码。 |
@@ -542,9 +547,15 @@ created_at = "1723756800"
 
 ## 配置
 
-`config.toml` 是服务端与客户端模式的唯一事实来源。所有配置项都是可选的。
+`config.toml` 描述服务端与客户端模式。所有配置项都是可选的。
 
-文件每 5 秒重新读取一次并**即时生效**：`[[routes]]` 与
+**配置存放在哪里取决于存储。** 没有任何说明的部署把它放在一个叫 `nexapipe.db` 的
+SQLite 数据库里，位置就在 `--config` 所指的目录 —— `./config.toml` 对应
+`./nexapipe.db`，`/etc/nexapipe/config.toml` 对应 `/etc/nexapipe/nexapipe.db`。
+只有一个锚点，因此配置、锁定计数和令牌都在同一个目录里，备份一次就够。见
+[配置存放在哪里](#配置存放在哪里)。
+
+配置每 5 秒重新读取一次并**即时生效**：`[[routes]]` 与
 `[auth.clients]` 表无需重启；解析或校验失败的配置会被报告并忽略，因此一次只写了一
 半的编辑不会把代理搞 down。其余配置在启动时只读取一次，需要重启：
 `[server] listen_addr`、`[iroh]`、`[peers]`、`[auth]` 的 TOTP 参数，以及 `[log]`。
@@ -556,12 +567,54 @@ created_at = "1723756800"
 监视器拾取，但把 2FA 关掉会被拒绝（要禁用请重启）；而 `enabled = true` 与暴露的明文
 监听器同时出现则直接被拒绝启动。
 
-### 配置与状态是两个文件
+### 配置存放在哪里
 
-`config.toml` 是运维者的文件：他写的、他读的、他放进版本控制的。而运行中的服务端
-学到的东西——某个客户端输错几次密码、锁到什么时候、最后一次出现是什么时候——
-不属于这一类，所以它们住在配置**旁边**的状态文件里，格式相同，客户端与设备
-的名字也相同。
+存储由命令行选定，从不写在配置自身里 —— 一份文档说不出自己住在哪，因为它正是从
+那里读出来的。
+
+| 存储 | 如何指定 | 位置 |
+| --- | --- | --- |
+| SQLite（默认） | 不写，或 `--storage sqlite` | `<--config 所在目录>/nexapipe.db` |
+| 文件 | `--storage toml` | `--config` 指定的路径 |
+
+无法修改启动命令行的部署可以用 `NEXAPIPE_STORAGE` 表达同一件事；`--storage-url` /
+`NEXAPIPE_STORAGE_URL` 则把数据库放到别处 —— URL 优先于推导出的路径：
+
+```bash
+nexapipe --config /etc/nexapipe/config.toml                       # /etc/nexapipe/nexapipe.db
+nexapipe --config /etc/nexapipe/config.toml --storage toml        # 文件，不开数据库
+nexapipe --config /etc/nexapipe/config.toml --storage-url /srv/nexapipe.db
+```
+
+数据库持有整份配置 —— 路由、客户端、设备、每个客户端的计数、admin 令牌和端点密钥 ——
+所以旁边没有 `config.state.toml`，也没有 `config.toml.admin-token`。文件存储仍然保留
+这两者（见[下一节](#文件存储是三个文件)）。
+
+**旧版本写下的 `config.toml` 会被导入一次。** 首次启动时若数据库为空且旁边有
+`config.toml`，该文件的配置会被写进数据库，并在日志里说明：
+
+```
+Imported the configuration from /etc/nexapipe/config.toml into /etc/nexapipe/nexapipe.db;
+this instance reads the store from now on. The file is left where it is — `--storage toml`
+reads it again — so editing it no longer changes this configuration
+```
+
+文件**不会**被搬走或删除：`--storage toml` 仍然读它，所以回退是一个旗标而不是一次
+恢复操作。无法解析的文件会让启动带着原因失败，数据库保持为空，而不是只应用一半。
+
+导入是**服务端启动**时的一步，而不是每条命令都会做：对空数据库执行 `client list`
+只会报告「没有配置」，不会在你背后做迁移 —— 只读的命令不该写。
+
+用 `--no-default-features` 构建的版本不带数据库驱动。它依然可用 —— 那就是纯文件
+服务端 —— 但必须用 `--storage toml` 告诉它，并且它会按名字拒绝数据库，而不是退回
+一个部署里可能并不存在的文件。
+
+### 文件存储是三个文件
+
+使用 `--storage toml` 时，`config.toml` 是运维者的文件：他写的、他读的、他放进
+版本控制的。而运行中的服务端学到的东西——某个客户端输错几次密码、锁到什么时候、
+最后一次出现是什么时候——不属于这一类，所以它们住在配置**旁边**的状态文件里，
+格式相同，客户端与设备的名字也相同。
 
 ```
 /etc/nexapipe/
@@ -1127,8 +1180,9 @@ allow = [
 
 ### 重载会应用哪些配置
 
-配置文件被监视，改动无需重启即可生效 —— 但不是每个键都可以。与其把这条规则散落在
-上面各节里，这里汇总成一张表：
+配置被监视 —— `--storage toml` 下看文件的修改时间，否则看数据库的 revision ——
+改动无需重启即可生效，但不是每个键都可以。与其把这条规则散落在上面各节里，这里
+汇总成一张表：
 
 | 键 | 重载时 |
 |---|---|
