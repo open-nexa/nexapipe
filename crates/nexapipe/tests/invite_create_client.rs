@@ -165,10 +165,10 @@ fn creates_a_missing_client_and_puts_a_one_time_token_in_the_invite() {
     );
 }
 
-/// `--registration` writes a `pending_enrollment` token, and the config writer
-/// refuses to do that for a client with no secret. `--create-client` has to
-/// supply one first, which is exactly the ordering that used to need two
-/// commands.
+/// A device invitation writes a `pending_enrollment` token, and the config
+/// writer refuses to do that for a client with no secret. `--create-client`
+/// has to supply one first, which is exactly the ordering that used to need
+/// two commands.
 #[test]
 fn creates_a_missing_client_for_an_enrollment_invite() {
     let (_dir, path) = scratch_config("config.toml");
@@ -176,10 +176,11 @@ fn creates_a_missing_client_for_an_enrollment_invite() {
     let (ok, output) = invite(
         &path,
         &[
-            "--generate-invite",
+            "device",
+            "invite",
+            "--client",
             "client-007",
             "--create-client",
-            "--registration",
             "--qr-format",
             "none",
         ],
@@ -192,6 +193,10 @@ fn creates_a_missing_client_for_an_enrollment_invite() {
         output.contains("enroll="),
         "the link carries a token:\n{output}"
     );
+    assert!(
+        output.contains("exp="),
+        "the link carries a deadline:\n{output}"
+    );
 
     let (_, auth) = nexapipe::config::Config::load_with_auth(path.to_str().unwrap())
         .expect("config still parses");
@@ -203,6 +208,10 @@ fn creates_a_missing_client_for_an_enrollment_invite() {
     assert!(
         client.pending_enrollment.is_some(),
         "the token joined the secret in one pass"
+    );
+    assert!(
+        client.pending_enrollment_expires_at.is_some(),
+        "the invitation expires"
     );
 }
 
@@ -296,7 +305,7 @@ fn an_existing_client_gets_a_link_that_says_it_is_a_credential() {
         "the link says what it is:\n{second}"
     );
     assert!(
-        second.contains("--registration"),
+        second.contains("device invite"),
         "the one-time form is named:\n{second}"
     );
 }

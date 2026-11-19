@@ -84,23 +84,27 @@ object IrohProxy {
     external fun nativeSetDiscoveryMode(discoveryMode: String): Int
 
     /**
-     * Names this device, once, for every **enrollment** it spends.
+     * Reports what this phone calls itself, once, for every **enrollment** it
+     * spends.
      *
-     * deviceId: printable ASCII without spaces, as
-     * `SettingsManager.deviceId()` generates it.
+     * label:    the model, from [android.os.Build.MODEL].
+     * platform: "android".
+     * model:    the OS version, from [android.os.Build.VERSION.RELEASE].
+     * appVersion: this app's version name.
      *
-     * An enrollment is where a name is asked for: the credential that comes
-     * back is filed under it on the server, so it is what makes that secret
-     * this phone's alone — and what lets it be revoked without rotating every
-     * other device's. Must be called before nativeStartProxy.
+     * These are labels for the operator, not an identity: the server files a
+     * device under the fingerprint of its key, worked out from the public half
+     * on both sides. Two phones may report the same four, and nothing here is
+     * used to claim a device id.
      *
-     * Kept apart from [nativeSetTwoFactorForNode] deliberately, even though one
-     * install has one name: what is set there is the name a *credential* was
-     * issued under, and the two are not the same question. Claiming this name
-     * for every pair would break the ones a server issued to the client, which
-     * it refuses rather than falling back on.
+     * Must be called before nativeStartProxy.
      */
-    external fun nativeSetDeviceId(deviceId: String): Int
+    external fun nativeSetDeviceInfo(
+        label: String,
+        platform: String,
+        model: String,
+        appVersion: String
+    ): Int
 
     /**
      * Configures the 2FA credentials of one endpoint.
@@ -156,10 +160,11 @@ object IrohProxy {
      * key:    the private half, as 64 hex characters — what
      *         [nativeGenerateDeviceKey] handed out.
      *
-     * A key is offered by the enrollment that spends the node's token, and
-     * signs every handshake after it. A node whose enrollment has not happened
-     * yet has a key but no device name, and the name is what the server
-     * answers with — so the key is an offer until then, not a credential.
+     * A key is the credential for this device: the private half never leaves
+     * the phone, and the id it answers under is the fingerprint of its public
+     * half, so no device name is needed here. On an endpoint still holding an
+     * enrollment token the key is offered as part of that enrollment, and signs
+     * every handshake after the token is spent.
      *
      * Must be called before nativeStartProxy.
      */
@@ -174,11 +179,12 @@ object IrohProxy {
      * token:    the token a `v=2` invite carried.
      *
      * The first connection to that endpoint spends it and the server answers
-     * with the real secret — which [nativeTakeIssuedCredential] then hands
-     * over to be persisted, because a token cannot be spent twice. An endpoint
-     * that already has credentials keeps them and never enrolls: enrolling
-     * rotates the secret, so every other device enrolled from the same code
-     * would be locked out by it.
+     * with the credential it filed — a TOTP secret, or the public half of the
+     * key this enrollment offered — which [nativeTakeIssuedCredential] then
+     * hands over to be persisted, because a token cannot be spent twice. An
+     * endpoint that already has credentials keeps them and never enrolls:
+     * enrolling rotates the secret, so every other device enrolled from the
+     * same code would be locked out by it.
      *
      * Must be called before nativeStartProxy.
      */

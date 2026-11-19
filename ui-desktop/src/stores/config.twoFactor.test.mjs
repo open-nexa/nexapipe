@@ -74,7 +74,7 @@ function withSecret(overrides = {}) {
   });
 }
 
-/** A node that enrolled with a key: no secret, a device name, and the key. */
+/** A node that enrolled with a key: no secret, the id the server filed it under, and the key. */
 function withKey(overrides = {}) {
   return node({
     twoFactor: { clientId: 'client-001', secret: '', algorithm: 'sha1', device: 'laptop' },
@@ -90,7 +90,7 @@ test('a node with a credential reads as on', () => {
 
 test('a node without one reads as off', () => {
   assert.equal(twoFactorState(node()), 'off');
-  // A record with an empty secret and no device name is not a credential: it
+  // A record with an empty secret and no device id is not a credential: it
   // is the shape an invite leaves behind.
   assert.equal(
     twoFactorState(node({ twoFactor: { clientId: '', secret: '', algorithm: 'sha1' } })),
@@ -100,7 +100,7 @@ test('a node without one reads as off', () => {
 
 test('a node waiting to enroll reads as pending, not off', () => {
   const pending = node({
-    enrollment: { clientId: 'client-001', token: 'tok', device: 'laptop' },
+    enrollment: { clientId: 'client-001', token: 'tok', deviceInfo: { label: 'laptop' } },
     // The key is on file already — it is what the enrollment will offer — and
     // it must not make the node read as one that already holds a credential.
     deviceKey: 'ab'.repeat(32),
@@ -110,9 +110,9 @@ test('a node waiting to enroll reads as pending, not off', () => {
   assert.equal(twoFactorState(pending), 'pending');
 });
 
-test('a key counts only once it names the device it was issued to', () => {
+test('a key counts only once the server has filed it under an id', () => {
   // The key is an offer until the enrollment has been answered: the server
-  // records the public half under a device name, and without that name there
+  // records the public half under the fingerprint, and without that id there
   // is nothing on the server to answer with.
   const offered = node({
     twoFactor: { clientId: 'client-001', secret: '', algorithm: 'sha1' },

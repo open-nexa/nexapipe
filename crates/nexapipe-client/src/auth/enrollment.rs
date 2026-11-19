@@ -10,6 +10,7 @@ use nexapipe_proto::secret::SecretString;
 
 use crate::ClientError;
 
+use super::device::DeviceInfo;
 use super::message::{AUTH_HANDSHAKE_TIMEOUT, message_name, read_message, write_message};
 use super::totp::{TotpAlgorithm, masked};
 use super::two_factor::TwoFactorAuth;
@@ -88,11 +89,22 @@ pub struct Enrollment {
     /// the token is wiped when the enrollment is dropped — which is what
     /// happens the moment it has been spent.
     token: SecretString,
-    /// The name to be enrolled under. The token is what authorizes the
-    /// exchange, so this is a request rather than a claim: the server is free
-    /// to answer with it or to refuse it, and what it answers with is what the
-    /// credential is filed under.
+    /// The id to be enrolled under, when the caller knows one.
+    ///
+    /// The token is what authorizes the exchange, so this is a request rather
+    /// than a claim: the server is free to answer with it or to refuse it, and
+    /// what it answers with is what the credential is filed under.
+    ///
+    /// A device that offers a key does not need to say anything here: the id
+    /// is worked out from that key, by the same rule the server works it out
+    /// by, and it is filled in at the exchange. The field is for the older
+    /// arrangement, where a client that offers no key is known by a name.
     device_id: Option<String>,
+    /// What this device says about itself, for the server to keep.
+    ///
+    /// Labels and not an identity: nothing is refused over any of them, and
+    /// two devices may carry the same ones.
+    info: DeviceInfo,
     /// The device key to offer, if any. What travels is the public half, and
     /// what comes back tells this side whether the offer was taken: an empty
     /// `secret` in ENROLL_ISSUE is the server saying the key was recorded.
@@ -109,6 +121,7 @@ impl std::fmt::Debug for Enrollment {
             .field("client_id", &self.client_id)
             .field("token", &masked(self.token.as_str()))
             .field("device_id", &self.device_id)
+            .field("info", &self.info)
             .finish()
     }
 }
@@ -150,12 +163,27 @@ impl Enrollment {
             token: SecretString::new(token.to_string()),
             device_id: None,
             key: None,
+            info: DeviceInfo::default(),
         }
     }
 
-    /// The same enrollment, asking to be issued under one device name.
+    /// The same enrollment, asking to be issued under one device id.
+    ///
+    /// The older arrangement: a client that offers no key is known by a name
+    /// it claims. A client that offers a key does not need this — its id is
+    /// worked out from the key, and one that disagrees with it is refused.
     pub fn with_device(mut self, device_id: &str) -> Self {
         self.device_id = Some(device_id.to_string());
+        self
+    }
+
+    /// The same enrollment, saying what this device is.
+    ///
+    /// The name it calls itself, the platform it runs on, the model it is and
+    /// the version of the app. The server keeps these beside the credential
+    /// for the operator to read; nothing is refused over them.
+    pub fn with_device_info(mut self, info: DeviceInfo) -> Self {
+        self.info = info;
         self
     }
 
@@ -179,6 +207,20 @@ impl Enrollment {
     /// The device this enrollment will ask for, if it was given one.
     pub fn device_id(&self) -> Option<&str> {
         self.device_id.as_deref()
+    }
+
+    /// The id this enrollment is filed under, worked out the way the server
+    /// works it out.
+    ///
+    /// The name the caller gave, when it gave one; otherwise the fingerprint of
+    /// the key this enrollment offers, which is the same id the server will
+    /// work out for itself.
+    fn asked_device_id(&self) -> Option<String> {
+        match (&self.device_id, &self.key) {
+            (Some(id), _) => Some(id.clone()),
+            (None, Some(key)) => Some(super::device::device_id_of_key(key)),
+            (None, None) => None,
+        }
     }
 
     /// Trades the token for the real credential and authenticates with it, in
@@ -224,11 +266,19 @@ impl Enrollment {
                 // receiver has to compare it — but the one here is still a
                 // `Secret`, and is wiped with the message.
                 token: self.token.clone(),
-                device_id: self.device_id.clone(),
+                // The id the device is known by: the fingerprint of the key it
+                // offers, worked out here so that it can be said in the
+                // request as well as worked out by the server.
+                device_id: self.asked_device_id(),
                 public_key: self
                     .key
                     .as_ref()
                     .map(|key| hex::encode(key.public().as_bytes())),
+                // What the device says about itself.
+                label: self.info.label.clone(),
+                platform: self.info.platform.clone(),
+                model: self.info.model.clone(),
+                app_version: self.info.app_version.clone(),
             },
             Format::LegacyJson,
         )
@@ -261,18 +311,17 @@ impl Enrollment {
                                 .to_string(),
                         ));
                     };
-                    // A key is one device's credential; the unnamed slot is
-                    // the client's shared secret and the server refuses to
-                    // file a key there, so a key answer always names the
-                    // device it was filed under.
-                    let Some(name) = device_id else {
-                        return Err(ClientError::Other(
-                            "the server issued a key credential without naming the device \
-                             it was filed under"
-                                .to_string(),
-                        ));
-                    };
-                    TwoFactorAuth::with_key(&client_id, key, &name)
+                    // The device this key credential belongs to. The server
+                    // names it, and on a server that knows keys the name it
+                    // gives is the fingerprint of this very key — the id the
+                    // key works out to. A server that predates keys filed it
+                    // under the name the client claimed, and that name is what
+                    // the handshake has to answer with, so it is taken from the
+                    // answer rather than worked out here.
+                    let name = device_id
+                        .clone()
+                        .unwrap_or_else(|| super::device::device_id_of_key(&key));
+                    TwoFactorAuth::with_key(&client_id, key).with_device(&name)
                 } else {
                     // A secret came back, so a secret is the credential:
                     // either that is what was asked for, or a key was offered

@@ -75,6 +75,10 @@ pub(crate) async fn list_clients(storage: &dyn Storage, json: bool) -> anyhow::R
                             "created_at": seconds_of(&device.created_at),
                             "last_used": device.last_used,
                             "key": device.public_key.is_some(),
+                            "label": device.label,
+                            "platform": device.platform,
+                            "model": device.model,
+                            "app_version": device.app_version,
                         })
                     })
                     .collect();
@@ -92,6 +96,7 @@ pub(crate) async fn list_clients(storage: &dyn Storage, json: bool) -> anyhow::R
                     // the list looks like the same restriction either way.
                     "allow_ports_strict": client.allow_ports_strict,
                     "invite_outstanding": client.pending_enrollment.is_some(),
+                    "invite_expires_at": client.pending_enrollment_expires_at,
                     "failed_attempts": client.failed_attempts,
                     "locked_out": client.is_locked_out(),
                     "devices": devices,
@@ -171,7 +176,13 @@ pub(crate) async fn list_clients(storage: &dyn Storage, json: bool) -> anyhow::R
             );
         }
         if client.pending_enrollment.is_some() {
-            println!("    invite      outstanding");
+            match client.pending_enrollment_expires_at {
+                Some(at) => println!(
+                    "    invite      outstanding, expires {}",
+                    stamp(Some(at as i64))
+                ),
+                None => println!("    invite      outstanding, no deadline"),
+            }
         }
         if client.failed_attempts > 0 {
             println!(
@@ -206,6 +217,9 @@ pub(crate) async fn list_clients(storage: &dyn Storage, json: bool) -> anyhow::R
                 if device.public_key.is_some() {
                     line.push_str(", key");
                 }
+                if let Some(label) = &device.label {
+                    line.push_str(&format!(", {label}"));
+                }
                 println!("      {name:width$}  {line}");
             }
         }
@@ -238,18 +252,13 @@ pub(crate) async fn list_clients(storage: &dyn Storage, json: bool) -> anyhow::R
 /// Issues a credential and writes it into the config, for a client or for one
 /// device of it.
 ///
-/// The two differ in what they rotate, and that is the whole reason the device
-/// table exists: `client add <id>` rewrites the client's own `secret`, which is
-/// the credential of the device that names none — every device that enrolled
-/// before the table existed — while `client add <id> --device <name>` writes a
-/// credential of its own under that device and leaves the client's alone, so the
-/// other devices keep working.
+/// `client add <id>` rewrites the client's own `secret`, which is the
+/// credential of a device that has no row of its own.
 ///
-/// `--device <name> --public-key <hex>` is the third case: the device is issued
-/// a key instead of a secret, so the ordinary path — generate a secret, draw it
-/// as a QR code — is skipped whole. Nothing is generated, because the private
-/// half is already on the device; what is written is the public half the
-/// operator pasted.
+/// `--public-key <hex>` writes a key credential for one device instead. The
+/// device is filed under the fingerprint of that key, so there is no name for
+/// the operator to invent; the normal way to get a device enrolled is
+/// `nexapipe device invite`, where the device reports its own details.
 pub(crate) async fn add_client(
     cli: &Cli,
     storage: &dyn Storage,
@@ -262,6 +271,13 @@ pub(crate) async fn add_client(
     use nexapipe::auth::otpauth::DEFAULT_ISSUER;
 
     let client_id = client_id.trim();
+    if device.is_some() {
+        anyhow::bail!(
+            "--device has been replaced by `nexapipe device invite --client <CLIENT_ID>`: a \
+             device is now identified by the fingerprint of its key, not by a name the operator \
+             picks"
+        );
+    }
     // Both ids are checked before anything is written, for the reason the
     // handshake checks them: either one becomes a key in this file, is sent by a
     // device, and is the subject of every log line about it. An id the server
@@ -274,25 +290,31 @@ pub(crate) async fn add_client(
             nexapipe::auth::MAX_CLIENT_ID_LEN
         );
     }
-    if let Some(device) = device
-        && !nexapipe::auth::is_presentable_device_id(device)
-    {
-        anyhow::bail!(
-            "device name {device:?} is printable ASCII of at most {} characters and not empty — \
-             it is a key under [auth.clients.{}.devices] and the subject of every log line about \
-             it",
-            nexapipe::auth::MAX_DEVICE_ID_LEN,
-            toml_key(client_id)
-        );
-    }
-
     let (auth_config, config_loaded) = load_auth_config(storage).await;
 
     // A device cannot be the first thing a client gets: a device table under a
     // client with no secret of its own is a config that will not load, and
     // saying so here beats writing a file that cannot be read back.
     let client = auth_config.clients.get(client_id);
-    if device.is_some() && client.is_none() {
+    // A key is filed under its fingerprint, so the row it would occupy is
+    // known before anything is written. Checking that row, rather than the
+    // client's own secret, is what lets a device be added without rotating the
+    // credential every other device is using.
+    let key = match public_key {
+        Some(offered) => {
+            let parsed = nexapipe::auth::parse_public_key(offered)
+                .map_err(|why| anyhow::anyhow!("--public-key: {why}"))?;
+            Some((
+                nexapipe::auth::device_id_from_public_key(parsed.as_bytes()),
+                nexapipe::auth::public_key_hex(&parsed),
+            ))
+        }
+        None => None,
+    };
+    // Without a key this command creates the client's shared secret, so a
+    // missing client is the normal case. A key, though, needs a row to be
+    // filed under.
+    if client.is_none() && key.is_some() {
         anyhow::bail!(
             "client \"{client_id}\" has no [auth.clients.{}] secret in {}; add the client first \
              with `nexapipe client add {client_id}`",
@@ -300,13 +322,13 @@ pub(crate) async fn add_client(
             storage.describe()
         );
     }
-    let already = match device {
-        Some(name) => client.is_some_and(|client| client.devices.contains_key(name)),
+    let already = match &key {
+        Some((name, _)) => client.is_some_and(|client| client.devices.contains_key(name)),
         None => client.is_some(),
     };
     if already && !force {
-        match device {
-            Some(name) => anyhow::bail!(
+        match &key {
+            Some((name, _)) => anyhow::bail!(
                 "device \"{name}\" of client \"{client_id}\" already has a credential in {}; \
                  pass --force to issue it another one, which enrolls the device using the \
                  current one out",
@@ -325,18 +347,7 @@ pub(crate) async fn add_client(
     // normally does — getting the credential onto the device — has been done
     // by whoever generated the pair; all that is missing is the public half
     // recorded on this side.
-    if let Some(offered) = public_key {
-        // `requires = "device"` on the flag already refuses this spelling;
-        // the check stays because this function is where the invariant lives,
-        // and a key belongs to one named device — the unnamed slot is the
-        // client's shared secret, which has no key to be half of.
-        let Some(name) = device else {
-            anyhow::bail!("--public-key needs --device: a key is issued to one named device");
-        };
-        let key = nexapipe::auth::parse_public_key(offered)
-            .map_err(|why| anyhow::anyhow!("--public-key: {why}"))?;
-        let key = nexapipe::auth::public_key_hex(&key);
-
+    if let Some((name, key)) = key {
         println!();
         println!("Key for device \"{name}\" of client \"{client_id}\"");
         println!("  Public key {key}");
@@ -351,7 +362,7 @@ pub(crate) async fn add_client(
         return write_issued_credential(
             storage,
             client_id,
-            Some(name),
+            Some(&name),
             nexapipe::auth::DeviceMaterial::PublicKey(&key),
             auth_config.enabled,
             force,
@@ -465,11 +476,11 @@ async fn write_issued_credential(
             "public key",
         ),
         // A key is one device's, and the unnamed slot — the client's own
-        // `secret` — is a string a key cannot live in. The CLI refuses this
-        // spelling twice before it gets here; the arm keeps the writer from
+        // `secret` — is a string a key cannot live in. The CLI derives the
+        // fingerprint row before it gets here; the arm keeps the writer from
         // being the one place that would write such a key nowhere.
         (None, nexapipe::auth::DeviceMaterial::PublicKey(_)) => {
-            anyhow::bail!("a public key is issued to a named device; pass --device with it")
+            anyhow::bail!("a public key needs the device row its fingerprint names")
         }
     };
 

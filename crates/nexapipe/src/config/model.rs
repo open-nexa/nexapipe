@@ -165,6 +165,10 @@ impl Auth {
                             .unwrap_or_else(crate::auth::config::default_created_at),
                         last_used: device.last_used,
                         last_used_step: None,
+                        label: device.label,
+                        platform: device.platform,
+                        model: device.model,
+                        app_version: device.app_version,
                     },
                 );
             }
@@ -180,6 +184,7 @@ impl Auth {
                     allow_ports: client.allow_ports,
                     allow_ports_strict: client.allow_ports_strict.unwrap_or(false),
                     pending_enrollment: client.pending_enrollment,
+                    pending_enrollment_expires_at: client.pending_enrollment_expires_at,
                     devices,
                     unnamed_device_allowed: client.unnamed_device_allowed.unwrap_or(true),
                     last_used: client.last_used,
@@ -238,6 +243,7 @@ impl Auth {
                             allow_ports: client.allow_ports.clone(),
                             allow_ports_strict: Some(client.allow_ports_strict),
                             pending_enrollment: client.pending_enrollment.clone(),
+                            pending_enrollment_expires_at: client.pending_enrollment_expires_at,
                             devices: client
                                 .devices
                                 .iter()
@@ -252,6 +258,10 @@ impl Auth {
                                             public_key: device.public_key.clone(),
                                             created_at: non_empty(&device.created_at),
                                             last_used: device.last_used,
+                                            label: device.label.clone(),
+                                            platform: device.platform.clone(),
+                                            model: device.model.clone(),
+                                            app_version: device.app_version.clone(),
                                         },
                                     )
                                 })

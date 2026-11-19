@@ -654,16 +654,19 @@ domains = ["app.example.com"]
 #   nexapipe --generate-invite client-001 --config config.toml
 #
 # The invite above carries the secret in the clear, so the code itself is the
-# credential. `--registration` swaps it for a one-time enrollment token:
-#   nexapipe --generate-invite client-001 --registration --config config.toml
-# That token lands in `pending_enrollment` here; the first device to scan it
-# trades it for a fresh secret and the token is spent - see
+# credential. `--registration` is removed; the device invitation is the one-time
+# form, and it has a deadline:
+#   nexapipe device invite --client client-001 --config config.toml
+#   nexapipe device invite --client client-001 --ttl 2h --config config.toml
+# It writes `pending_enrollment` and `pending_enrollment_expires_at` (a Unix
+# timestamp) here; the first device to scan before the deadline is filed under
+# the fingerprint of its key, and the token is spent - see
 # config.toml.2fa.example for the full flow.
 #
 # This file ships with 2FA on and no client enrolled, so nothing can connect
 # until you enroll the first one - which is the point: the first credential is
 # handed out on purpose.
-#   nexapipe --generate-invite client-001 --create-client --config config.toml
+#   nexapipe device invite --client client-001 --create-client --config config.toml
 [auth]
 enabled = true
 # issuer = "NexaPipe"
@@ -676,6 +679,8 @@ enabled = true
 #
 # [auth.clients.client-001]
 # secret = "JBSWY3DPEHPK3PXP"
+# pending_enrollment = "one-time-token"       # written by `device invite`, not by hand
+# pending_enrollment_expires_at = 1763577600  # Unix deadline of that invitation
 # created_at = "1723756800"
 # allow_hosts = ["app.example.com", "*.db.example.com"]   # unset = every route
 # allow_ports = [443, 8443]                                # unset = every port

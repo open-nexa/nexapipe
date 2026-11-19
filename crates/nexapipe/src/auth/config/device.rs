@@ -60,6 +60,23 @@ pub struct DeviceAuth {
     /// so there is nothing for a second use to replay.
     #[serde(default)]
     pub last_used_step: Option<u64>,
+    /// The name the device calls itself, for the operator to read.
+    ///
+    /// A label and not an identity: the device is known by the fingerprint of
+    /// its key, and two devices may carry the same label — which is the point
+    /// of the label being one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// The platform the device runs on: `android`, `macos`, `windows`, `linux`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    /// The model the device runs on: the phone's model, the operating
+    /// system's version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The version of the app the device runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_version: Option<String>,
 }
 
 /// The material one device's credential is made of, on its way into the file:
@@ -81,6 +98,86 @@ pub enum DeviceMaterial<'a> {
     PublicKey(&'a str),
 }
 
+/// What a device says about itself when it enrolls.
+///
+/// Four labels, none of which is an identity: the device is known by the
+/// fingerprint of its key, and these are what the operator reads to tell two
+/// of them apart. Two devices may carry the same label, so nothing is refused
+/// over any of them.
+///
+/// The strings come off the wire, so they are cleaned before they are kept:
+/// control characters are dropped, because the label reaches a log line and a
+/// newline in it would write the next line, and each one is clipped, because a
+/// device that sends a megabyte of model name should not be able to put it in
+/// the configuration file.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeviceInfo {
+    /// The name the device calls itself.
+    pub label: Option<String>,
+    /// The platform the device runs on: `android`, `macos`, `windows`, `linux`.
+    pub platform: Option<String>,
+    /// The model the device runs on: the phone's model, the operating
+    /// system's version.
+    pub model: Option<String>,
+    /// The version of the app the device runs.
+    pub app_version: Option<String>,
+}
+
+/// Longest a label may be.
+///
+/// Long enough for a phone's model and a version string, short enough that a
+/// list of devices stays a list.
+const MAX_INFO_LEN: usize = 128;
+
+impl DeviceInfo {
+    /// The four fields, cleaned on the way in.
+    ///
+    /// An empty field is dropped rather than kept as an empty string: there is
+    /// a difference between a device that said nothing and a device that said
+    /// nothing at all, and only the first is worth a key in the file.
+    pub fn new(
+        label: Option<&str>,
+        platform: Option<&str>,
+        model: Option<&str>,
+        app_version: Option<&str>,
+    ) -> Self {
+        Self {
+            label: clean(label),
+            platform: clean(platform),
+            model: clean(model),
+            app_version: clean(app_version),
+        }
+    }
+
+    /// Whether this says anything at all.
+    pub fn is_empty(&self) -> bool {
+        self.label.is_none()
+            && self.platform.is_none()
+            && self.model.is_none()
+            && self.app_version.is_none()
+    }
+}
+
+/// A label off the wire, cleaned on the way in.
+///
+/// Control characters go: the label reaches a log line, and one that ends in a
+/// newline writes the line after it. The rest is kept as it is — a phone's
+/// model is not always ASCII, and transliterating it would make the operator
+/// read a name their device does not call itself.
+fn clean(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let cleaned: String = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_INFO_LEN)
+        .collect();
+    let cleaned = cleaned.trim();
+    (!cleaned.is_empty()).then(|| cleaned.to_string())
+}
+
 /// Same reason as [`ClientAuth`](super::ClientAuth)'s, and the same consequence: the whole config
 /// is logged when it is parsed, and a device secret is as live a credential as
 /// a client's. The public key is not redacted: it is public by definition, and
@@ -93,6 +190,10 @@ impl std::fmt::Debug for DeviceAuth {
             .field("created_at", &self.created_at)
             .field("last_used", &self.last_used)
             .field("last_used_step", &self.last_used_step)
+            .field("label", &self.label)
+            .field("platform", &self.platform)
+            .field("model", &self.model)
+            .field("app_version", &self.app_version)
             .finish()
     }
 }

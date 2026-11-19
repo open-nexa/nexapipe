@@ -6,10 +6,12 @@
 //! config file on disk, reading the file back afterwards to see what it did.
 //!
 //! The device cases are the ones worth pinning. `client add <id>` and
-//! `client add <id> --device <name>` look like the same command and are not: the
-//! first rotates the credential every unnamed device of that client is using,
-//! the second leaves it alone and writes a credential of its own. Which one ran
-//! is the difference between re-enrolling a client and adding a laptop.
+//! `client add <id> --public-key <hex>` look like the same command and are not:
+//! the first rotates the credential every unnamed device of that client is
+//! using, the second writes a key credential of its own under the device id
+//! derived from that key. Which one ran is the difference between re-enrolling
+//! a client and registering a laptop. Device names are gone: `--device` now
+//! points the operator at `nexapipe device invite --client <CLIENT_ID>`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -78,6 +80,25 @@ fn printed_secret(text: &str) -> String {
         .next()
         .expect("the URI has a first parameter")
         .to_string()
+}
+
+/// Registers a device through `--public-key`, the way an operator hands the
+/// server a key the device generated itself.
+///
+/// Returns the hex public key and the device id the server derives from it, so
+/// a test can read the row back and revoke by the same id a real device would
+/// be known by. No otpauth URI comes back from this path: there is no shared
+/// secret to print, only the public half of the key.
+fn add_key_device(config: &Path, client_id: &str) -> (String, String) {
+    let key = iroh::SecretKey::generate();
+    let public_key = hex::encode(key.public().as_bytes());
+    let device_id = nexapipe::auth::device_id_from_public_key(key.public().as_bytes());
+    let (ok, text) = run(
+        config,
+        &["client", "add", client_id, "--public-key", &public_key],
+    );
+    assert!(ok, "adding the device failed:\n{text}");
+    (public_key, device_id)
 }
 
 #[test]
@@ -153,31 +174,37 @@ fn a_device_gets_a_credential_of_its_own() {
     assert!(ok, "the client should be added first");
     let client_secret = printed_secret(&run(&path, &["--show-2fa", "acme"]).1);
 
-    let (ok, text) = run(&path, &["client", "add", "acme", "--device", "laptop"]);
-    assert!(ok, "adding the device failed:\n{text}");
-    let device_secret = printed_secret(&text);
+    let (public_key, device_id) = add_key_device(&path, "acme");
 
     let written = fs::read_to_string(&path).expect("read back");
     assert!(
         written.contains("[auth.clients.acme.devices]"),
         "the device needs a table of the client's own:\n{written}"
     );
-    assert!(written.contains(&device_secret), "{written}");
+    assert!(
+        written.contains(&format!("{device_id} = {{")),
+        "the device must be filed under the fingerprint of its key:\n{written}"
+    );
+    assert!(
+        written.contains(&format!("public_key = \"{public_key}\"")),
+        "the device must hold the key half the operator registered:\n{written}"
+    );
     assert!(
         written.contains(&format!("secret = \"{client_secret}\"")),
         "the client's own secret must survive — it is the credential of the device that names \
          none:\n{written}"
     );
-    assert_ne!(client_secret, device_secret);
 
-    // And it is not merely text in the file: the server has to read it back as a
-    // credential of that device.
+    // And it is not merely text in the file: the server has to read it back as
+    // a key credential of that device.
     let (_, auth) = nexapipe::config::Config::load_with_auth(path.to_str().expect("utf-8 path"))
         .expect("config still parses");
     let auth = auth.expect("[auth] exists");
     assert_eq!(
-        auth.clients["acme"].devices["laptop"].secret.as_str(),
-        device_secret
+        auth.clients["acme"].devices[&device_id]
+            .public_key
+            .as_deref(),
+        Some(public_key.as_str())
     );
     assert_eq!(auth.clients["acme"].secret.as_str(), client_secret);
 }
@@ -186,9 +213,14 @@ fn a_device_gets_a_credential_of_its_own() {
 fn a_device_cannot_be_the_first_thing_a_client_gets() {
     let (_dir, path) = empty_auth();
 
+    // The old spelling is gone. The error has to name the command that replaced
+    // it, so an operator following an old runbook knows where to go.
     let (ok, text) = run(&path, &["client", "add", "ghost", "--device", "laptop"]);
-    assert!(!ok, "a device under no client must not be created:\n{text}");
-    assert!(text.contains("add the client first"), "{text}");
+    assert!(!ok, "a named device must not be created:\n{text}");
+    assert!(
+        text.contains("device invite"),
+        "the error should point at the replacement command:\n{text}"
+    );
     let written = fs::read_to_string(&path).expect("read back");
     assert!(!written.contains("ghost"), "{written}");
 }
@@ -199,23 +231,24 @@ fn the_list_names_the_devices_and_prints_no_secret() {
     let (ok, text) = run(&path, &["client", "add", "acme"]);
     assert!(ok, "{text}");
     let secret = printed_secret(&text);
-    let (ok, text) = run(&path, &["client", "add", "acme", "--device", "laptop"]);
-    assert!(ok, "{text}");
-    let device_secret = printed_secret(&text);
+    let (_public_key, device_id) = add_key_device(&path, "acme");
 
     let (ok, listed) = run(&path, &["client", "list"]);
     assert!(ok, "{listed}");
     assert!(listed.contains("acme"), "{listed}");
-    assert!(listed.contains("laptop"), "{listed}");
+    assert!(
+        listed.contains(&device_id),
+        "the device must be listed under the id derived from its key:\n{listed}"
+    );
+    assert!(
+        listed.contains(", key"),
+        "the key device is marked as such:\n{listed}"
+    );
     // The command run to see what is configured is the worst place for a
     // credential: scrollback, pastes and screenshots outlive it.
     assert!(
         !listed.contains(&secret),
         "the client's secret is printed:\n{listed}"
-    );
-    assert!(
-        !listed.contains(&device_secret),
-        "the device's secret is printed:\n{listed}"
     );
 }
 
@@ -225,8 +258,7 @@ fn the_list_is_parseable_as_json_and_carries_no_secret() {
     let (ok, text) = run(&path, &["client", "add", "acme"]);
     assert!(ok, "{text}");
     let secret = printed_secret(&text);
-    let (ok, _) = run(&path, &["client", "add", "acme", "--device", "laptop"]);
-    assert!(ok, "the device should be added");
+    let (_public_key, device_id) = add_key_device(&path, "acme");
 
     let (ok, text) = run(&path, &["client", "list", "--json"]);
     assert!(ok, "{text}");
@@ -235,9 +267,34 @@ fn the_list_is_parseable_as_json_and_carries_no_secret() {
     assert_eq!(clients.len(), 1, "{clients:?}");
     assert_eq!(clients[0]["id"], "acme");
     assert_eq!(clients[0]["has_secret"], true);
+    // The invite deadline is part of the shape, even when no invite is pending:
+    // an operator reading the JSON can tell that apart from a field that is
+    // simply absent in this build.
+    assert!(
+        clients[0]
+            .as_object()
+            .expect("client object")
+            .contains_key("invite_expires_at"),
+        "the invite deadline is part of the client shape: {clients:?}"
+    );
+    assert!(clients[0]["invite_expires_at"].is_null(), "{clients:?}");
     let devices = clients[0]["devices"].as_array().expect("devices");
     assert_eq!(devices.len(), 1, "{devices:?}");
-    assert_eq!(devices[0]["name"], "laptop");
+    assert_eq!(devices[0]["name"], device_id);
+    assert_eq!(devices[0]["key"], true);
+    // The device's self-reported details are part of the shape too. A key
+    // registered by hand reports none of them, so each field is present but
+    // null — not missing from the JSON entirely.
+    for field in ["label", "platform", "model", "app_version"] {
+        assert!(
+            devices[0]
+                .as_object()
+                .expect("device object")
+                .contains_key(field),
+            "{field} is part of the device shape: {devices:?}"
+        );
+        assert!(devices[0][field].is_null(), "{field}: {devices:?}");
+    }
     assert!(
         !text.contains(&secret),
         "the JSON carries the secret:\n{text}"
@@ -250,14 +307,13 @@ fn revoking_a_device_leaves_the_client_alone() {
     let (ok, text) = run(&path, &["client", "add", "acme"]);
     assert!(ok, "{text}");
     let client_secret = printed_secret(&text);
-    let (ok, _) = run(&path, &["client", "add", "acme", "--device", "laptop"]);
-    assert!(ok, "the device should be added");
+    let (_public_key, device_id) = add_key_device(&path, "acme");
 
-    let (ok, text) = run(&path, &["client", "revoke", "acme", "--device", "laptop"]);
+    let (ok, text) = run(&path, &["client", "revoke", "acme", "--device", &device_id]);
     assert!(ok, "revoking failed:\n{text}");
 
     let written = fs::read_to_string(&path).expect("read back");
-    assert!(!written.contains("laptop"), "{written}");
+    assert!(!written.contains(&device_id), "{written}");
     assert!(
         written.contains(&format!("secret = \"{client_secret}\"")),
         "the client's own credential is not a device's to revoke:\n{written}"
@@ -275,10 +331,9 @@ fn revoking_a_device_says_what_the_shared_secret_still_is() {
     let (_dir, path) = empty_auth();
     let (ok, _) = run(&path, &["client", "add", "acme"]);
     assert!(ok, "the client should be added");
-    let (ok, _) = run(&path, &["client", "add", "acme", "--device", "laptop"]);
-    assert!(ok, "the device should be added");
+    let (_public_key, device_id) = add_key_device(&path, "acme");
 
-    let (ok, text) = run(&path, &["client", "revoke", "acme", "--device", "laptop"]);
+    let (ok, text) = run(&path, &["client", "revoke", "acme", "--device", &device_id]);
     assert!(ok, "revoking failed:\n{text}");
     assert!(
         text.contains("one can still authenticate as this client"),
@@ -329,8 +384,7 @@ fn revoking_a_client_takes_its_devices_with_it() {
     let (_dir, path) = empty_auth();
     let (ok, _) = run(&path, &["client", "add", "acme"]);
     assert!(ok, "the client should be added");
-    let (ok, _) = run(&path, &["client", "add", "acme", "--device", "laptop"]);
-    assert!(ok, "the device should be added");
+    let (_public_key, _device_id) = add_key_device(&path, "acme");
 
     let (ok, text) = run(&path, &["client", "revoke", "acme"]);
     assert!(ok, "revoking failed:\n{text}");
@@ -349,8 +403,7 @@ fn revoking_what_is_not_there_is_an_error() {
     let (_dir, path) = empty_auth();
     let (ok, _) = run(&path, &["client", "add", "acme"]);
     assert!(ok, "the client should be added");
-    let (ok, _) = run(&path, &["client", "add", "acme", "--device", "laptop"]);
-    assert!(ok, "the device should be added");
+    let (_public_key, device_id) = add_key_device(&path, "acme");
 
     let (ok, text) = run(&path, &["client", "revoke", "ghost"]);
     assert!(!ok, "{text}");
@@ -361,12 +414,12 @@ fn revoking_what_is_not_there_is_an_error() {
     let (ok, text) = run(&path, &["client", "revoke", "acme", "--device", "tablet"]);
     assert!(!ok, "{text}");
     assert!(text.contains("tablet"), "{text}");
-    assert!(text.contains("laptop"), "{text}");
+    assert!(text.contains(&device_id), "{text}");
 
     let written = fs::read_to_string(&path).expect("read back");
     assert!(written.contains("acme"), "nothing was revoked:\n{written}");
     assert!(
-        written.contains("laptop"),
+        written.contains(&device_id),
         "nothing was revoked:\n{written}"
     );
 }
@@ -422,21 +475,20 @@ fn revoking_an_id_the_server_would_refuse_is_an_error() {
     let (_dir, path) = empty_auth();
     let (ok, _) = run(&path, &["client", "add", "acme"]);
     assert!(ok, "the client should be added");
-    let (ok, _) = run(&path, &["client", "add", "acme", "--device", "laptop"]);
-    assert!(ok, "the device should be added");
+    let (_public_key, device_id) = add_key_device(&path, "acme");
 
     for id in ["bad\nname", "", " "] {
         let (ok, text) = run(&path, &["client", "revoke", id]);
         assert!(!ok, "{id:?} must be refused:\n{text}");
     }
     let (ok, text) = run(&path, &["client", "revoke", "acme", "--device", "lap\ntop"]);
-    assert!(!ok, "a device name with a newline must be refused:\n{text}");
+    assert!(!ok, "a device id with a newline must be refused:\n{text}");
 
     // Nothing was touched, and the ids that are really there still are.
     let written = fs::read_to_string(&path).expect("read back");
     assert!(written.contains("acme"), "nothing was revoked:\n{written}");
     assert!(
-        written.contains("laptop"),
+        written.contains(&device_id),
         "nothing was revoked:\n{written}"
     );
 }

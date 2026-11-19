@@ -6,13 +6,13 @@
 
 use super::auth::constant_time_eq;
 use super::auth::enrollment::{
-    EnrollmentSlot, EnrollmentVerdict, IssuedCredential, device_taken_hint, enrollment_verdict,
-    issue_enrolled_secret, undo_enrolled_secret,
+    EnrollmentSlot, EnrollmentVerdict, IssuedCredential, device_taken_hint, enrollment_identity,
+    enrollment_verdict, issue_enrolled_secret, undo_enrolled_secret,
 };
 use super::auth::state::{persist_auth_state, storage_write};
 use super::stream::{StreamBudgets, StreamKind, classify, read_first_bytes};
 use super::{AuthState, count_enrollment_failure, find_headers_end};
-use crate::auth::{AuthConfig, ClientAuth, DeviceAuth};
+use crate::auth::{AuthConfig, ClientAuth, DeviceAuth, DeviceInfo};
 use nexapipe_proto::protocol::Protocol;
 use nexapipe_proto::secret::SecretString;
 use std::collections::HashMap;
@@ -232,6 +232,7 @@ fn device_secret(name: &str, secret: &str) -> IssuedCredential {
     IssuedCredential::DeviceSecret {
         name: name.to_string(),
         secret: SecretString::new(secret.to_string()),
+        info: DeviceInfo::default(),
     }
 }
 
@@ -326,6 +327,7 @@ fn auth_with_pending(token: Option<&str>) -> AuthConfig {
             allow_ports: None,
             allow_ports_strict: false,
             pending_enrollment: token.map(|t| SecretString::new(t.to_string())),
+            pending_enrollment_expires_at: None,
             devices: HashMap::new(),
             unnamed_device_allowed: true,
             last_used: None,
@@ -368,8 +370,34 @@ fn token_comparison_only_accepts_an_exact_match() {
 fn an_outstanding_token_is_accepted() {
     let cfg = auth_with_pending(Some("0123456789abcdef"));
     assert_eq!(
-        enrollment_verdict(&cfg, "alice", "0123456789abcdef", None, None),
+        enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcdef",
+            // A named device: a request that offers neither a name nor a key
+            // is refused on its own account, before the token is spent.
+            &enrollment_identity(Some("laptop"), None)
+        ),
         EnrollmentVerdict::Accept
+    );
+}
+
+/// A request that offers neither a key nor a name has nowhere to be filed but
+/// the client's own `secret` — the credential every other device of that
+/// client answers with. Spending the token there would rotate it and lock all
+/// of them out, so the request is refused before anything is issued, and it is
+/// not counted as a guess at the token.
+#[test]
+fn an_enrollment_with_neither_a_key_nor_a_name_is_refused() {
+    let cfg = auth_with_pending(Some("0123456789abcdef"));
+    assert_eq!(
+        enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcdef",
+            &enrollment_identity(None, None)
+        ),
+        EnrollmentVerdict::Refuse { counted: false }
     );
 }
 
@@ -413,6 +441,7 @@ fn a_key_enrollment_records_the_key_and_no_secret() {
         &IssuedCredential::DeviceKey {
             name: "phone".to_string(),
             key: spelled.clone(),
+            info: DeviceInfo::default(),
         },
     );
 
@@ -456,6 +485,10 @@ fn a_failed_write_puts_the_device_it_replaced_back() {
             created_at: "0".to_string(),
             last_used: None,
             last_used_step: None,
+            label: None,
+            platform: None,
+            model: None,
+            app_version: None,
         },
     );
 
@@ -510,6 +543,65 @@ fn a_failed_write_puts_the_clients_secret_back() {
     assert_eq!(cfg.clients["alice"].secret, shared);
 }
 
+/// The deadline is part of the invitation, not of the credential: a failed
+/// write has to put it back with the token, or an invitation that had already
+/// run out becomes one that never expires.
+#[test]
+fn a_failed_write_puts_the_invitation_deadline_back() {
+    let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+    // A deadline in the past, so the restored invitation is still refused.
+    let deadline = 1_700_000_000;
+    cfg.clients
+        .get_mut("alice")
+        .unwrap()
+        .pending_enrollment_expires_at = Some(deadline);
+
+    let slot = issue_enrolled_secret(&mut cfg, "alice", &device_secret("laptop", "NEWSECRET"));
+    assert!(
+        cfg.clients["alice"].pending_enrollment_expires_at.is_none(),
+        "a successful enrollment clears the deadline"
+    );
+
+    undo_enrolled_secret(&mut cfg, "alice", slot, "0123456789abcdef");
+
+    let alice = &cfg.clients["alice"];
+    assert_eq!(alice.pending_enrollment_expires_at, Some(deadline));
+    assert_eq!(
+        enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcdef",
+            &enrollment_identity(Some("laptop"), None)
+        ),
+        EnrollmentVerdict::Refuse { counted: false },
+        "the restored invitation is still past its deadline"
+    );
+}
+
+/// The unnamed slot clears the deadline on success too, so it has to restore
+/// it on failure just like the device slot does.
+#[test]
+fn a_failed_write_puts_the_deadline_back_on_the_unnamed_slot() {
+    let mut cfg = auth_with_pending(Some("0123456789abcdef"));
+    let deadline = 1_700_000_000;
+    cfg.clients
+        .get_mut("alice")
+        .unwrap()
+        .pending_enrollment_expires_at = Some(deadline);
+
+    let slot = issue_enrolled_secret(
+        &mut cfg,
+        "alice",
+        &IssuedCredential::SharedSecret(SecretString::new("NEWSECRET".to_string())),
+    );
+    undo_enrolled_secret(&mut cfg, "alice", slot, "0123456789abcdef");
+
+    assert_eq!(
+        cfg.clients["alice"].pending_enrollment_expires_at,
+        Some(deadline)
+    );
+}
+
 /// The token is a credential like any other: guessing at it has to cost
 /// the same as guessing a TOTP code, or the link is a slower credential
 /// with no ceiling on how many times it can be tried.
@@ -517,11 +609,16 @@ fn a_failed_write_puts_the_clients_secret_back() {
 fn a_wrong_token_is_refused_and_counted() {
     let cfg = auth_with_pending(Some("0123456789abcdef"));
     assert_eq!(
-        enrollment_verdict(&cfg, "alice", "0123456789abcde0", None, None),
+        enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcde0",
+            &enrollment_identity(None, None)
+        ),
         EnrollmentVerdict::Refuse { counted: true }
     );
     assert_eq!(
-        enrollment_verdict(&cfg, "alice", "", None, None),
+        enrollment_verdict(&cfg, "alice", "", &enrollment_identity(None, None)),
         EnrollmentVerdict::Refuse { counted: true }
     );
 }
@@ -570,7 +667,12 @@ fn the_token_has_a_ceiling_of_its_own() {
     let alice = &cfg.clients["alice"];
     assert!(alice.is_enrollment_locked_out(), "the slot is closed");
     assert_eq!(
-        enrollment_verdict(&cfg, "alice", "0123456789abcdef", None, None),
+        enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcdef",
+            &enrollment_identity(None, None)
+        ),
         EnrollmentVerdict::Refuse { counted: false },
         "even the right token is refused while the slot is closed"
     );
@@ -605,7 +707,12 @@ fn an_expired_enrollment_lockout_is_cleared() {
 fn a_client_with_nothing_pending_is_refused_without_being_counted() {
     let cfg = auth_with_pending(None);
     assert_eq!(
-        enrollment_verdict(&cfg, "alice", "0123456789abcdef", None, None),
+        enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcdef",
+            &enrollment_identity(None, None)
+        ),
         EnrollmentVerdict::Refuse { counted: false }
     );
 }
@@ -614,7 +721,12 @@ fn a_client_with_nothing_pending_is_refused_without_being_counted() {
 fn an_unknown_client_is_refused_without_being_counted() {
     let cfg = auth_with_pending(Some("0123456789abcdef"));
     assert_eq!(
-        enrollment_verdict(&cfg, "bob", "0123456789abcdef", None, None),
+        enrollment_verdict(
+            &cfg,
+            "bob",
+            "0123456789abcdef",
+            &enrollment_identity(None, None)
+        ),
         EnrollmentVerdict::Refuse { counted: false }
     );
 }
@@ -627,7 +739,12 @@ fn a_locked_out_client_is_refused_even_with_the_right_token() {
     let mut cfg = auth_with_pending(Some("0123456789abcdef"));
     cfg.clients.get_mut("alice").unwrap().locked_until = Some(u64::MAX);
     assert_eq!(
-        enrollment_verdict(&cfg, "alice", "0123456789abcdef", None, None),
+        enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcdef",
+            &enrollment_identity(None, None)
+        ),
         EnrollmentVerdict::Refuse { counted: false }
     );
 }
@@ -639,7 +756,7 @@ fn a_locked_out_client_is_refused_even_with_the_right_token() {
 fn a_blank_pending_token_is_never_accepted() {
     let cfg = auth_with_pending(Some(""));
     assert_eq!(
-        enrollment_verdict(&cfg, "alice", "", None, None),
+        enrollment_verdict(&cfg, "alice", "", &enrollment_identity(None, None)),
         EnrollmentVerdict::Refuse { counted: false }
     );
 }
@@ -655,24 +772,42 @@ fn a_blank_pending_token_is_never_accepted() {
 fn an_enrollment_may_not_take_over_a_device_that_is_already_there() {
     let cfg = auth_with_device("laptop", Some("0123456789abcdef"));
     assert_eq!(
-        enrollment_verdict(&cfg, "alice", "0123456789abcdef", Some("laptop"), None),
+        enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcdef",
+            &enrollment_identity(Some("laptop"), None),
+        ),
         EnrollmentVerdict::Refuse { counted: false }
     );
 }
 
 /// The same table, a name that is not in it: an enrollment is how a device
 /// that is not there yet gets one, and refusing those would make the table
-/// impossible to grow past the first device.
+/// impossible to grow past the first device. An unnamed request is not such a
+/// device — it would land on the client's own secret instead — so it is
+/// refused even when the table has room.
 #[test]
 fn an_enrollment_may_still_add_a_device_that_is_not_there() {
     let cfg = auth_with_device("laptop", Some("0123456789abcdef"));
     assert_eq!(
-        enrollment_verdict(&cfg, "alice", "0123456789abcdef", Some("phone"), None),
+        enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcdef",
+            &enrollment_identity(Some("phone"), None),
+        ),
         EnrollmentVerdict::Accept
     );
     assert_eq!(
-        enrollment_verdict(&cfg, "alice", "0123456789abcdef", None, None),
-        EnrollmentVerdict::Accept
+        enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcdef",
+            &enrollment_identity(None, None)
+        ),
+        EnrollmentVerdict::Refuse { counted: false },
+        "an unnamed request is not a second device"
     );
 }
 
@@ -682,7 +817,15 @@ fn an_enrollment_may_still_add_a_device_that_is_not_there() {
 #[test]
 fn taking_over_a_device_is_not_counted_as_a_wrong_token() {
     let cfg = auth_with_device("laptop", Some("0123456789abcdef"));
-    assert!(!enrollment_verdict(&cfg, "alice", "0123456789abcdef", Some("laptop"), None).counted());
+    assert!(
+        !enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcdef",
+            &enrollment_identity(Some("laptop"), None),
+        )
+        .counted()
+    );
 }
 
 /// The hint the operator gets names the command that unblocks the enrollment.
@@ -702,30 +845,40 @@ fn the_refusal_hint_names_the_command_that_unblocks_the_enrollment() {
 /// A device that still holds the key the table records may enroll again.
 ///
 /// This is the device coming back for a credential it lost — the answer it was
-/// given was never written down, so it asked again with the same key. The
-/// enrollment records that same key under the same name, which leaves the
-/// device holding the private half working and gives the one that does not
-/// nothing.
+/// given was never written down, so it asked again with the same key. A keyed
+/// enrollment is filed under the fingerprint of its key, so the id it claims
+/// has to be that fingerprint; re-enrolling the same key under the same id
+/// leaves the device holding the private half working and gives the one that
+/// does not nothing.
 #[test]
 fn a_device_that_holds_the_key_on_file_may_enroll_again() {
     let key = iroh::SecretKey::generate();
     let hex = crate::auth::public_key_hex(&key.public());
-    let cfg = auth_with_device_key("phone", &hex, Some("0123456789abcdef"));
+    let id = crate::auth::device_id_from_public_key(key.public().as_bytes());
+    let cfg = auth_with_device_key(&id, &hex, Some("0123456789abcdef"));
 
     assert_eq!(
-        enrollment_verdict(&cfg, "alice", "0123456789abcdef", Some("phone"), Some(&hex)),
+        enrollment_verdict(
+            &cfg,
+            "alice",
+            "0123456789abcdef",
+            &enrollment_identity(Some(&id), Some(&hex)),
+        ),
         EnrollmentVerdict::Accept
     );
 }
 
-/// A different key is somebody else: the name belongs to the device that holds
-/// the key on file, and a copied link must not be able to take it over.
+/// A different key is somebody else: the id belongs to the device that holds
+/// the key on file, and a copied link must not be able to take it over. The
+/// claim names the fingerprint the id was filed under, so the refusal is about
+/// the different key and not about a name that disagrees.
 #[test]
 fn a_device_that_offers_a_different_key_is_still_refused() {
     let stored = iroh::SecretKey::generate();
     let offered = iroh::SecretKey::generate();
+    let id = crate::auth::device_id_from_public_key(stored.public().as_bytes());
     let cfg = auth_with_device_key(
-        "phone",
+        &id,
         &crate::auth::public_key_hex(&stored.public()),
         Some("0123456789abcdef"),
     );
@@ -735,47 +888,53 @@ fn a_device_that_offers_a_different_key_is_still_refused() {
             &cfg,
             "alice",
             "0123456789abcdef",
-            Some("phone"),
-            Some(&crate::auth::public_key_hex(&offered.public()))
+            &enrollment_identity(
+                Some(&id),
+                Some(&crate::auth::public_key_hex(&offered.public()))
+            ),
         ),
         EnrollmentVerdict::Refuse { counted: false }
     );
 }
 
 /// A row that holds a secret is a device that proves itself with a code: it is
-/// not the device that offered a key, so the name stays where it is.
+/// not the device that offered a key, so the fingerprint id stays with the
+/// device that already occupies it.
 #[test]
 fn a_device_that_holds_a_secret_may_not_enroll_again_with_a_key() {
     let offered = iroh::SecretKey::generate();
-    let cfg = auth_with_device("laptop", Some("0123456789abcdef"));
+    let hex = crate::auth::public_key_hex(&offered.public());
+    let id = crate::auth::device_id_from_public_key(offered.public().as_bytes());
+    let cfg = auth_with_device(&id, Some("0123456789abcdef"));
 
     assert_eq!(
         enrollment_verdict(
             &cfg,
             "alice",
             "0123456789abcdef",
-            Some("laptop"),
-            Some(&crate::auth::public_key_hex(&offered.public()))
+            &enrollment_identity(Some(&id), Some(&hex)),
         ),
         EnrollmentVerdict::Refuse { counted: false }
     );
 }
 
 /// The key is compared in the spelling the table stores, so a key that arrives
-/// in another one is the same key and not a different one.
+/// in another one is the same key and not a different one. The fingerprint is
+/// worked out from the parsed key, so the same key in uppercase still claims
+/// the id it was filed under.
 #[test]
 fn the_same_key_in_another_spelling_is_the_same_key() {
     let key = iroh::SecretKey::generate();
     let hex = crate::auth::public_key_hex(&key.public());
-    let cfg = auth_with_device_key("phone", &hex, Some("0123456789abcdef"));
+    let id = crate::auth::device_id_from_public_key(key.public().as_bytes());
+    let cfg = auth_with_device_key(&id, &hex, Some("0123456789abcdef"));
 
     assert_eq!(
         enrollment_verdict(
             &cfg,
             "alice",
             "0123456789abcdef",
-            Some("phone"),
-            Some(&hex.to_uppercase())
+            &enrollment_identity(Some(&id), Some(&hex.to_uppercase())),
         ),
         EnrollmentVerdict::Accept
     );
@@ -793,6 +952,10 @@ fn auth_with_device(device: &str, token: Option<&str>) -> AuthConfig {
             created_at: "0".to_string(),
             last_used: None,
             last_used_step: None,
+            label: None,
+            platform: None,
+            model: None,
+            app_version: None,
         },
     );
     cfg
@@ -809,6 +972,10 @@ fn auth_with_device_key(device: &str, public_key: &str, token: Option<&str>) -> 
             created_at: "0".to_string(),
             last_used: None,
             last_used_step: None,
+            label: None,
+            platform: None,
+            model: None,
+            app_version: None,
         },
     );
     cfg
