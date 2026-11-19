@@ -22,6 +22,14 @@ pub(super) mod flag {
     pub const PUBLIC_KEY: u8 = 0b0000_0010;
     /// The message announces the protocol version it speaks.
     pub const VERSION: u8 = 0b0000_0100;
+    /// The message carries the name the device calls itself.
+    pub const LABEL: u8 = 0b0000_1000;
+    /// The message carries the platform the device runs on.
+    pub const PLATFORM: u8 = 0b0001_0000;
+    /// The message carries the model the device runs on.
+    pub const MODEL: u8 = 0b0010_0000;
+    /// The message carries the version of the app the device runs.
+    pub const APP_VERSION: u8 = 0b0100_0000;
 }
 
 /// The flags a message type may carry.
@@ -34,7 +42,14 @@ pub(super) fn allowed_flags(kind: u8) -> u8 {
     match kind {
         kind::START => flag::DEVICE_ID | flag::VERSION,
         kind::RESPONSE => flag::DEVICE_ID,
-        kind::ENROLL_START => flag::DEVICE_ID | flag::PUBLIC_KEY,
+        kind::ENROLL_START => {
+            flag::DEVICE_ID
+                | flag::PUBLIC_KEY
+                | flag::LABEL
+                | flag::PLATFORM
+                | flag::MODEL
+                | flag::APP_VERSION
+        }
         kind::ENROLL_ISSUE => flag::DEVICE_ID,
         _ => 0,
     }

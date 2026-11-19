@@ -243,7 +243,10 @@ impl std::fmt::Debug for NodeInput {
             .field("two_factor_device", &self.two_factor_device)
             .field("enrollment_client_id", &self.enrollment_client_id)
             .field("enrollment_token", &present(&self.enrollment_token))
-            .field("enrollment_device", &self.enrollment_device)
+            .field("enrollment_label", &self.enrollment_label)
+            .field("enrollment_platform", &self.enrollment_platform)
+            .field("enrollment_model", &self.enrollment_model)
+            .field("enrollment_app_version", &self.enrollment_app_version)
             .finish()
     }
 }
@@ -283,11 +286,17 @@ pub struct NodeInput {
     pub enrollment_client_id: Option<String>,
     #[serde(default)]
     pub enrollment_token: Option<String>,
-    /// The name to be enrolled under, when the machine has one. Absent enrolls as
-    /// the unnamed device, which is what a server that predates per-device
-    /// credentials issues.
+    /// What the enrolling device calls itself, for the operator to read. A
+    /// label, not an identity: the device is known by the fingerprint of its
+    /// key, and two devices may carry the same one.
     #[serde(default)]
-    pub enrollment_device: Option<String>,
+    pub enrollment_label: Option<String>,
+    #[serde(default)]
+    pub enrollment_platform: Option<String>,
+    #[serde(default)]
+    pub enrollment_model: Option<String>,
+    #[serde(default)]
+    pub enrollment_app_version: Option<String>,
 }
 
 impl NodeInput {
@@ -310,7 +319,10 @@ impl NodeInput {
         Some(NodeEnrollment {
             client_id: self.enrollment_client_id.clone().unwrap_or_default(),
             token: token.to_string(),
-            device: self.enrollment_device.clone(),
+            label: self.enrollment_label.clone(),
+            platform: self.enrollment_platform.clone(),
+            model: self.enrollment_model.clone(),
+            app_version: self.enrollment_app_version.clone(),
         })
     }
     pub fn two_factor(&self) -> Option<NodeTwoFactor> {
@@ -574,7 +586,10 @@ mod tests {
             device_key: None,
             enrollment_client_id: None,
             enrollment_token: None,
-            enrollment_device: None,
+            enrollment_label: None,
+            enrollment_platform: None,
+            enrollment_model: None,
+            enrollment_app_version: None,
         }
     }
 

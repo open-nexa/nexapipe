@@ -2,6 +2,7 @@ package com.nexa.pipe.ui
 
 import android.content.Context
 import android.net.ConnectivityManager
+import com.nexa.pipe.DeviceInfo
 import com.nexa.pipe.IrohProxy
 import com.nexa.pipe.R
 import com.nexa.pipe.locale.AppStrings
@@ -64,8 +65,6 @@ class ProxyConnector(private val log: ConnectionLog) {
          * finding the address behind a Node ID is the lookup itself.
          */
         val discoveryMode: String,
-        /** The name this install answers as. */
-        val deviceId: String,
         /**
          * The private half of each endpoint's device key, by endpoint ID.
          *
@@ -166,11 +165,15 @@ class ProxyConnector(private val log: ConnectionLog) {
         // connect for as long as the process lives.
         IrohProxy.nativeClearNodeTwoFactor()
 
-        // One name for this install, however many endpoints it authenticates
-        // to, read when the enrollment below is armed. Before any credential
-        // is registered rather than after: what is in the native tables at
-        // nativeStartProxy is what goes on the wire.
-        IrohProxy.nativeSetDeviceId(plan.deviceId)
+        // What this phone says about itself, read before the enrollment below
+        // is armed. These are labels for the operator, not a device id: the
+        // server derives that from the key the enrollment offers.
+        IrohProxy.nativeSetDeviceInfo(
+            DeviceInfo.label(),
+            DeviceInfo.platform(),
+            DeviceInfo.model(),
+            DeviceInfo.appVersion()
+        )
 
         for (node in plan.nodes) {
             val otp = node.twoFactor?.takeIf { it.enabled } ?: continue

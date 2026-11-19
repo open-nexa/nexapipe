@@ -179,6 +179,13 @@ impl From<crate::auth::DeviceMaterial<'_>> for DeviceCredential {
     }
 }
 
+/// What a device said about itself, on its way into the file.
+///
+/// The labels travel with the credential: the file is what the operator reads
+/// when they ask what is enrolled, and a row that says only "a device" is a
+/// row that cannot be told from another one.
+pub use crate::auth::DeviceInfo;
+
 /// The endpoint's identity, generated and written back when the configuration
 /// holds none.
 ///
@@ -319,10 +326,15 @@ pub trait Storage: Send + Sync + 'static {
     ///
     /// Any token already outstanding is replaced, which is how an invitation
     /// that never arrived gets revoked.
+    ///
+    /// `expires_at` is when the token stops being good, as a Unix timestamp.
+    /// `None` is a token without a deadline — what an invitation written by
+    /// hand says.
     fn write_pending_enrollment<'a>(
         &'a self,
         client_id: &'a str,
         token: &'a SecretString,
+        expires_at: Option<u64>,
     ) -> BoxFuture<'a, anyhow::Result<()>>;
 
     /// Spends the token: writes the issued secret and drops the token, so the
@@ -333,13 +345,17 @@ pub trait Storage: Send + Sync + 'static {
         secret: &'a SecretString,
     ) -> BoxFuture<'a, anyhow::Result<()>>;
 
-    /// Spends the token for one named device: writes that device's own
-    /// credential and drops the token, leaving the client's secret as it was.
+    /// Spends the token for one device: writes that device's own credential
+    /// and drops the token, leaving the client's secret as it was.
+    ///
+    /// `info` is what the device said about itself, kept beside the
+    /// credential for the operator to read.
     fn complete_device_enrollment<'a>(
         &'a self,
         client_id: &'a str,
         device: &'a str,
         credential: DeviceCredential,
+        info: DeviceInfo,
     ) -> BoxFuture<'a, anyhow::Result<()>>;
 
     /// Writes one device's credential — a TOTP secret or a public key.

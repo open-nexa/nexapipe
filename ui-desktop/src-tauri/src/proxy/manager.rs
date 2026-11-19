@@ -6,7 +6,7 @@ use anyhow::Result;
 use iroh::endpoint::presets;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use nexapipe_client::auth::{
-    DeviceKey, Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth,
+    DeviceInfo, DeviceKey, Enrollment, IssuedCredential, TotpAlgorithm, TwoFactorAuth,
 };
 use nexapipe_client::connection_pool::parse_endpoint_addr;
 use nexapipe_client::discovery::DiscoveryMode;
@@ -160,11 +160,14 @@ pub struct NodeTwoFactor {
 pub struct NodeEnrollment {
     pub client_id: String,
     pub token: String,
-    /// The name to be enrolled under, rather than taking the client's own
-    /// secret: it is what turns this into a credential the server can revoke on
-    /// its own. Absent enrolls as the unnamed device, which is the behaviour a
-    /// server that predates per-device credentials still has.
-    pub device: Option<String>,
+    /// What this device says about itself when it spends the token. Labels only:
+    /// the id it is filed under is the fingerprint of its key, worked out on
+    /// both sides from the same public half. None of these is an identity, and
+    /// two devices may carry the same four.
+    pub label: Option<String>,
+    pub platform: Option<String>,
+    pub model: Option<String>,
+    pub app_version: Option<String>,
 }
 
 /// The address a configured node resolves to.
@@ -451,14 +454,11 @@ impl ProxyManager {
             // missing.
             let two_factor = node.two_factor.as_ref();
             let has_secret = two_factor.is_some_and(|tf| !tf.secret.trim().is_empty());
-            // A key is a credential only once it names the device it was
-            // issued to: the name comes back from the enrollment, and until
-            // then the key is an offer rather than something to answer with.
-            let has_key = two_factor.is_some_and(|tf| {
-                !has_secret
-                    && node.device_key.is_some()
-                    && tf.device.as_deref().is_some_and(|d| !d.trim().is_empty())
-            });
+            // A key is a credential by itself: the id it answers under is the
+            // fingerprint of that key, so no stored name is needed to recognise
+            // one. A secret still needs its device name to be told apart from
+            // the client's own.
+            let has_key = two_factor.is_some() && !has_secret && node.device_key.is_some();
             let has_credential = has_secret || has_key;
             if !has_credential && node.enrollment.is_none() {
                 continue;
@@ -487,39 +487,27 @@ impl ProxyManager {
                         addr.id
                     );
                 }
-                // No algorithm to agree on: the server sends the parameters it generated
-                // the secret with in ENROLL_ISSUE, and the exchange builds its TOTP from
-                // those rather than from anything configured here.
-                // Taken before the name below shadows it: an empty device is not
-                // the unnamed device, it is a field left blank, and enrolling
-                // as "" would be refused by the server with a message about
-                // printable ASCII that says nothing about this side.
-                let device = enrollment
-                    .device
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty());
-                let enrollment = Enrollment::new(&enrollment.client_id, &enrollment.token);
-                let enrollment = match device {
-                    Some(device) => enrollment.with_device(device),
-                    None => enrollment,
-                };
-                // A device key is offered here rather than asked for: the
-                // server records the public half under the device's name and
-                // issues no secret at all, so the private half never has to be
-                // anywhere but this machine. A server that predates keys
-                // ignores the offer and issues a secret as it always has.
-                //
-                // Only with a name, because the server refuses a key that
-                // names no device — and a refusal that reads as a bad token
-                // would be a lie: the token was fine and the device had no
-                // name.
-                let enrollment = match (device, key_for(node)) {
-                    (Some(_), Some(key)) => enrollment.with_key(key),
-                    _ => enrollment,
-                };
+                // The id this device is filed under is the fingerprint of its
+                // key, worked out the same way on both sides. There is no name
+                // to claim: the four labels below describe the device but do
+                // not identify it, and two devices may carry the same ones.
+                let mut built = Enrollment::new(&enrollment.client_id, &enrollment.token)
+                    .with_device_info(DeviceInfo::new(
+                        enrollment.label.as_deref(),
+                        enrollment.platform.as_deref(),
+                        enrollment.model.as_deref(),
+                        enrollment.app_version.as_deref(),
+                    ));
+                // A device key is offered rather than asked for: the server
+                // records the public half under the fingerprint and issues no
+                // secret, so the private half never has to leave this machine.
+                // A server that predates keys ignores the offer and issues a
+                // secret as it always has.
+                if let Some(key) = key_for(node) {
+                    built = built.with_key(key);
+                }
                 endpoint_group
-                    .set_enrollment_for(&addr.id.to_string(), Some(enrollment))
+                    .set_enrollment_for(&addr.id.to_string(), Some(built))
                     .await;
                 tracing::info!(
                     "Enrolling {} with a one-time token as client '{}'",
@@ -551,10 +539,8 @@ impl ProxyManager {
             // secret uses it — the server may have ignored the key and issued
             // one instead, and then the secret is what it holds.
             let device = two_factor.device.as_deref().map(str::trim);
-            let auth = match (has_secret, key_for(node), device) {
-                (false, Some(key), Some(device)) if !device.is_empty() => {
-                    TwoFactorAuth::with_key(&two_factor.client_id, key, device)
-                }
+            let (auth, key_based) = match (has_secret, key_for(node)) {
+                (false, Some(key)) => (TwoFactorAuth::with_key(&two_factor.client_id, key), true),
                 _ => {
                     // A name nobody supports is refused rather than downgraded:
                     // the node would compute codes the server does not accept.
@@ -562,17 +548,26 @@ impl ProxyManager {
                         TotpAlgorithm::try_from_name(&two_factor.algorithm).map_err(|e| {
                             anyhow::anyhow!("Invalid 2FA config for {}: {}", addr.id, e)
                         })?;
-                    TwoFactorAuth::new(&two_factor.client_id, &two_factor.secret, algorithm)
-                        .map_err(|e| anyhow::anyhow!("Invalid 2FA config for {}: {}", addr.id, e))?
+                    (
+                        TwoFactorAuth::new(&two_factor.client_id, &two_factor.secret, algorithm)
+                            .map_err(|e| anyhow::anyhow!("Invalid 2FA config for {}: {}", addr.id, e))?,
+                        false,
+                    )
                 }
             };
-            // Named only when the node carries a name: an empty one is not the
-            // unnamed device, it is a field somebody left blank, and enrolling
-            // or answering as "" would be refused by the server with a message
-            // about printable ASCII that says nothing about this side.
-            let auth = match device {
-                Some(device) if !device.is_empty() => auth.with_device(device),
-                _ => auth,
+            // A key-based credential is known by the fingerprint `with_key`
+            // worked out from its key. A name stored here is a label at most,
+            // and putting it on the wire would ask the server for a device it
+            // never filed this key under. A secret-based credential still
+            // answers under the name its server filed it under — an empty one
+            // is a field left blank, not the unnamed device.
+            let auth = if key_based {
+                auth
+            } else {
+                match device {
+                    Some(device) if !device.is_empty() => auth.with_device(device),
+                    _ => auth,
+                }
             };
             endpoint_group
                 .set_two_factor_for(&addr.id.to_string(), Some(auth))

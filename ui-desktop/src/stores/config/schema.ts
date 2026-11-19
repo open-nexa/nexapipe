@@ -12,6 +12,7 @@
  * credential store, about the relay or about `localStorage`.
  */
 import type {
+  DeviceInfo,
   EnrollmentToken,
   NodeConfig,
   NodeTwoFactor,
@@ -43,7 +44,6 @@ export const defaultConfig: ProxyConfig = {
   // An older build kept n0's address lookup without a setting. Keeping `n0`
   // as the default means upgrading changes nothing until the operator asks.
   discoveryMode: 'n0',
-  deviceId: '',
 };
 
 export function generateNodeId(): string {
@@ -82,6 +82,25 @@ function normalizeTwoFactor(raw: unknown): NodeTwoFactor | undefined {
 }
 
 /**
+ * The labels an enrolling device reported about itself. None is an identity —
+ * the id comes from the key — so a blank one is simply left out.
+ */
+function normalizeDeviceInfo(raw: unknown): DeviceInfo | undefined {
+  if (!isRecord(raw)) return undefined;
+  const label = asString(raw.label, '').trim();
+  const platform = asString(raw.platform, '').trim();
+  const model = asString(raw.model, '').trim();
+  const appVersion = asString(raw.appVersion, '').trim();
+  const info: DeviceInfo = {
+    ...(label ? { label } : {}),
+    ...(platform ? { platform } : {}),
+    ...(model ? { model } : {}),
+    ...(appVersion ? { appVersion } : {}),
+  };
+  return Object.keys(info).length ? info : undefined;
+}
+
+/**
  * A node's pending enrollment token, if it has one.
  *
  * A token with nothing in it is treated as no token at all: the server would refuse it, and a
@@ -94,8 +113,11 @@ function normalizeEnrollment(raw: unknown): EnrollmentToken | undefined {
   // Same reason as `normalizeTwoFactor`: a spent-or-stored token is an empty string here, and
   // the client id is what says which node is waiting for one.
   if (!token && !clientId) return undefined;
-  const device = asString(raw.device, '').trim();
-  return { clientId, token, ...(device ? { device } : {}) };
+  // An older build stored a generated name here. It is not the device's id — the
+  // key fingerprint is — and claiming it would ask the server for a device it
+  // never filed this key under, so a stale value is dropped.
+  const deviceInfo = normalizeDeviceInfo(raw.deviceInfo);
+  return { clientId, token, ...(deviceInfo ? { deviceInfo } : {}) };
 }
 
 function normalizeNode(raw: unknown): NodeConfig | null {
@@ -167,9 +189,6 @@ export function normalizeConfig(raw: Record<string, unknown>): ProxyConfig {
   }
   config.tunName = asString(raw.tunName, config.tunName) || defaultConfig.tunName;
   config.relayUrl = asString(raw.relayUrl, config.relayUrl);
-  // Empty is the state before it has been generated, not a name: `ensureDeviceId` fills it
-  // in on the first run and a payload that never had one is a payload from before devices.
-  config.deviceId = asString(raw.deviceId, '').trim();
   config.relayAuthToken = asString(raw.relayAuthToken, config.relayAuthToken);
   // The relay a stored token was issued for. A payload written before the
   // pairing existed carries no such thing, and the token in it is bound to

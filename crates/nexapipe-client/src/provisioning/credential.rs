@@ -154,6 +154,12 @@ pub struct InviteEnrollment {
     /// A [`SecretString`]: the link that carries this token is the credential
     /// until it is spent, and the token is wiped when the invite is dropped.
     pub token: SecretString,
+    /// When the invitation stops being worth anything, as a Unix timestamp.
+    ///
+    /// The server decides; this is only what the link says, so a client that
+    /// scanned an old invitation can say so before it connects. A token
+    /// without a deadline is the older arrangement.
+    pub expires_at: Option<u64>,
 }
 
 impl fmt::Debug for InviteEnrollment {
@@ -161,6 +167,7 @@ impl fmt::Debug for InviteEnrollment {
         f.debug_struct("InviteEnrollment")
             .field("client_id", &self.client_id)
             .field("token", &REDACTED)
+            .field("expires_at", &self.expires_at)
             .finish()
     }
 }
@@ -178,15 +185,33 @@ impl InviteEnrollment {
         Ok(Self {
             client_id: client_id.to_string(),
             token: SecretString::new(token.to_string()),
+            expires_at: None,
         })
+    }
+
+    /// The deadline printed into the link. The server keeps its own copy, so
+    /// this is a hint for whoever scanned it rather than the thing that
+    /// decides whether the token still works.
+    pub fn with_expiry(mut self, expires_at: u64) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+
+    /// Whether this invitation has run out at `now`, both in Unix seconds.
+    pub fn is_expired(&self, now: u64) -> bool {
+        self.expires_at.is_some_and(|at| now >= at)
     }
 
     /// Parameters, in the order [`EndpointInvite::to_uri`] writes them.
     pub(super) fn to_params(&self) -> Vec<(&'static str, String)> {
-        vec![
+        let mut params = vec![
             ("client", self.client_id.clone()),
             ("enroll", self.token.expose_secret_cloned()),
-        ]
+        ];
+        if let Some(expires_at) = self.expires_at {
+            params.push(("exp", expires_at.to_string()));
+        }
+        params
     }
 }
 
@@ -216,5 +241,11 @@ pub(super) fn enrollment_from_params(
     let Some(client_id) = params.first("client") else {
         bail!("the invite carries an enrollment token but no client id");
     };
-    InviteEnrollment::new(client_id, token).map(Some)
+    let mut enrollment = InviteEnrollment::new(client_id, token)?;
+    if let Some(expires_at) = params.first("exp") {
+        enrollment.expires_at = Some(expires_at.parse().map_err(|_| {
+            anyhow::anyhow!("the invite carries an unreadable expiration time {expires_at:?}")
+        })?);
+    }
+    Ok(Some(enrollment))
 }

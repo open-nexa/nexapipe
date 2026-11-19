@@ -49,7 +49,23 @@ export interface NodeTwoFactor {
 }
 
 /**
- * A one-time enrollment token, which is what a `--registration` invite carries instead of a
+ * What a device says about itself when it enrolls. Four labels, none of which
+ * is an identity: the device is known by the fingerprint of its key, and two
+ * devices may carry the same four.
+ */
+export interface DeviceInfo {
+  /** The name the device calls itself: the hostname on a desktop. */
+  label?: string;
+  /** `android`, `macos`, `windows`, `linux`. */
+  platform?: string;
+  /** The operating system's version. */
+  model?: string;
+  /** The version of this app. */
+  appVersion?: string;
+}
+
+/**
+ * A one-time enrollment token, which is what a registration invite carries instead of a
  * secret.
  *
  * It is spent by the first connection that uses it — the server answers with the real
@@ -62,10 +78,13 @@ export interface EnrollmentToken {
   clientId: string;
   token: string;
   /**
-   * The name this device asks to be enrolled under. Absent asks for the client's own secret,
-   * which is the only thing a server that predates per-device credentials will answer.
+   * What this device says about itself, for the operator to read.
+   *
+   * Labels only: the id it is filed under is the fingerprint of its key,
+   * worked out from the public half on both sides, so none of these can be
+   * claimed as an identity.
    */
-  device?: string;
+  deviceInfo?: DeviceInfo;
 }
 
 /** What the server issued for a spent token: the credentials to keep from here on. */
@@ -194,15 +213,6 @@ export interface ProxyConfig {
    * config store for the rule that keeps the two together.
    */
   relayAuthTokenRelay: string;
-  /**
-   * The name this machine answers as, once per installation rather than once per server: the
-   * device is the machine, and every node belongs to it.
-   *
-   * Generated on first run and kept, because a name that changed would leave the server holding
-   * an entry for a device that no longer exists — a credential nobody can revoke by name. Empty
-   * until it has been generated; see `ensureDeviceId`.
-   */
-  deviceId: string;
 }
 
 /** The persisted shape: user config plus the schema version the migration chain walks. */

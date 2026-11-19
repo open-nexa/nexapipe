@@ -184,10 +184,8 @@ struct Cli {
     #[arg(
         long,
         requires = "generate_invite",
-        help = "With --generate-invite CLIENT_ID: put a one-time enrollment token in the \
-                invite instead of the client's TOTP secret. The first device to scan it \
-                trades the token for a freshly generated secret, and the link stops being \
-                a credential — the secret in it is never one"
+        help = "Replaced by `nexapipe device invite --client CLIENT_ID`, which issues a \
+                one-time token with a deadline"
     )]
     registration: bool,
 
@@ -265,6 +263,39 @@ enum Commands {
         #[command(subcommand)]
         action: ClientAction,
     },
+
+    /// Invite a device to enroll under a client without naming it
+    Device {
+        #[command(subcommand)]
+        action: DeviceAction,
+    },
+}
+
+/// The device invitation replaces the operator-named device join.
+#[derive(Subcommand, Debug)]
+enum DeviceAction {
+    /// Print a one-time invitation link that expires after a short while
+    Invite {
+        /// The client the device will enroll under
+        #[arg(long, value_name = "CLIENT_ID")]
+        client: String,
+
+        /// How long the invitation is good for: 15m by default, e.g. 30m, 2h
+        #[arg(long, value_name = "DURATION")]
+        ttl: Option<String>,
+
+        /// Domains to put in the invite (default: [local_proxy] proxy_domains, else the route hosts)
+        #[arg(long = "domains", value_delimiter = ',', value_name = "DOMAINS")]
+        domains: Vec<String>,
+
+        /// Relay URL to put in the invite (default: the configured pinned relay)
+        #[arg(long = "relay", value_name = "URL")]
+        relay: Option<String>,
+
+        /// Create the client when it does not exist yet
+        #[arg(long)]
+        create_client: bool,
+    },
 }
 
 /// The write half of the management surface.
@@ -291,16 +322,15 @@ enum ClientAction {
         #[arg(value_name = "CLIENT_ID")]
         client_id: String,
 
-        /// Give this device a secret of its own, leaving the client's alone
+        /// Replaced by `nexapipe device invite`: a device is identified by its
+        /// key fingerprint, not by a name the operator picks
         #[arg(long, value_name = "NAME")]
         device: Option<String>,
 
-        /// Issue this device a key instead of a secret: the public half of an
-        /// Ed25519 key pair, 64 hex characters. The device proves itself by
-        /// signing each challenge — no code for anyone to read — which is what
-        /// a device that runs unattended needs; the private half never leaves
-        /// the device.
-        #[arg(long, value_name = "HEX", requires = "device")]
+        /// Issue a key credential instead of a secret: the public half of an
+        /// Ed25519 key pair, 64 hex characters. The device is filed under the
+        /// fingerprint of this key; no --device is needed or allowed.
+        #[arg(long, value_name = "HEX")]
         public_key: Option<String>,
 
         /// Replace the credential that is already there, enrolling out whatever
@@ -402,6 +432,16 @@ async fn main() {
         return;
     }
 
+    // A named device no longer exists, and neither does a token that never
+    // expires. Both old spellings fail with the command that replaced them.
+    if cli.registration {
+        eprintln!(
+            "Error: --registration has been replaced by `nexapipe device invite --client \
+             <CLIENT_ID>`, which issues a one-time token with a deadline"
+        );
+        std::process::exit(1);
+    }
+
     // Handle --generate-invite
     if cli.generate_invite.is_some() {
         let store = match open_store().await {
@@ -412,6 +452,41 @@ async fn main() {
             }
         };
         if let Err(e) = cli::print_endpoint_invite(&cli, store.as_ref()).await {
+            eprintln!("Error: {e:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    if let Some(Commands::Device { action }) = &cli.command {
+        let store = match open_store().await {
+            Ok(store) => store,
+            Err(e) => {
+                eprintln!("Error: {e:#}");
+                std::process::exit(1);
+            }
+        };
+        let outcome = match action {
+            DeviceAction::Invite {
+                client,
+                ttl,
+                domains,
+                relay,
+                create_client,
+            } => {
+                cli::invite_device(
+                    &cli,
+                    store.as_ref(),
+                    client,
+                    ttl.as_deref(),
+                    domains,
+                    relay.as_deref(),
+                    *create_client,
+                )
+                .await
+            }
+        };
+        if let Err(e) = outcome {
             eprintln!("Error: {e:#}");
             std::process::exit(1);
         }

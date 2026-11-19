@@ -37,6 +37,45 @@ says they are to be answered; and take the delay out of the path a phone's
 traffic takes. Every configuration key that shipped in 1.0.0 keeps its name
 and its meaning.
 
+## [Unreleased]
+
+> Entries in earlier releases describe the flow as it was in *their* release.
+> Named devices and the `client add --device` / `--registration` forms they
+> mention are superseded by the Removed note in this section.
+
+### Added
+
+- **Device invitations.** `nexapipe device invite --client <CLIENT_ID> [--ttl
+  15m] [--domains a,b] [--relay URL] [--create-client]` prints a `nexapipe://`
+  link and QR carrying a one-time `enroll=<token>` and an `exp=<unix>` deadline.
+  The server writes `pending_enrollment` and `pending_enrollment_expires_at`
+  (Unix timestamp) before printing it. The lifetime defaults to 15m and accepts
+  1s..30d; generating another invitation replaces the outstanding token, which
+  revokes a link that went astray. A device reports its own `label`, `platform`,
+  `model` and `app_version` when it enrolls, and is filed under `d-` plus the
+  first 16 hex characters of the SHA-256 of its Ed25519 public key — duplicate
+  labels are allowed.
+
+### Changed
+
+- Device rows are keyed by that fingerprint and carry the reported details:
+  `[auth.clients.<id>.devices.d-9f2c1a4b7e0d3f58]` with `public_key`, `label`,
+  `platform`, `model` and `app_version`, instead of a name the operator chose.
+  An expired token is refused without counting as a guessed token.
+- `client list --json` now includes `invite_expires_at` and each device's
+  `label`/`platform`/`model`/`app_version`; admin `GET /v1/auth` now includes
+  `enrollment_expires_at`.
+
+### Removed
+
+- **BREAKING:** `client add <id> --device <NAME>` and `--generate-invite <id>
+  --registration` now fail with an error pointing to `nexapipe device invite`.
+  Old name-keyed device rows are legacy entries: devices on them must be revoked
+  and re-enrolled with a fresh invitation to move to the new scheme. Plain `--generate-invite <id>` (endpoint
+  share) and `client add <id>` (client secret) remain; `client add <id>
+  --public-key <HEX>` still registers a key but no longer takes `--device`, the
+  id being derived from the key.
+
 ## [1.2.0] — 2026-11-05
 
 A minor release. Nothing on the wire changes: the handshake, the ALPN and the

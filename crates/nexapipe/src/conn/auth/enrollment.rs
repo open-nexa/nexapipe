@@ -1,6 +1,6 @@
 //! The enrollment: a client that asks for a credential, and what it gets.
 
-use crate::auth::{AuthConfig, AuthMessage, ClientAcl, DeviceAuth};
+use crate::auth::{AuthConfig, AuthMessage, ClientAcl, DeviceAuth, DeviceInfo};
 use crate::conn::peers::{PeerGuard, PeerIdentity, PeerRegistry};
 use crate::metrics;
 
@@ -47,6 +47,75 @@ impl EnrollmentVerdict {
     }
 }
 
+/// Who is enrolling.
+///
+/// The identity of a device is the fingerprint of the key it proves itself
+/// with, so a device that offers a key is known by that key's fingerprint and
+/// by nothing else. A client that offers no key — one built before keys
+/// existed — is known by the name it claims, which is the older arrangement
+/// and is kept working.
+///
+/// The identity is worked out **before** the token is compared, because the
+/// token decides whether the enrollment is a guess and the identity decides
+/// what is enrolled. A malformed key is not refused here: that refusal would
+/// come before the token was compared, and a wrong token is a guess that has
+/// to be counted.
+#[derive(Clone, Debug, PartialEq)]
+pub(in crate::conn) enum EnrollmentIdentity {
+    /// A device that offered a key.
+    Keyed {
+        /// The id the key's fingerprint gives, which is what the device is
+        /// filed under.
+        id: String,
+        /// The offered key, in the canonical spelling.
+        key: String,
+        /// The name the client claimed, when it claimed one.
+        ///
+        /// A client that offers a key may claim no name at all: it knows its
+        /// own id, because it works it out from the key it holds.
+        claimed: Option<String>,
+    },
+    /// A client that offered no key: the name it claims, if any.
+    Named(Option<String>),
+}
+
+impl EnrollmentIdentity {
+    /// The id this enrollment is filed under, when it names a device.
+    pub(in crate::conn) fn device_id(&self) -> Option<&str> {
+        match self {
+            EnrollmentIdentity::Keyed { id, .. } => Some(id),
+            EnrollmentIdentity::Named(name) => name.as_deref(),
+        }
+    }
+}
+
+/// Works out who is enrolling, from what the request carried.
+///
+/// A key that does not parse yields the named identity: the request is
+/// refused later, where the refusal can name the reason, and the token is
+/// compared first so that a guess at it is still counted.
+pub(in crate::conn) fn enrollment_identity(
+    device: Option<&str>,
+    public_key: Option<&str>,
+) -> EnrollmentIdentity {
+    let Some(offered) = public_key else {
+        return EnrollmentIdentity::Named(device.map(str::to_string));
+    };
+    match crate::auth::parse_public_key(offered) {
+        Ok(key) => {
+            let bytes = key.as_bytes();
+            let mut canonical = [0u8; 32];
+            canonical.copy_from_slice(bytes);
+            EnrollmentIdentity::Keyed {
+                id: crate::auth::device_id_from_public_key(&canonical),
+                key: crate::auth::public_key_hex(&key),
+                claimed: device.map(str::to_string),
+            }
+        }
+        Err(_) => EnrollmentIdentity::Named(device.map(str::to_string)),
+    }
+}
+
 /// Decides one enrollment attempt against `cfg`.
 ///
 /// A guess at a token that is actually outstanding is the only thing counted.
@@ -70,32 +139,31 @@ impl EnrollmentVerdict {
 /// were locked out over a credential they were never sent. The token keeps its
 /// ceiling, and the ceiling is paid for by the token.
 ///
-/// A name that is already in the table is refused too. An enrollment token
-/// proves the invite reached *someone*, not which device it reached — the name
-/// is chosen by the client at enrollment time — so accepting any name turned a
-/// copied link into a takeover: enrolling as the name of a device that is
-/// already there replaces its credential, which locks the real device out while
-/// every log line and the peer list go on showing the real device's name.
-/// Rotating one device's credential is the operator's move and has its own
-/// `--force`; an enrollment is for a device that is not there yet.
+/// **An expired invitation is refused, and not counted.** The deadline is the
+/// operator's, not a guess: an invitation that ran out is worth nothing, and
+/// the counter is there for the attempts to spend it while it was worth
+/// something.
 ///
-/// **With one exception: the device that still holds the key the table already
-/// records.** That is the same device coming back for a credential it lost —
-/// the answer it was given was never written down — and not somebody taking
-/// the name over. The key is not proof of possession: the public half is
-/// public, and anybody who has seen a device's key can name it. What makes it
-/// safe is what the enrollment does with it. It records the same key under the
-/// same name, so the device holding the private half keeps working and the one
-/// that does not gains nothing; and a key enrollment writes the device row and
-/// nothing else, so the client's own shared secret is not rotated and no other
-/// device of it is locked out. A different key, or no key at all, is refused as
-/// before.
+/// **An identity that is already in the table is refused too, unless the row
+/// holds the same key.** A device that offers a key is filed under that key's
+/// fingerprint, so an id that is already there is the same device coming back
+/// for a credential it lost — the answer it was given was never written down.
+/// The key is not proof of possession: the public half is public, and anybody
+/// who has seen a device's key can name it. What makes it safe is what the
+/// enrollment does with it. It records the same key under the same id, so the
+/// device holding the private half keeps working and the one that does not
+/// gains nothing; and a key enrollment writes the device row and nothing else,
+/// so the client's own shared secret is not rotated and no other device of it
+/// is locked out. A different key under an id that is taken is refused.
+///
+/// A client that offers no key is the older arrangement and keeps the older
+/// rule: a name that is already in the table is refused, because the token
+/// proves the invitation reached *someone*, not which device it reached.
 pub(in crate::conn) fn enrollment_verdict(
     cfg: &AuthConfig,
     client_id: &str,
     token: &str,
-    device: Option<&str>,
-    public_key: Option<&str>,
+    identity: &EnrollmentIdentity,
 ) -> EnrollmentVerdict {
     let Some(client) = cfg.clients.get(client_id) else {
         return EnrollmentVerdict::Refuse { counted: false };
@@ -108,6 +176,11 @@ pub(in crate::conn) fn enrollment_verdict(
     // and it does not close the client's authentication — the devices that
     // already hold a credential are not what a stranger is guessing at.
     if client.is_enrollment_locked_out() {
+        return EnrollmentVerdict::Refuse { counted: false };
+    }
+    // The invitation's deadline. An expired token is worth nothing, and the
+    // refusal is not counted: nobody is guessing at it, it simply ran out.
+    if client.enrollment_expired(crate::auth::config::unix_now()) {
         return EnrollmentVerdict::Refuse { counted: false };
     }
     // An empty token is refused on both sides before the comparison runs.
@@ -132,13 +205,41 @@ pub(in crate::conn) fn enrollment_verdict(
     // Not counted: this is the right token in the wrong hands, not a guess at
     // one. Whoever is holding it is about to be told the same thing every other
     // refusal says.
-    if let Some(name) = device
-        && let Some(entry) = client.devices.get(name)
-        && !holds_the_key_on_file(entry, public_key)
-    {
-        return EnrollmentVerdict::Refuse { counted: false };
+    match identity {
+        EnrollmentIdentity::Keyed { id, key, claimed } => {
+            // The id is worked out from the key, so a client that claims
+            // another one is confused at best and lying at worst. Either way
+            // the server files it under the id its key gives, and a claim that
+            // disagrees is refused rather than ignored.
+            if let Some(claimed) = claimed
+                && claimed != id
+            {
+                return EnrollmentVerdict::Refuse { counted: false };
+            }
+            // The same device coming back for a credential it lost is allowed;
+            // a different key under an id that is taken is not.
+            if let Some(entry) = client.devices.get(id)
+                && !holds_the_key_on_file(entry, Some(key))
+            {
+                return EnrollmentVerdict::Refuse { counted: false };
+            }
+            EnrollmentVerdict::Accept
+        }
+        EnrollmentIdentity::Named(name) => {
+            // A name that is already in the table is refused: the token proves
+            // the invitation reached *someone*, not which device it reached, so
+            // accepting any name would let a copied link take the place of the
+            // real device. Replacing an existing device's credential is the
+            // operator's move and has its own `--force`; an enrollment is for a
+            // device that is not there yet.
+            if let Some(name) = name
+                && client.devices.contains_key(name)
+            {
+                return EnrollmentVerdict::Refuse { counted: false };
+            }
+            EnrollmentVerdict::Accept
+        }
     }
-    EnrollmentVerdict::Accept
 }
 
 /// Whether the credential this enrollment offers is the one the device's row
@@ -273,13 +374,21 @@ pub(in crate::conn) enum EnrollmentSlot {
 #[derive(Clone)]
 pub(in crate::conn) enum IssuedCredential {
     /// A named device with a secret of its own.
-    DeviceSecret { name: String, secret: SecretString },
+    DeviceSecret {
+        name: String,
+        secret: SecretString,
+        info: DeviceInfo,
+    },
     /// A named device with a key: it signs each challenge, and `secret` is
     /// empty on the wire because there is no code for it to send.
     ///
     /// The key is the *public* half, so it is a plain string: there is nothing
     /// secret about it.
-    DeviceKey { name: String, key: String },
+    DeviceKey {
+        name: String,
+        key: String,
+        info: DeviceInfo,
+    },
     /// The client's own `secret`, rotated.
     SharedSecret(SecretString),
 }
@@ -305,7 +414,7 @@ pub(in crate::conn) fn issue_enrolled_secret(
     };
 
     let slot = match issued {
-        IssuedCredential::DeviceSecret { name, secret } => EnrollmentSlot::Device {
+        IssuedCredential::DeviceSecret { name, secret, info } => EnrollmentSlot::Device {
             previous: client.devices.insert(
                 name.clone(),
                 DeviceAuth {
@@ -314,11 +423,15 @@ pub(in crate::conn) fn issue_enrolled_secret(
                     created_at: crate::auth::config::default_created_at(),
                     last_used: None,
                     last_used_step: None,
+                    label: info.label.clone(),
+                    platform: info.platform.clone(),
+                    model: info.model.clone(),
+                    app_version: info.app_version.clone(),
                 },
             ),
             name: name.clone(),
         },
-        IssuedCredential::DeviceKey { name, key } => EnrollmentSlot::Device {
+        IssuedCredential::DeviceKey { name, key, info } => EnrollmentSlot::Device {
             previous: client.devices.insert(
                 name.clone(),
                 DeviceAuth {
@@ -327,6 +440,10 @@ pub(in crate::conn) fn issue_enrolled_secret(
                     created_at: crate::auth::config::default_created_at(),
                     last_used: None,
                     last_used_step: None,
+                    label: info.label.clone(),
+                    platform: info.platform.clone(),
+                    model: info.model.clone(),
+                    app_version: info.app_version.clone(),
                 },
             ),
             name: name.clone(),
@@ -336,6 +453,7 @@ pub(in crate::conn) fn issue_enrolled_secret(
         },
     };
     client.pending_enrollment = None;
+    client.pending_enrollment_expires_at = None;
     slot
 }
 
@@ -393,6 +511,18 @@ pub fn count_enrollment_failure(
     }
 }
 
+/// What a device says it is called, for a log line.
+///
+/// The id is what the device is; the label is what it says it is called, and
+/// it is worth having in the log: the id is a fingerprint, and an operator
+/// reading a log wants to know which machine it was.
+fn device_label(info: &DeviceInfo) -> String {
+    match info.label.as_deref() {
+        Some(label) => format!(" (called \"{label}\")"),
+        None => String::new(),
+    }
+}
+
 /// What an operator has to do about a device that is already enrolled.
 ///
 /// The command that unblocks the enrollment is the one that **removes** the
@@ -426,15 +556,21 @@ pub(in crate::conn) fn device_taken_hint(client_id: &str, device: &str) -> Strin
 /// no name is the case above, and the only one that existed before the table.
 ///
 /// `public_key` is the key a device offered to be known by, for a device that
-/// will answer with a signature instead of a code. It is only ever recorded for
-/// a named device: the entry it goes into is the device's, and the unnamed slot
-/// — the client's own shared `secret` — is a string with no key in it.
+/// will answer with a signature instead of a code. A key is filed under the
+/// fingerprint of itself, which is the id both sides work out from the same
+/// bytes; the unnamed slot — the client's own shared `secret` — is a string
+/// with no key in it.
+// The two optional strings, the info and the format are the four parts of one
+// enrollment request; keeping them as separate borrows avoids making a struct
+// that lives for exactly one call.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn enroll_client(
     auth: &AuthState,
     client_id: &str,
     token: &str,
     device: Option<&str>,
     public_key: Option<&str>,
+    info: DeviceInfo,
     format: Format,
     send: &mut iroh::endpoint::SendStream,
 ) -> Result<(), AuthFailure> {
@@ -453,19 +589,32 @@ pub(super) async fn enroll_client(
         client.refresh_enrollment_lockout();
     }
 
-    let verdict = enrollment_verdict(&cfg, client_id, token, device, public_key);
+    // Who is enrolling, worked out before the token is compared: the token
+    // decides whether this is a guess, and the identity decides what is
+    // enrolled.
+    let identity = enrollment_identity(device, public_key);
+    // A key that does not parse is refused **after** the token is compared:
+    // the refusal has to be able to name the reason, and the token is what
+    // decides whether this attempt was a guess at all.
+    let malformed_key = match (public_key, &identity) {
+        (Some(offered), EnrollmentIdentity::Named(_)) => crate::auth::parse_public_key(offered)
+            .err()
+            .map(|why| why.to_string()),
+        _ => None,
+    };
+    let verdict = enrollment_verdict(&cfg, client_id, token, &identity);
     if !matches!(verdict, EnrollmentVerdict::Accept) {
         // The refusal sent on the wire is one string for every reason, so the
         // only place this one is legible is the log — and it is the one an
         // operator can act on, because it names the command that rotates the
         // device properly.
-        if let Some(name) = device
+        if let Some(id) = identity.device_id()
             && cfg
                 .clients
                 .get(client_id)
-                .is_some_and(|client| client.devices.contains_key(name))
+                .is_some_and(|client| client.devices.contains_key(id))
         {
-            tracing::warn!("{}", device_taken_hint(client_id, name));
+            tracing::warn!("{}", device_taken_hint(client_id, id));
         }
         // Whether the counters have moved and the state file has to be
         // written. The write itself happens after the lock is released.
@@ -507,6 +656,13 @@ pub(super) async fn enroll_client(
         )));
     }
 
+    // A key that does not parse cannot be recorded, so the request is refused
+    // with the reason — and the token is not spent, because nothing was
+    // enrolled.
+    if let Some(reason) = malformed_key {
+        return Err(refuse_unrecordable_enrollment(send, client_id, &reason, format).await);
+    }
+
     // Read off the config before the client is borrowed again: the credential
     // issued here has to be generated with what the server will verify against.
     let (algorithm, digits, period) = (
@@ -526,46 +682,33 @@ pub(super) async fn enroll_client(
     // does not move, and the reason is spelled out on the wire: unlike the
     // token refusals, one fixed string for every reason, which is about what
     // this server knows and does not say.
-    let issued = match public_key {
-        None => {
+    let issued = match &identity {
+        EnrollmentIdentity::Keyed { id, key, .. } => {
+            // The id is the fingerprint of the key the client offered, so the
+            // device is filed under the one thing that says which device it is.
+            // The name it claimed is not asked for and not needed.
+            IssuedCredential::DeviceKey {
+                name: id.clone(),
+                key: key.clone(),
+                info,
+            }
+        }
+        EnrollmentIdentity::Named(name) => {
             // Minted as a `Secret`: the credential that is about to be issued
             // is the most valuable thing this process holds, and it is wiped
             // when the enrollment is over.
+            //
+            // A client that offered no key is the older arrangement, and it
+            // gets the older credential: a secret under the name it claimed,
+            // or the client's own shared secret when it claimed none.
             let secret = SecretString::new(crate::auth::TotpValidator::generate_secret());
-            match device {
+            match name {
                 Some(name) => IssuedCredential::DeviceSecret {
-                    name: name.to_string(),
+                    name: name.clone(),
                     secret,
+                    info,
                 },
                 None => IssuedCredential::SharedSecret(secret),
-            }
-        }
-        Some(offered) => {
-            let Some(name) = device else {
-                return Err(refuse_unrecordable_enrollment(
-                    send,
-                    client_id,
-                    "a public key has to be issued to a named device; the unnamed credential is \
-                     the client's own shared secret",
-                    format,
-                )
-                .await);
-            };
-            let key = match crate::auth::parse_public_key(offered) {
-                // Stored in the canonical spelling — lowercase hex — whatever
-                // case it arrived in, so the config reads the way every writer
-                // of this file writes keys.
-                Ok(key) => crate::auth::public_key_hex(&key),
-                Err(why) => {
-                    let reason = why.to_string();
-                    return Err(
-                        refuse_unrecordable_enrollment(send, client_id, &reason, format).await,
-                    );
-                }
-            };
-            IssuedCredential::DeviceKey {
-                name: name.to_string(),
-                key,
             }
         }
     };
@@ -584,21 +727,23 @@ pub(super) async fn enroll_client(
     let persisted = issued.clone();
     let write = async move {
         match &persisted {
-            IssuedCredential::DeviceSecret { name, secret } => {
+            IssuedCredential::DeviceSecret { name, secret, info } => {
                 storage
                     .complete_device_enrollment(
                         &enrolled_client,
                         name,
                         crate::storage::DeviceCredential::Secret(secret.clone()),
+                        info.clone(),
                     )
                     .await
             }
-            IssuedCredential::DeviceKey { name, key } => {
+            IssuedCredential::DeviceKey { name, key, info } => {
                 storage
                     .complete_device_enrollment(
                         &enrolled_client,
                         name,
                         crate::storage::DeviceCredential::PublicKey(key.clone()),
+                        info.clone(),
                     )
                     .await
             }
@@ -671,13 +816,15 @@ pub(super) async fn enroll_client(
     }
 
     match &issued {
-        IssuedCredential::DeviceKey { name, .. } => tracing::info!(
-            "2FA: client '{client_id}' enrolled device '{name}' with a public key; it proves \
-             itself by signing each challenge, with no TOTP code"
+        IssuedCredential::DeviceKey { name, info, .. } => tracing::info!(
+            "2FA: client '{client_id}' enrolled device '{name}'{} with a public key; it proves \
+             itself by signing each challenge, with no TOTP code",
+            device_label(info)
         ),
-        IssuedCredential::DeviceSecret { name, .. } => tracing::info!(
-            "2FA: client '{client_id}' enrolled device '{name}'; its own secret was left \
-             alone, so the other devices keep theirs"
+        IssuedCredential::DeviceSecret { name, info, .. } => tracing::info!(
+            "2FA: client '{client_id}' enrolled device '{name}'{}; its own secret was left \
+             alone, so the other devices keep theirs",
+            device_label(info)
         ),
         IssuedCredential::SharedSecret(_) => tracing::info!(
             "2FA: client '{client_id}' enrolled; its secret was rotated, so every device \
@@ -686,7 +833,7 @@ pub(super) async fn enroll_client(
     }
 
     let (secret, device_id) = match &issued {
-        IssuedCredential::DeviceSecret { name, secret } => (secret.clone(), Some(name.clone())),
+        IssuedCredential::DeviceSecret { name, secret, .. } => (secret.clone(), Some(name.clone())),
         // An empty secret is how the client is told its key was recorded:
         // there is no seed for it to keep, and from here on every response it
         // sends is a signature.

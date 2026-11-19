@@ -158,11 +158,19 @@ nexapipe                                # writes ./config.toml, then starts
 
 Two things are true of that file until you change them, and both are the safe
 direction: **no route**, so every host is answered 404; and **no client**, so with
-`[auth] enabled = true` nothing can connect at all. Enroll the first one with
+`[auth] enabled = true` nothing can connect at all. Create the first client and
+invite its first device with
 
 ```bash
-nexapipe --generate-invite client-001 --create-client
+nexapipe device invite --client client-001 --create-client
 ```
+
+That prints a `nexapipe://` link and a QR code carrying a one-time enrollment
+token that expires after 15 minutes (set `--ttl` to anything from `1s` to `30d`).
+Scan it on the device before the deadline: the device reports its own details
+when it connects and is filed under the fingerprint of its key, so there is no
+name for the operator to choose. Generating a second invitation replaces the
+outstanding token, which is how a link that went astray is revoked.
 
 A config that already exists is never regenerated, and one that exists but does
 not parse still fails the start rather than being replaced.
@@ -234,18 +242,20 @@ cp config.toml.example config/config.toml   # config.toml is gitignored
 sudo chown -R 1000:1000 config secrets logs # the image runs as uid 1000
 docker compose up -d --build
 # The example starts with 2FA on, so nothing can connect until a client is
-# enrolled. This one prints the invite to scan.
+# enrolled. This one prints the expiring device invitation to scan.
 docker compose exec nexapipe /usr/local/bin/nexapipe \
-    --config /app/config/config.toml --generate-invite client-001 --create-client
+    --config /app/config/config.toml device invite --client client-001 --create-client
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
 
 The example ships with 2FA on and no client enrolled, so the server starts and
-then refuses every connection until a client is enrolled — the `--generate-invite
-client-001 --create-client` above is what enrolls the first one. It writes the
-client into the config file and prints a one-time enrollment token in the link;
-the first device that scans it trades the token for a secret of its own, and the
-link stops being a credential at that moment.
+then refuses every connection until a client is enrolled — `device invite
+--client client-001 --create-client` above creates the client and prints a
+one-time enrollment link that expires after 15 minutes. It writes the client and
+the token, with its deadline, into the config file; the first device that scans
+the link before the deadline trades the token for a credential of its own, and
+the link stops being a credential at that moment. Generating another invitation
+revokes the outstanding one.
 
 `docker-compose.yaml` mounts a `config/` directory — the one holding your
 `config.toml` — a `secrets/` directory for the endpoint identity, and a `logs/`
@@ -335,7 +345,7 @@ anything that writes it inside the container**:
 ```bash
 # The image's own binary, against the file the server is actually reading.
 docker compose exec nexapipe /usr/local/bin/nexapipe \
-    --config /app/config/config.toml --generate-invite client-001 --registration
+    --config /app/config/config.toml device invite --client client-001
 ```
 
 Running the same command on the host against the bind-mounted file is where it
@@ -360,7 +370,7 @@ goes wrong:
   attempt happened. They live in a state file of the server's own now
   (`config.state.toml`, beside the configuration), so that race is gone with
   them.
-- **The host binary is not the server's binary.** `--generate-invite` derives the
+- **The host binary is not the server's binary.** Both invite commands derive the
   endpoint from `[iroh] secret_key`, so a `nexapipe` built from another commit
   than the running one can issue an invite pointing at an endpoint nobody is
   running. (A config *without* the key used to be a way to hit this too; the
@@ -406,13 +416,18 @@ sudo chmod 600 /etc/nexapipe/config.toml
 ```
 
 The example ships with 2FA on and no client enrolled, so the service starts and
-then refuses every connection until a client is enrolled. Enroll the first one
-before pointing a device at it:
+then refuses every connection until a client is enrolled. Create the first one
+and invite its first device before pointing a device at it:
 
 ```bash
 sudo -u nexapipe nexapipe \
-    --config /etc/nexapipe/config.toml --generate-invite client-001 --create-client
+    --config /etc/nexapipe/config.toml device invite --client client-001 --create-client
 ```
+
+The invitation expires after 15 minutes by default (`--ttl` accepts `1s`..`30d`),
+and a second `device invite` revokes the outstanding one. Scan it before the
+deadline: the device reports its own details and is filed under the fingerprint
+of its key.
 
 It has to run as the account the service runs as: the config is written by
 writing a new file and renaming it over the old one, so a file written by root
@@ -552,14 +567,29 @@ will name.
 | `--qr-format <FMT>` | `unicode` (default), `plain`, `ascii`, `svg`, `none`. |
 | `--qr-invert` | Draw the QR code inverted (light on dark). |
 | `--qr-out <PATH>` | Also write the QR code to a file (`.svg` → SVG, anything else → ASCII). |
-| `--generate-invite [CLIENT_ID]` | Print a scannable `nexapipe://` invite. With a `CLIENT_ID` it carries the 2FA secret too; without one, only endpoint and domains. |
-| `--registration` | With `--generate-invite CLIENT_ID`: put a one-time enrollment token in the link instead of the secret. |
-| `--create-client` | With `--generate-invite CLIENT_ID`: create the client if it does not exist yet, generating and writing its secret in the same run. |
+| `--generate-invite [CLIENT_ID]` | Print a scannable `nexapipe://` endpoint invite. With a `CLIENT_ID` it carries that client's 2FA secret too; without one, only endpoint and domains. To enroll a device, use `device invite` instead. |
+| `--registration` | **Removed** — it now fails with a pointer to `device invite`. Use `nexapipe device invite --client <CLIENT_ID>` for a one-time enrollment link, which also has a deadline. |
+| `--create-client` | With `--generate-invite CLIENT_ID`: create the client if it does not exist yet, generating and writing its secret in the same run. `device invite` has its own `--create-client` for the same purpose. |
 | `--invite-domains <LIST>` | Domains to put in the invite, comma-separated (default: `[local_proxy] proxy_domains`, else the route hosts). |
 | `--invite-name <NAME>` | Label stored alongside the endpoint. |
 | `--invite-relay <URL>` | Relay URL in the invite (default: `[iroh] relay_url`). |
 | `--endpoint-id <NODE_ID>` | Endpoint to publish (default: derived from `[iroh] secret_key`). Requires lookup: the client resolves it through discovery. When the configuration names this server's identity, the endpoint has to be this server's own: an invite that would carry this server's 2FA credential to another endpoint is refused. |
 | `--invite-ticket <TICKET>` | Publish a full endpoint ticket (as printed at server start) instead of a Node ID. The addresses ride in the link, so the invite works with `[iroh] discovery = "none"`. Requires `--generate-invite`; conflicts with `--endpoint-id`. It has to be this server's own ticket: an invite that would carry this server's 2FA credential to another endpoint is refused. |
+
+### `nexapipe device`
+
+Device enrollment is an invitation with a deadline, not a name picked by the
+operator. A device is known by the fingerprint of its key and reports its own
+`label`, `platform`, `model` and `app_version` when it connects — duplicate
+labels are allowed, because the label is for reading, not for addressing.
+
+| Command | Meaning |
+| --- | --- |
+| `device invite --client <CLIENT_ID> [--ttl 15m] [--domains a,b] [--relay URL] [--create-client]` | Print a `nexapipe://` link and QR carrying a one-time `enroll=<token>` and an `exp=<unix>` deadline. The server writes `pending_enrollment` and `pending_enrollment_expires_at` into the config before printing it. The first device to scan before the deadline enrolls and the link is spent; generating another invitation revokes the outstanding one. `--ttl` accepts `1s`..`30d`. |
+
+The device is filed under `d-` plus the first 16 hex characters of the SHA-256 of
+its Ed25519 public key, for example `[auth.clients.client-001.devices.d-9f2c1a4b7e0d3f58]`.
+See [Device invitations](#device-invitations) for the flow and the link format.
 
 ### `nexapipe client`
 
@@ -572,17 +602,17 @@ reload.
 
 | Command | Meaning |
 | --- | --- |
-| `client list [--json]` | The clients in `[auth.clients]` and the devices of each. **No secret is printed** — that is what `--show-2fa` is for. |
-| `client add <CLIENT_ID>` | Issue a credential: writes the client's own `secret`, which is the credential of the device that names none. Refuses to replace one without `--force`. |
-| `client add <CLIENT_ID> --device <NAME>` | Issue a credential to one device, leaving the client's own `secret` alone — so the devices already using it keep working. The client has to exist first. |
-| `client add <CLIENT_ID> --device <NAME> --public-key <HEX>` | Issue a **key** instead of a secret: the public half of an Ed25519 pair (64 hex chars). The device signs every challenge with the private half it keeps; this is what the server verifies that signature against. No secret is written and none is printed — there is none. See [Device keys](#device-keys). |
+| `client list [--json]` | The clients in `[auth.clients]` and the devices of each. **No secret is printed** — that is what `--show-2fa` is for. JSON includes `invite_expires_at` and each device's `label`/`platform`/`model`/`app_version`. |
+| `client add <CLIENT_ID>` | Issue a credential: writes the client's own `secret`, which is the credential of a device with no row of its own. Refuses to replace one without `--force`. |
+| `client add <CLIENT_ID> --device <NAME>` | **Removed** — it now fails with a pointer to `device invite`. Devices are identified by the fingerprint of their key, not a name the operator picks; re-enroll old name-keyed devices with a fresh invitation. |
+| `client add <CLIENT_ID> --public-key <HEX>` | Issue a **key** instead of a secret: the public half of an Ed25519 pair (64 hex chars). The device id is derived from the key fingerprint (`d-` plus 16 hex chars), so no `--device` is needed or allowed. No secret is written and none is printed — there is none. See [Device keys](#device-keys). |
 | `client revoke <CLIENT_ID>` | Drop a client and every device credential under it. |
-| `client revoke <CLIENT_ID> --device <NAME>` | Drop one device's credential, keeping the client and its other devices. |
+| `client revoke <CLIENT_ID> --device <DEVICE_ID>` | Drop one device's credential, keeping the client and its other devices. |
 
 ```bash
 nexapipe client list --config config.toml
-nexapipe client add laptop-1 --device laptop --config config.toml
-nexapipe client revoke laptop-1 --device laptop --config config.toml
+nexapipe device invite --client laptop-1 --config config.toml
+nexapipe client revoke laptop-1 --device d-9f2c1a4b7e0d3f58 --config config.toml
 ```
 
 A revoke deletes rather than rewriting, because a missing entry is what the
@@ -590,23 +620,31 @@ handshake reads as "this device has no credential" — the same answer a device
 that never enrolled gets, so what happened to it cannot be told from outside.
 
 What those commands read and write is a `devices` table beside the client's own
-`secret`:
+`secret`. A device row is keyed by the device id — `d-` plus the first 16 hex
+characters of the SHA-256 of its Ed25519 public key — and carries the details the
+device reported when it enrolled:
 
 ```toml
 [auth.clients.client-001]
-secret = "JBSWY3DPEHPK3PXP"        # the credential of the device that names none
+secret = "JBSWY3DPEHPK3PXP"        # the credential of a device with no row of its own
 
-[auth.clients.client-001.devices.laptop]
-secret = "MFRGGZDFMZTWQ2LK"        # issued at enrollment, revocable on its own
+[auth.clients.client-001.devices.d-9f2c1a4b7e0d3f58]
+public_key = "a1b2…f0e9"            # 64 hex chars, the public half of the device's key
+label = "laptop"                    # human name the device reported, not an identity
+platform = "linux"
+model = "ThinkPad X1"
+app_version = "1.2.0"
 created_at = "1723756800"
 ```
 
-The server checks a peer against whichever of the two it asked for: a device
-that named itself against its own entry, one that named none against the
-client's `secret`. Neither has to be written by hand — enrollment files a device
-on its own, and `client add --device` issues one from the shell — and a client
-carrying no `devices` table behaves exactly as it did before it existed. A
-device can carry a key instead of a secret — see [Device keys](#device-keys).
+The label is what the operator reads, not how the device is addressed, so two
+devices may report the same label. Rows are now filed under the key fingerprint.
+A name-keyed row is a legacy entry: to move that device onto the new scheme,
+revoke the old row and scan a fresh invitation to re-enroll it. Nothing here has
+to be written by hand: enrollment files the device on its own, and
+`client add <id> --public-key <HEX>` registers a key from the shell. A client
+carrying no `devices` table authenticates as it always did, and a device with no
+row of its own answers with the client's `secret`. See [Device keys](#device-keys).
 
 ---
 
@@ -637,7 +675,7 @@ refused outright.
 keep in version control. The things a running server learns — how many times a
 client mistyped a code, until when it is locked out, when it was last seen —
 are not that, so they live in a state file **beside** the configuration, in the
-same shape and with the same client and device names.
+same shape and with the same client ids and device ids.
 
 ```
 /etc/nexapipe/
@@ -1253,7 +1291,7 @@ the access line and the span, but there is no HTTP response to put a header on.
 connection authenticated as are appended last, so nothing before them moves:
 
 ```text
-203.0.113.9 - - [29/Sep/2026:13:52:04 +0800] "GET /api/v1/items" 200 512 12ms id=3f9ac1… client=acme device=laptop
+203.0.113.9 - - [29/Sep/2026:13:52:04 +0800] "GET /api/v1/items" 200 512 12ms id=3f9ac1… client=acme device=d-9f2c1a4b7e0d3f58
 ```
 
 A device that authenticated without naming itself is `device=-` — the one
@@ -1560,19 +1598,26 @@ otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algor
 - **The secret is the credential, not the six digits.** The server checks the
   response signature (HMAC-SHA256 keyed by the secret; an Ed25519 signature over
   the same bytes, for a device registered with a key) *before* it looks at the
-  code. Any `nexapipe://` invite with `secret=` and any enrollment QR carry it
-  **in the clear** — treat both as passwords (`--qr-out` writes `0600` on Unix).
+  code. Any `nexapipe://` invite with `secret=` and the `--generate-2fa` QR carry
+  it **in the clear** — treat both as passwords (`--qr-out` writes `0600` on
+  Unix). A [device invitation](#device-invitations) carries a one-time token
+  instead, and is a credential only until it is spent or expires.
 
 ### Device keys
 
 A device does not have to hold a shared secret. Register the **public** half of
-an Ed25519 key pair for one named device, and the private half — generated on
-the device, never sent anywhere — is what it proves itself with:
+an Ed25519 key pair, and the private half — generated on the device, never sent
+anywhere — is what it proves itself with:
 
 ```bash
-nexapipe client add client-001 --device phone --public-key <64 hex chars> \
-  --config config.toml
+nexapipe client add client-001 --public-key <64 hex chars> --config config.toml
 ```
+
+The device is filed under the fingerprint of that key (`d-` plus 16 hex
+characters), so there is no `--device` name for the operator to pick. This is the
+one shell form that issues a key directly; the normal way to enroll a device is a
+[device invitation](#device-invitations), where the device reports its own
+details.
 
 From then on that device answers each connection by **signing** the challenge
 (the nonce and the timestamp) instead of returning a code, and the server
@@ -1598,7 +1643,7 @@ Whether a device is key-based comes from that entry and not from the wire, so
 the handshake of every device that keeps a secret stays byte-for-byte what it
 was, and a config written before any of this loads and behaves as it always
 did. `client list` marks a key device with `key`, and
-`client revoke <id> --device <name>` drops it like any other device.
+`client revoke <id> --device <DEVICE_ID>` drops it like any other device.
 
 Enrollment can issue a key too: a client built on the library can offer a
 public key while it spends its one-shot token (the library exposes this as
@@ -1608,7 +1653,7 @@ moment stays where it was — scanning the invite, spending the token, once —
 which is why TOTP is the enrollment-time factor rather than a prompt on every
 connection.
 
-**Both apps do exactly that now.** A `v=2` registration invite — the one that
+**Both apps do exactly that now.** A device invitation — the expiring link that
 carries a token rather than a secret — enrolls the device with a key of its own
 on the desktop and on Android, with nothing asked of you: the private half is
 generated on the device, sealed at rest beside the other credentials, and never
@@ -1616,15 +1661,17 @@ leaves it, and the public half is what the server records and what the app
 displays, so you can tell which key a server has on file. A server that
 predates keys ignores the offer and issues a secret as before, so the same
 invite works against both, and a node that already holds a TOTP secret keeps
-it. The invite format does not change: this is decided by the kind of invite,
-not by anything you choose.
+it. The invite format is unchanged from the `v=2` token form: this is decided by
+the kind of invite, not by anything you choose.
 
 ---
 
 ## Endpoint invites
 
 One QR code can carry a whole client configuration — endpoint, domains and 2FA —
-so enrolling a phone is a scan instead of three fields typed by hand:
+so adding a client to a phone is a scan instead of three fields typed by hand.
+That code hands out the client's long-lived secret; to enroll a device with a
+credential of its own, use a [device invitation](#device-invitations) instead:
 
 ```bash
 cargo run -p nexapipe -- --generate-invite client-001 --qr-format unicode
@@ -1667,9 +1714,9 @@ code stays valid across restarts. Override any of it with `--invite-domains`,
   QR rendering — anyone who scans it holds that client's credentials.
 - **Revoking one used to mean rotating all.** Deleting the
   `[auth.clients.client-001]` section, or `--generate-2fa client-001 --force`,
-  still takes every device enrolled under that client with it. A device that
-  enrolled with a name can now be dropped on its own, and the rest left alone:
-  see [`nexapipe client`](#nexapipe-client).
+  still takes every device enrolled under that client with it. Each device now
+  has its own row under its key fingerprint, so one can be dropped on its own
+  and the rest left alone: see [`nexapipe client`](#nexapipe-client).
 
 ### QR codes that will not scan
 
@@ -1718,9 +1765,13 @@ config and put into the invite:
 
 ```bash
 cargo run -p nexapipe -- --generate-invite client-001 --create-client
-cargo run -p nexapipe -- --generate-invite client-001 --create-client --registration
+cargo run -p nexapipe -- device invite --client client-001 --create-client
 ```
 
+- **With 2FA on, a newly created client gets an expiring one-time token in the
+  link rather than its secret.** The token is written beside a 15-minute
+  deadline, so the same rule applies to both invite commands: a link that
+  hands out a credential does not keep doing so forever.
 - **It never touches a client that already exists.** A run against a configured
   client reuses the stored secret instead of minting a second one, which would
   lock out every device enrolled with the first. Rotating stays the explicit
@@ -1729,53 +1780,59 @@ cargo run -p nexapipe -- --generate-invite client-001 --create-client --registra
   section that exists with no `secret` is a broken file, not a blank to fill in.
 - **It is not a standalone "add a client" command** — it requires
   `--generate-invite`, so a secret is only ever created as part of an invite
-  someone is about to hand out.
+  someone is about to hand out. `device invite --create-client` does the same
+  for a device invitation: it creates the client and an expiring enrollment link
+  in one run.
 
 Since the new secret is written to `config.toml`, remember that the TOTP
 parameters are read once at startup: a client added under `[auth.clients]` is
 picked up on its own (the file is re-read every 5 seconds), but changing
 `algorithm`, `time_step` or `digits` still needs a restart.
 
-### Enrollment invites (`--registration`)
+### Device invitations
 
-The code above stays a credential for as long as the secret lives.
-`--registration` puts a **one-time enrollment token** in the link instead:
+The endpoint invite above stays a credential for as long as the secret lives.
+A device invitation is a different, expiring link: it carries a one-time token
+instead of the secret. The old `--registration` spelling is **removed** and now
+fails with a pointer to this command:
 
 ```bash
-cargo run -p nexapipe -- --generate-invite client-001 --registration
+cargo run -p nexapipe -- device invite --client client-001
+cargo run -p nexapipe -- device invite --client client-001 --ttl 2h --domains app.example.com
 ```
 
 ```text
 nexapipe://endpoint/a612…7063?v=2&domains=app.example.com&client=client-001
-    &enroll=9f2c…c41b
+    &enroll=9f2c…c41b&exp=1763577600
 ```
 
-The first device to connect sends the token, the server answers with a freshly
-generated secret and **burns the token in the same write**, so a link copied in
-transit stops being a credential the moment it is used. A link you never
-delivered is revoked by generating another one, which replaces the outstanding
-token.
+`enroll` is the one-time token and `exp` is its deadline as a Unix timestamp.
+The server writes both as `pending_enrollment` and
+`pending_enrollment_expires_at` in the config before it prints the link. The
+lifetime defaults to 15 minutes (`--ttl` accepts `1s`..`30d`); after the deadline
+the server refuses the token without counting it as a guessed token. The first
+device to connect sends the token and is filed under the fingerprint of its key,
+with the `label`, `platform`, `model` and `app_version` it reports; the token is
+burned in the same write, so a link copied in transit stops being a credential
+the moment it is used. A link you never delivered is revoked by generating
+another invitation, which replaces the outstanding token.
 
-**Which secret enrollment rotates depends on whether the device named itself.**
-An install that answers as one named device of itself — the desktop after its
-hostname, Android after the device model — is filed under
-`[auth.clients.<id>.devices.<name>]`, so only that device's credential changes
-and every other one keeps working. An install that names no device is enrolled
-under the client's own `secret`, and *that* is the rotation that takes every
-device sharing it with it: they have to scan again. Nothing re-enrolls on its
-own, so a device enrolled before it could name itself keeps answering as nobody
-until its invite is imported again — which is the one thing that changes it.
-
-Enrollment does **not** overwrite a device name that is already there. The token
-proves the invite reached *someone*, not which device it reached, and the name is
-supplied by the client at enrollment time, so accepting any name would let a
-copied link take the place of the real device. Replacing an existing device's
-credential is `nexapipe client add <id> --device <name> --force`.
+**The device reports its own details; the operator picks no name.** The link
+carries no device name. The device is filed under `d-` plus the first 16 hex
+characters of the SHA-256 of its Ed25519 public key, and the label it sends is
+for reading only — two devices may carry the same label. An old row keyed by a
+name (`[auth.clients.<id>.devices.<name>]`) is a legacy entry from before devices
+were filed by fingerprint; the new flow does not write rows like that, and the
+device should be re-enrolled with a fresh invitation to be filed under its
+fingerprint. Nothing re-enrolls on its own, so an old device keeps answering
+under its name-keyed row until that row is revoked with
+`client revoke <id> --device <DEVICE_ID>` and the device is re-enrolled with a
+fresh invitation.
 
 - `v=2` is a **version of its own**, so an app that only knows `v=1` refuses the
   code rather than reading it as an endpoint share whose credentials went
   missing.
-- The device that enrolled has to **persist the secret it was issued** — the
+- The device that enrolled has to **persist the credential it was issued** — the
   token is spent, so an app that restarts holding the invite cannot enroll twice.
   Both apps do this: the desktop asks `take_issued_credential` after a start, and
   Android reads the same thing from

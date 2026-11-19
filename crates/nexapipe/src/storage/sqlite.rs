@@ -45,7 +45,7 @@
 
 use crate::auth::state::RuntimeState;
 use crate::config::{AuthClient, AuthDevice, ClientSecretWrite, Config};
-use crate::storage::{DeviceCredential, Stamp, Storage, StorageKind};
+use crate::storage::{DeviceCredential, DeviceInfo, Stamp, Storage, StorageKind};
 
 use futures_util::future::BoxFuture;
 
@@ -373,8 +373,12 @@ impl Rows {
 }
 
 /// The credential a device is issued, as the model holds one.
-fn device_of(credential: DeviceCredential, path: &Path) -> anyhow::Result<AuthDevice> {
-    match credential {
+fn device_of(
+    credential: DeviceCredential,
+    info: DeviceInfo,
+    path: &Path,
+) -> anyhow::Result<AuthDevice> {
+    let (secret, public_key) = match credential {
         DeviceCredential::Secret(secret) => {
             let secret = secret.expose_secret();
             if secret.is_empty() {
@@ -384,24 +388,24 @@ fn device_of(credential: DeviceCredential, path: &Path) -> anyhow::Result<AuthDe
                     path.display()
                 );
             }
-            Ok(AuthDevice {
-                secret: Some(secret.to_string().into()),
-                public_key: None,
-                created_at: Some(crate::auth::config::default_created_at()),
-                last_used: None,
-            })
+            (Some(secret.to_string().into()), None)
         }
         DeviceCredential::PublicKey(public_key) => {
             let key = crate::auth::parse_public_key(&public_key)
                 .map_err(|why| anyhow::anyhow!("{}: {why}", path.display()))?;
-            Ok(AuthDevice {
-                secret: None,
-                public_key: Some(crate::auth::public_key_hex(&key)),
-                created_at: Some(crate::auth::config::default_created_at()),
-                last_used: None,
-            })
+            (None, Some(crate::auth::public_key_hex(&key)))
         }
-    }
+    };
+    Ok(AuthDevice {
+        secret,
+        public_key,
+        created_at: Some(crate::auth::config::default_created_at()),
+        last_used: None,
+        label: info.label,
+        platform: info.platform,
+        model: info.model,
+        app_version: info.app_version,
+    })
 }
 
 impl Storage for SqliteStorage {
@@ -492,6 +496,7 @@ impl Storage for SqliteStorage {
                 allow_ports: None,
                 allow_ports_strict: None,
                 pending_enrollment: None,
+                pending_enrollment_expires_at: None,
                 devices: BTreeMap::new(),
                 unnamed_device_allowed: None,
                 failed_attempts: None,
@@ -513,6 +518,7 @@ impl Storage for SqliteStorage {
         &'a self,
         client_id: &'a str,
         token: &'a SecretString,
+        expires_at: Option<u64>,
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let Some(mut client) = self.client(client_id).await? else {
@@ -530,6 +536,9 @@ impl Storage for SqliteStorage {
                 );
             }
             client.pending_enrollment = Some(token.clone());
+            // The deadline goes in beside the token and the old one goes out
+            // with it: a token that was replaced is a token that is gone.
+            client.pending_enrollment_expires_at = expires_at;
             self.put_client(client_id, &client).await
         })
     }
@@ -548,6 +557,7 @@ impl Storage for SqliteStorage {
             };
             client.secret = secret.clone();
             client.pending_enrollment = None;
+            client.pending_enrollment_expires_at = None;
             self.put_client(client_id, &client).await
         })
     }
@@ -557,6 +567,7 @@ impl Storage for SqliteStorage {
         client_id: &'a str,
         device: &'a str,
         credential: DeviceCredential,
+        info: DeviceInfo,
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let Some(mut client) = self.client(client_id).await? else {
@@ -565,9 +576,10 @@ impl Storage for SqliteStorage {
                     self.path.display()
                 );
             };
-            let entry = device_of(credential, &self.path)?;
+            let entry = device_of(credential, info, &self.path)?;
             client.devices.insert(device.to_string(), entry);
             client.pending_enrollment = None;
+            client.pending_enrollment_expires_at = None;
             self.put_client(client_id, &client).await
         })
     }
@@ -612,7 +624,7 @@ impl Storage for SqliteStorage {
                 );
             }
 
-            let entry = device_of(credential, &self.path)?;
+            let entry = device_of(credential, DeviceInfo::default(), &self.path)?;
             client.devices.insert(device.to_string(), entry);
             self.put_client(client_id, &client).await?;
 

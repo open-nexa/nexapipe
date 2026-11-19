@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use acl::ClientAcl;
 pub use client::ClientAuth;
-pub use device::{DeviceAuth, DeviceMaterial};
+pub use device::{DeviceAuth, DeviceInfo, DeviceMaterial};
 pub use step::StepVerdict;
 
 /// TOTP algorithm variants
@@ -213,6 +213,11 @@ impl AuthConfig {
                             // blanked, and neither of the two ever reaches the
                             // file — the state file writes a digest.
                             pending_enrollment: client.pending_enrollment.clone(),
+                            // The deadline travels with the token: a snapshot
+                            // is what the watcher compares when a reload lands,
+                            // and an invitation must not grow a new life just
+                            // because the file was re-read.
+                            pending_enrollment_expires_at: client.pending_enrollment_expires_at,
                             // Names and stamps only. A snapshot exists so a
                             // wrong code does not copy a credential, and every
                             // device secret is one — so a device travels with
@@ -234,6 +239,10 @@ impl AuthConfig {
                                             created_at: String::new(),
                                             last_used: device.last_used,
                                             last_used_step: device.last_used_step,
+                                            label: None,
+                                            platform: None,
+                                            model: None,
+                                            app_version: None,
                                         },
                                     )
                                 })
@@ -336,7 +345,7 @@ fn decode_base32_secret(stored: &str) -> Result<SecretBytes, anyhow::Error> {
 /// The fallible `SystemTime` dance is centralised here so the lockout rules
 /// below read as arithmetic; a clock before 1970 is treated as 0, which only
 /// means "long ago" to every comparison made with it.
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

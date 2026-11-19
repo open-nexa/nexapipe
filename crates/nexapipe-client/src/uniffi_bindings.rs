@@ -570,8 +570,7 @@ impl ProxyClient {
     /// Raw bytes, over the connection the domain mapping picked.
     async fn send_raw_inner(&self, host: String, data: Vec<u8>) -> Result<Vec<u8>, ClientError> {
         let pooled = self.group.get_connection(&host, Protocol::Http).await?;
-        let result = crate::client::exchange_over(pooled.conn(), &data).await;
-        result
+        crate::client::exchange_over(pooled.conn(), &data).await
     }
 }
 

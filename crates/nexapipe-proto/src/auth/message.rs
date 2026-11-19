@@ -79,9 +79,16 @@ pub enum AuthMessage {
         /// A [`SecretString`]: an unspent token is a credential, and this one is
         /// wiped when the message is dropped.
         token: SecretString,
-        /// The name the device asking to enroll wants to be issued under. The
-        /// server is free to answer with the same name or refuse; the token is
-        /// what authorizes the exchange, not this field.
+        /// The id the device asking to enroll wants to be known by.
+        ///
+        /// The server is free to answer with the same id or refuse; the token
+        /// is what authorizes the exchange, not this field.
+        ///
+        /// For a device that offers a key, this is the fingerprint of that key
+        /// — see [`crate::auth::device_id_from_public_key`] — and the server
+        /// checks it against the fingerprint it works out for itself. A device
+        /// that offers no key sends a name it was given, which is the older
+        /// arrangement and is filed under that name.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         device_id: Option<String>,
         /// The device key this client is asking to be issued under, as the
@@ -96,6 +103,24 @@ pub enum AuthMessage {
         /// check against.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         public_key: Option<String>,
+        /// The name the device calls itself, for the operator to read.
+        ///
+        /// A label and not an identity: two devices may carry the same one, and
+        /// nothing is refused over it. Absent for a client that has no name to
+        /// give — every client built before devices reported one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        /// The platform the device runs on — `android`, `macos`, `windows`,
+        /// `linux` — for the operator to read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        platform: Option<String>,
+        /// The model the device runs on: the phone's model, the operating
+        /// system's version. For the operator to read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// The version of the app the device runs, for the operator to read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_version: Option<String>,
     },
     /// Server issues the credential the token was standing in for
     #[serde(rename = "ENROLL_ISSUE")]
@@ -281,6 +306,10 @@ impl AuthMessage {
                 token,
                 device_id,
                 public_key,
+                label,
+                platform,
+                model,
+                app_version,
             } => {
                 let mut flags = 0;
                 if device_id.is_some() {
@@ -288,6 +317,18 @@ impl AuthMessage {
                 }
                 if public_key.is_some() {
                     flags |= flag::PUBLIC_KEY;
+                }
+                if label.is_some() {
+                    flags |= flag::LABEL;
+                }
+                if platform.is_some() {
+                    flags |= flag::PLATFORM;
+                }
+                if model.is_some() {
+                    flags |= flag::MODEL;
+                }
+                if app_version.is_some() {
+                    flags |= flag::APP_VERSION;
                 }
                 writer.u8(kind::ENROLL_START);
                 writer.u8(flags);
@@ -298,6 +339,18 @@ impl AuthMessage {
                 }
                 if let Some(public_key) = public_key {
                     writer.string(public_key)?;
+                }
+                if let Some(label) = label {
+                    writer.string(label)?;
+                }
+                if let Some(platform) = platform {
+                    writer.string(platform)?;
+                }
+                if let Some(model) = model {
+                    writer.string(model)?;
+                }
+                if let Some(app_version) = app_version {
+                    writer.string(app_version)?;
                 }
             }
             AuthMessage::EnrollIssue {
@@ -403,11 +456,35 @@ impl AuthMessage {
                 } else {
                     None
                 };
+                let label = if flags & flag::LABEL != 0 {
+                    Some(reader.string()?)
+                } else {
+                    None
+                };
+                let platform = if flags & flag::PLATFORM != 0 {
+                    Some(reader.string()?)
+                } else {
+                    None
+                };
+                let model = if flags & flag::MODEL != 0 {
+                    Some(reader.string()?)
+                } else {
+                    None
+                };
+                let app_version = if flags & flag::APP_VERSION != 0 {
+                    Some(reader.string()?)
+                } else {
+                    None
+                };
                 Ok(AuthMessage::EnrollStart {
                     client_id,
                     token,
                     device_id,
                     public_key,
+                    label,
+                    platform,
+                    model,
+                    app_version,
                 })
             }
             kind::ENROLL_ISSUE => {

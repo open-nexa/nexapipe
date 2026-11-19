@@ -213,11 +213,12 @@ export async function hydrateCredentials(source: ProxyConfig): Promise<ProxyConf
       node.enrollment = {
         clientId: node.enrollment?.clientId ?? '',
         token,
-        // The device the enrollment names travels with it. Dropping it here
-        // enrolls without a name, and enrolling without a name answers with
-        // the client's own secret — which is what makes a revocation rotate
-        // every other device that shares it.
-        ...(node.enrollment?.device ? { device: node.enrollment.device } : {}),
+        // What this device says about itself travels with the enrollment: the
+        // token comes from the store, the labels stay in the payload. These are
+        // descriptions rather than an identity — the id comes from the key —
+        // so dropping them here would leave the operator with no idea which
+        // machine the issued credential belongs to.
+        ...(node.enrollment?.deviceInfo ? { deviceInfo: node.enrollment.deviceInfo } : {}),
       };
     } else if (node.enrollment?.token.trim()) {
       await putCredential('enrollment', node.enrollment.token, node.id);

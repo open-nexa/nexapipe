@@ -635,30 +635,23 @@ fn start_proxy(env: &mut Env<'_>) -> jint {
                 if node_has_two_factor(&node_id) {
                     continue;
                 }
-                // Named where the token is spent, which is the only moment a
-                // name means anything: it is what makes the credential that
-                // comes back this phone's alone, and enrolling without one is
-                // how a device ends up sharing the client's secret — the thing
-                // that makes revoking one rotate every other one.
-                let name = device_id();
+                // The id the server files this device under is the fingerprint
+                // of its key, worked out from the public half on both sides.
+                // No name is claimed here: what Kotlin reports is a set of
+                // labels for the operator, none of which is an identity.
                 let enrollment = Enrollment::new(&client_id, token.as_str());
-                let enrollment = match &name {
-                    Some(name) => enrollment.with_device(name),
+                let enrollment = match device_info() {
+                    Some(info) => enrollment.with_device_info(info),
                     None => enrollment,
                 };
-                // A device key is offered here rather than asked for: the server
-                // records the public half under the device's name and issues no
-                // secret at all, so the private half never has to be anywhere
-                // but this device. A server that predates keys ignores the offer
-                // and issues a secret as it always has, which is what the
-                // credential then is.
-                //
-                // Only with a name, because the server refuses a key that names
-                // no device — and a refusal that reads as a bad token would be a
-                // lie: the token was fine and the device had no name.
-                let enrollment = match (&name, node_device_key_for(&node_id)) {
-                    (Some(_), Some(key)) => enrollment.with_key(key),
-                    _ => enrollment,
+                // A device key is offered rather than asked for: the server
+                // records the public half under the fingerprint and issues no
+                // secret, so the private half never leaves this phone. A server
+                // that predates keys ignores the offer and issues a secret as
+                // it always has, which is what the credential then is.
+                let enrollment = match node_device_key_for(&node_id) {
+                    Some(key) => enrollment.with_key(key),
+                    None => enrollment,
                 };
                 endpoint_group
                     .set_enrollment_for(&node_id, Some(enrollment))

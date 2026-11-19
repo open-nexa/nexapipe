@@ -15,6 +15,7 @@
 // and the config file all of them work on.
 mod client;
 mod config;
+mod device;
 mod enrollment;
 mod invite;
 mod qr;
@@ -23,5 +24,6 @@ mod qr;
 mod tests;
 
 pub(crate) use client::{add_client, list_clients, revoke_client};
+pub(crate) use device::invite_device;
 pub(crate) use enrollment::print_2fa_enrollment;
 pub(crate) use invite::print_endpoint_invite;

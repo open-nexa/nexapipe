@@ -81,10 +81,20 @@ pub struct AuthClient {
     /// allows, so an operator opts in.
     pub allow_ports_strict: Option<bool>,
     /// A one-time enrollment token outstanding for this client, written by
-    /// `--generate-invite --registration` and cleared by whoever spends it. Not
+    /// `nexapipe device invite` and cleared by whoever spends it. Not
     /// written back by `save_auth_state`: it belongs to the operator, not to
     /// the runtime.
     pub pending_enrollment: Option<SecretString>,
+    /// When the pending enrollment token stops being good, as a Unix
+    /// timestamp.
+    ///
+    /// Written by `nexapipe device invite` next to the token, and kept here
+    /// rather than in the state file for the reason the token is: both belong
+    /// to the operator, and a restart must not hand the invitation a new life.
+    ///
+    /// Absent means the token has no deadline, which is what an invitation
+    /// written by hand says.
+    pub pending_enrollment_expires_at: Option<u64>,
     /// `[auth.clients.<id>.devices.<name>]` — credentials issued to individual
     /// devices, each with a secret of its own so one can be dropped without
     /// rotating the others. Absent means this client has never issued one, and
@@ -131,6 +141,19 @@ pub struct AuthDevice {
     /// The stamp is written to the server's state file, beside the
     /// configuration, and not here — see [`crate::auth::state`].
     pub last_used: Option<u64>,
+    /// The name the device calls itself, for the operator to read.
+    ///
+    /// A label and not an identity: the device is known by the fingerprint of
+    /// its key, and two devices may carry the same label. Absent means the
+    /// device never said what it is called.
+    pub label: Option<String>,
+    /// The platform the device runs on: `android`, `macos`, `windows`, `linux`.
+    pub platform: Option<String>,
+    /// The model the device runs on: the phone's model, the operating
+    /// system's version.
+    pub model: Option<String>,
+    /// The version of the app the device runs.
+    pub app_version: Option<String>,
 }
 
 /// Reads the `[auth]` section, and names it when it is what broke.
@@ -231,8 +254,11 @@ impl Config {
         client_id: &str,
         token: &str,
     ) -> anyhow::Result<()> {
-        FileStorage::new(path)
-            .write_pending_enrollment(client_id, &SecretString::new(token.to_string()))
+        FileStorage::new(path).write_pending_enrollment(
+            client_id,
+            &SecretString::new(token.to_string()),
+            None,
+        )
     }
 
     /// Spends the token: writes the issued `secret` and drops
@@ -277,6 +303,7 @@ impl Config {
             client_id,
             device,
             crate::storage::DeviceCredential::from(material),
+            Default::default(),
         )
     }
 

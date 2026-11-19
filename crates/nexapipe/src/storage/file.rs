@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 use zeroize::Zeroize;
 
-use super::{DeviceCredential, Stamp, Storage, StorageKind};
+use super::{DeviceCredential, DeviceInfo, Stamp, Storage, StorageKind};
 
 use crate::toml_zeroize::zeroize_document;
 
@@ -185,10 +185,16 @@ impl FileStorage {
     }
 
     /// Records a one-time enrollment token for a client.
+    ///
+    /// The deadline goes in beside the token, and the old one goes out with
+    /// it: a token that was replaced is a token that is gone, and a deadline
+    /// left behind would be read as the deadline of the token that replaced
+    /// it.
     pub fn write_pending_enrollment(
         &self,
         client_id: &str,
         token: &SecretString,
+        expires_at: Option<u64>,
     ) -> anyhow::Result<()> {
         let path = self.config_path.clone();
         with_lock(&path, || {
@@ -209,6 +215,17 @@ impl FileStorage {
                 "pending_enrollment",
                 toml_edit::value(token.expose_secret().as_str()),
             );
+            match expires_at {
+                Some(at) => {
+                    // TOML integers are signed; clamp a timestamp past i64::MAX
+                    // rather than wrapping it into the past.
+                    let at = at.min(i64::MAX as u64) as i64;
+                    client.insert("pending_enrollment_expires_at", toml_edit::value(at));
+                }
+                None => {
+                    client.remove("pending_enrollment_expires_at");
+                }
+            }
 
             write_document(&path, doc)
         })
@@ -230,17 +247,22 @@ impl FileStorage {
 
             client.insert("secret", toml_edit::value(secret.expose_secret().as_str()));
             client.remove("pending_enrollment");
+            // The deadline goes with the token: a token that is gone has no
+            // deadline, and a deadline left behind would be read as the
+            // deadline of the next invitation.
+            client.remove("pending_enrollment_expires_at");
 
             write_document(&path, doc)
         })
     }
 
-    /// Spends the token for one named device.
+    /// Spends the token for one device.
     pub fn complete_device_enrollment(
         &self,
         client_id: &str,
         device: &str,
         credential: DeviceCredential,
+        info: DeviceInfo,
     ) -> anyhow::Result<()> {
         let path = self.config_path.clone();
         with_lock(&path, || {
@@ -251,9 +273,10 @@ impl FileStorage {
             let client = sub_table(clients, client_id, &path)?;
 
             let devices = device_table(client, client_id, &path)?;
-            devices.insert(device, device_entry(credential, &path)?);
+            devices.insert(device, device_entry(credential, info, &path)?);
 
             client.remove("pending_enrollment");
+            client.remove("pending_enrollment_expires_at");
 
             write_document(&path, doc)
         })
@@ -304,7 +327,10 @@ impl FileStorage {
                 );
             }
 
-            devices.insert(device, device_entry(credential, &path)?);
+            devices.insert(
+                device,
+                device_entry(credential, DeviceInfo::default(), &path)?,
+            );
 
             write_document(&path, doc)?;
 
@@ -539,12 +565,13 @@ impl Storage for FileStorage {
         &'a self,
         client_id: &'a str,
         token: &'a SecretString,
+        expires_at: Option<u64>,
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         let this = self.clone();
         let client_id = client_id.to_string();
         let token = token.clone();
         Box::pin(async move {
-            blocking(move || this.write_pending_enrollment(&client_id, &token)).await
+            blocking(move || this.write_pending_enrollment(&client_id, &token, expires_at)).await
         })
     }
 
@@ -566,12 +593,14 @@ impl Storage for FileStorage {
         client_id: &'a str,
         device: &'a str,
         credential: DeviceCredential,
+        info: DeviceInfo,
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         let this = self.clone();
         let client_id = client_id.to_string();
         let device = device.to_string();
         Box::pin(async move {
-            blocking(move || this.complete_device_enrollment(&client_id, &device, credential)).await
+            blocking(move || this.complete_device_enrollment(&client_id, &device, credential, info))
+                .await
         })
     }
 
@@ -969,7 +998,11 @@ fn device_table<'a>(
 /// public key that is not a key, so an unchecked write would hand back success
 /// while leaving a config that cannot be read again. A key is written in the
 /// canonical spelling — lowercase hex — whatever case it arrived in.
-fn device_entry(credential: DeviceCredential, path: &Path) -> anyhow::Result<toml_edit::Item> {
+fn device_entry(
+    credential: DeviceCredential,
+    info: DeviceInfo,
+    path: &Path,
+) -> anyhow::Result<toml_edit::Item> {
     let mut entry = toml_edit::InlineTable::new();
     match credential {
         DeviceCredential::Secret(secret) => {
@@ -996,6 +1029,20 @@ fn device_entry(credential: DeviceCredential, path: &Path) -> anyhow::Result<tom
         "created_at",
         toml_edit::Value::from(crate::auth::config::default_created_at()),
     );
+    // What the device said about itself, for the operator to read. A field
+    // the device did not send is left out rather than written as an empty
+    // string: there is a difference between a device that said nothing and a
+    // device that has nothing to say.
+    for (key, value) in [
+        ("label", info.label),
+        ("platform", info.platform),
+        ("model", info.model),
+        ("app_version", info.app_version),
+    ] {
+        if let Some(value) = value {
+            entry.insert(key, toml_edit::Value::from(value));
+        }
+    }
     Ok(toml_edit::value(entry))
 }
 
