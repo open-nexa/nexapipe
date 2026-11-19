@@ -14,7 +14,14 @@ use std::process::{Command, Output, Stdio};
 
 /// The name of the binary the integration tests drive.
 fn binary() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_nexapipe"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_nexapipe"));
+    // A store inherited from the caller's environment would open a database
+    // other than the one the test named, and a start that is expected to fail
+    // would then wait forever. Each test names its own store explicitly.
+    command
+        .env_remove("NEXAPIPE_STORAGE")
+        .env_remove("NEXAPIPE_STORAGE_URL");
+    command
 }
 
 /// Runs the binary with `args`, stdin closed, and gives back what it said.

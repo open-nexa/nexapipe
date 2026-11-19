@@ -11,6 +11,7 @@
 //! away, and a build that carries no database driver says so rather than
 //! pretending to open one.
 
+use crate::config::Config;
 use crate::storage::{FileStorage, Storage, StorageKind};
 
 use std::path::{Path, PathBuf};
@@ -127,15 +128,77 @@ pub async fn import_legacy_config(
     // Where an unknown key becomes the error it is: the same parse the file
     // store's readers run, so the import refuses exactly what a start on the
     // file would have refused.
-    let config = crate::config::Config::from_toml_text(text.expose_secret()).map_err(|e| {
+    let mut config = Config::from_toml_text(text.expose_secret()).map_err(|e| {
         anyhow::anyhow!(
             "{} cannot be read as a configuration: {e:#}",
             path.display()
         )
     })?;
 
+    // The rest of what a cold start would check, before the store becomes
+    // authoritative. `from_toml_text` only deserializes: it accepts the
+    // removed `default_backend`, a zero timeout or a backend that cannot
+    // work, all of which `build_routes` refuses a moment later. A config
+    // committed to the store is the one the next start reads *instead* of
+    // importing again, so refusing it here is what leaves the operator able
+    // to fix the file and start.
+    config.build_routes().map_err(|e| {
+        anyhow::anyhow!(
+            "{} cannot be started as a configuration: {e:#}",
+            path.display()
+        )
+    })?;
+
+    // A database store has no directory to resolve a relative
+    // `secret_key_file` against. The file store resolved such a pointer beside
+    // the configuration, so do the same once here and write the absolute
+    // spelling: otherwise the next start refuses the pointer and the server
+    // stays down after an import that reported success.
+    absolutize_credential_paths(&mut config, &path)?;
+
     storage.put_config(&config).await?;
     Ok(Some(path))
+}
+
+/// Rewrites the `*_file` pointers a legacy configuration spells relatively so
+/// they still name the same files once the configuration lives in a database.
+///
+/// A database store has no `base_dir()`, and a relative pointer in it is
+/// refused on the next start — a start that no longer imports, so correcting
+/// the file beside it would not help. The legacy file's directory is the one
+/// the file store used, so joining it here keeps the deployment reading the
+/// same keys.
+fn absolutize_credential_paths(config: &mut Config, path: &Path) -> anyhow::Result<()> {
+    let Some(iroh) = config.iroh.as_mut() else {
+        return Ok(());
+    };
+
+    let directory = match path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        Some(directory) => directory.to_path_buf(),
+        // A bare `config.toml` lives in the working directory, which is what
+        // the file store's empty parent resolved against too.
+        None => std::env::current_dir().map_err(|e| {
+            anyhow::anyhow!(
+                "cannot resolve the credential paths beside {}: {e}",
+                path.display()
+            )
+        })?,
+    };
+
+    for pointer in [&mut iroh.secret_key_file, &mut iroh.relay_auth_token_file] {
+        if let Some(spelling) = pointer.take() {
+            let candidate = Path::new(&spelling);
+            *pointer = Some(if candidate.is_absolute() {
+                spelling
+            } else {
+                directory.join(candidate).to_string_lossy().into_owned()
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The directory the configuration file is in, when it names one.
@@ -279,6 +342,70 @@ mod tests {
                 .expect("the store is readable")
                 .is_none(),
             "the store is left holding no configuration"
+        );
+    }
+
+    /// A configuration a cold start would refuse is not committed to the
+    /// store: the operator can still fix the file beside it and start.
+    #[tokio::test]
+    async fn a_configuration_a_start_would_refuse_is_not_imported() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "default_backend = \"http://127.0.0.1:18080\"\n")
+            .expect("the legacy file is written");
+
+        let store = FileStorage::new(dir.path().join("not-the-legacy-file.toml"));
+        let error = import_legacy_config(&store, &config.to_string_lossy())
+            .await
+            .expect_err("the import refuses a configuration startup would refuse");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("default_backend"),
+            "the refusal names the key: {message}"
+        );
+        assert!(
+            store
+                .config()
+                .await
+                .expect("the store is readable")
+                .is_none(),
+            "the store is left holding no configuration"
+        );
+    }
+
+    /// Relative `*_file` pointers are resolved against the legacy file's
+    /// directory before the configuration is written, because a database has
+    /// no directory to resolve them against on the next start.
+    #[tokio::test]
+    async fn relative_credential_paths_are_resolved_before_the_import_is_written() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = dir.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[iroh]\nsecret_key_file = \"keys/iroh.key\"\n\
+             relay_auth_token_file = \"keys/relay.token\"\n",
+        )
+        .expect("the legacy file is written");
+
+        let store = FileStorage::new(dir.path().join("not-the-legacy-file.toml"));
+        import_legacy_config(&store, &config.to_string_lossy())
+            .await
+            .expect("the import runs");
+
+        let stored = store
+            .config()
+            .await
+            .expect("the store is readable")
+            .expect("the store holds a configuration");
+        let text = stored.expose_secret();
+        assert!(
+            text.contains(&dir.path().join("keys/iroh.key").display().to_string()),
+            "the secret key pointer names the same file: {text}"
+        );
+        assert!(
+            text.contains(&dir.path().join("keys/relay.token").display().to_string()),
+            "the relay token pointer names the same file: {text}"
         );
     }
 }

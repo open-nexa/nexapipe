@@ -6,8 +6,8 @@
 #
 # The configuration is kept in a SQLite database by default: `nexapipe.db`,
 # beside the path `--config` names. This file is the interchange format — the
-# first start that finds an empty database and a `config.toml` beside it imports
-# that file once and leaves it where it is. `--storage toml` reads and writes the
+# first start that finds an empty database and a `config.toml` beside the path
+# `--config` names imports that file once and leaves it where it is. `--storage toml` reads and writes the
 # file directly instead, with no database.
 #
 # This is the general example: every section written out, with 2FA on - the

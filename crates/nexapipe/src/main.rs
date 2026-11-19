@@ -582,14 +582,21 @@ async fn main() {
     // The path is carried to the advisory after `log::init` rather than
     // printed here, for the same reason the "wrote a minimal one" notice is:
     // server-mode advisories go through the log channel.
-    let legacy_import =
+    // Only a database store has an import to do. The file store reads the
+    // `config.toml` it was named with `--config` itself; running the import
+    // there would copy a sibling `config.toml` into a *different* file the
+    // operator named, instead of writing that store's first-run template.
+    let legacy_import = if storage.kind() == StorageKind::Toml {
+        None
+    } else {
         match nexapipe::storage::import_legacy_config(storage.as_ref(), &cli.config).await {
             Ok(path) => path,
             Err(e) => {
                 eprintln!("Failed to import the configuration: {e:#}");
                 std::process::exit(1);
             }
-        };
+        }
+    };
 
     // A first start with no config file gets a minimal one written for it,
     // rather than a refusal to start with nothing to act on. Server mode only:

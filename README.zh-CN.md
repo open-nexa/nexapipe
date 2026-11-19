@@ -590,8 +590,8 @@ nexapipe --config /etc/nexapipe/config.toml --storage-url /srv/nexapipe.db
 所以旁边没有 `config.state.toml`，也没有 `config.toml.admin-token`。文件存储仍然保留
 这两者（见[下一节](#文件存储是三个文件)）。
 
-**旧版本写下的 `config.toml` 会被导入一次。** 首次启动时若数据库为空且旁边有
-`config.toml`，该文件的配置会被写进数据库，并在日志里说明：
+**旧版本写下的 `config.toml` 会被导入一次。** 首次启动时若数据库为空，且 `--config`
+指定的路径旁边有 `config.toml`，该文件的配置会被写进数据库，并在日志里说明：
 
 ```
 Imported the configuration from /etc/nexapipe/config.toml into /etc/nexapipe/nexapipe.db;

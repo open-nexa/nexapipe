@@ -41,9 +41,27 @@ discovery = \"none\"
 /// Reading while the process runs is what makes this work: the server does not
 /// exit, so waiting for it would block forever on a process behaving exactly
 /// as it should. The child is left running for the caller to kill.
-fn start(config: &Path) -> (String, Child) {
+/// The log directory a test child writes to: inside the temporary directory,
+/// so a start leaves nothing in the checkout and parallel starts do not share
+/// the same files.
+fn log_dir(config: &Path) -> PathBuf {
+    config
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .join("logs")
+}
+
+fn start(config: &Path, extra: &[&str]) -> (String, Child) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
         .args(["--config", config.to_str().expect("utf-8 path")])
+        .args(extra)
+        // A store inherited from the caller's environment would open a
+        // database other than the temporary one, and a start that is expected
+        // to fail would then never print the refusal the test waits for.
+        .env_remove("NEXAPIPE_STORAGE")
+        .env_remove("NEXAPIPE_STORAGE_URL")
+        .env("NEXAPIPE_LOG_DIR", log_dir(config))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -127,7 +145,7 @@ async fn a_fresh_start_keeps_the_configuration_in_the_database() {
     let dir = tempfile::tempdir().expect("temp dir");
     let config = dir.path().join("config.toml");
 
-    let (output, mut child) = start(&config);
+    let (output, mut child) = start(&config, &[]);
     let _ = child.kill();
     let _ = child.wait();
 
@@ -160,7 +178,7 @@ async fn the_file_beside_an_empty_database_is_imported_once() {
     let config = dir.path().join("config.toml");
     fs::write(&config, LEGACY_CONFIG).expect("the legacy file is written");
 
-    let (output, mut child) = start(&config);
+    let (output, mut child) = start(&config, &[]);
     let _ = child.kill();
     let _ = child.wait();
 
@@ -189,7 +207,7 @@ async fn the_file_beside_an_empty_database_is_imported_once() {
 
     // The second start finds the configuration already there, so it reads no
     // file and imports nothing.
-    let (output, mut child) = start(&config);
+    let (output, mut child) = start(&config, &[]);
     let _ = child.kill();
     let _ = child.wait();
 
@@ -215,6 +233,9 @@ async fn a_file_that_does_not_parse_stops_the_start() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_nexapipe"))
         .args(["--config", config.to_str().expect("utf-8 path")])
+        .env_remove("NEXAPIPE_STORAGE")
+        .env_remove("NEXAPIPE_STORAGE_URL")
+        .env("NEXAPIPE_LOG_DIR", log_dir(&config))
         .stdin(Stdio::null())
         .output()
         .expect("the binary runs");
@@ -236,5 +257,34 @@ async fn a_file_that_does_not_parse_stops_the_start() {
             .expect("the store is readable")
             .is_none(),
         "the database is left holding no configuration"
+    );
+}
+
+/// An explicit `--storage toml` keeps the file store's own behaviour: the
+/// sibling `config.toml` is not imported into the file the operator named
+/// with `--config`, and no database is opened.
+#[tokio::test]
+async fn an_explicit_file_store_does_not_import_a_sibling_config() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let legacy = dir.path().join("config.toml");
+    fs::write(
+        &legacy,
+        "[auth]\nenabled = true\n\n[auth.clients.legacy-client]\nsecret = \"JBSWY3DPEHPK3PXP\"\n",
+    )
+    .expect("the legacy file is written");
+    let named = dir.path().join("new.toml");
+
+    let (_, mut child) = start(&named, &["--storage", "toml"]);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let text = fs::read_to_string(&named).expect("the named file is written");
+    assert!(
+        !text.contains("legacy-client"),
+        "the sibling configuration was not imported: {text}"
+    );
+    assert!(
+        !database(&named).exists(),
+        "an explicit file store opens no database"
     );
 }

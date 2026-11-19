@@ -710,8 +710,9 @@ keeps those two, as it always has (see [the next
 section](#the-file-store-is-three-files)).
 
 **A `config.toml` from an earlier version is imported once.** The first start
-that finds an empty database and a `config.toml` beside it writes that file's
-configuration into the database, and says so in the log:
+that finds an empty database and a `config.toml` beside the path `--config`
+names writes that file's configuration into the database, and says so in the
+log:
 
 ```
 Imported the configuration from /etc/nexapipe/config.toml into /etc/nexapipe/nexapipe.db;
