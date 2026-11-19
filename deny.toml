@@ -95,22 +95,24 @@ ignore = [
     #
     # RUSTSEC-2026-0574..0582: nine unsoundness advisories on `heapless
     # 0.7.17` (`Deque`, `Spsc`, `IndexMap::truncate`,
-    # `SortedLinkedList::zeroize`, `FindMutView::pop`, …). All are fixed in
-    # heapless >= 0.9.4, but heapless reaches this graph through postcard
-    # 1.x, pulled in by iroh-relay and iroh-tickets, which pin the 0.7 line:
-    # the lockfile cannot move until iroh moves off postcard 1.x. None of
-    # the affected constructs are on a path this project uses. Remove these
+    # `SortedLinkedList::zeroize`, `FindMutView::pop`, …), fixed in
+    # heapless >= 0.9.4. Each lockfile carried two copies: the 0.9.3 one
+    # reached through smoltcp (which allows 0.9.4) has been updated, so
+    # these ignores cover only the 0.7.17 copy reached through postcard 1.x,
+    # pulled in by iroh-relay and iroh-tickets, which pin the 0.7 line. That
+    # copy cannot move until iroh moves off postcard 1.x, and none of the
+    # affected constructs are on a path this project uses. Remove these
     # entries and bump the lockfile as soon as an iroh release allows
     # heapless >= 0.9.4.
-    { id = "RUSTSEC-2026-0574", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
-    { id = "RUSTSEC-2026-0575", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
-    { id = "RUSTSEC-2026-0576", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
-    { id = "RUSTSEC-2026-0577", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
-    { id = "RUSTSEC-2026-0578", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
-    { id = "RUSTSEC-2026-0579", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
-    { id = "RUSTSEC-2026-0580", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
-    { id = "RUSTSEC-2026-0581", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
-    { id = "RUSTSEC-2026-0582", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0574", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); the smoltcp 0.9.x copy is patched at 0.9.4, this one waits for iroh" },
+    { id = "RUSTSEC-2026-0575", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); the smoltcp 0.9.x copy is patched at 0.9.4, this one waits for iroh" },
+    { id = "RUSTSEC-2026-0576", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); the smoltcp 0.9.x copy is patched at 0.9.4, this one waits for iroh" },
+    { id = "RUSTSEC-2026-0577", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); the smoltcp 0.9.x copy is patched at 0.9.4, this one waits for iroh" },
+    { id = "RUSTSEC-2026-0578", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); the smoltcp 0.9.x copy is patched at 0.9.4, this one waits for iroh" },
+    { id = "RUSTSEC-2026-0579", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); the smoltcp 0.9.x copy is patched at 0.9.4, this one waits for iroh" },
+    { id = "RUSTSEC-2026-0580", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); the smoltcp 0.9.x copy is patched at 0.9.4, this one waits for iroh" },
+    { id = "RUSTSEC-2026-0581", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); the smoltcp 0.9.x copy is patched at 0.9.4, this one waits for iroh" },
+    { id = "RUSTSEC-2026-0582", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); the smoltcp 0.9.x copy is patched at 0.9.4, this one waits for iroh" },
 ]
 # An advisory on this list that no crate in the graph matches is worth
 # knowing about — it means the ignore can go. This file is used for two

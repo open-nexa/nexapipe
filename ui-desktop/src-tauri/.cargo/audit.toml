@@ -47,12 +47,12 @@ ignore = [
     # listed here so that this file and the one at the root stay in step.
     "RUSTSEC-2026-0459",
     # RUSTSEC-2026-0574..0582: nine unsoundness advisories on heapless
-    # 0.7.17, all fixed in heapless >= 0.9.4. heapless reaches this tree
-    # through postcard 1.x (iroh-relay / iroh-tickets), which pins the 0.7
-    # line, so the lockfile cannot move to the patched release until iroh
-    # moves off postcard 1.x. Listed so this file and the one at the root
-    # stay in step. Remove these entries and bump the lockfile as soon as
-    # an iroh release allows heapless >= 0.9.4.
+    # 0.7.17, all fixed in heapless >= 0.9.4. The 0.9.3 copy reached through
+    # smoltcp is updated to 0.9.4; the 0.7.17 copy comes from postcard 1.x
+    # (iroh-relay / iroh-tickets), which pins the 0.7 line, so that copy
+    # cannot move until iroh moves off postcard 1.x. Listed so this file and
+    # the one at the root stay in step. Remove these entries and bump the
+    # lockfile as soon as an iroh release allows heapless >= 0.9.4.
     "RUSTSEC-2026-0574",
     "RUSTSEC-2026-0575",
     "RUSTSEC-2026-0576",
