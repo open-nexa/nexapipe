@@ -1,0 +1,340 @@
+/*
+ * The console's own styling.
+ *
+ * A page that is read on a terminal-sized window next to a running server
+ * wants dense rows and a lot of monospace, not a marketing layout: the
+ * patterns are the host, the path and the client id.
+ */
+
+:root {
+  --ink: #1c2024;
+  --ink-soft: #5b6570;
+  --paper: #fbfcfd;
+  --line: #dfe4e9;
+  --accent: #2f6f9f;
+  --ok: #2c7a4b;
+  --bad: #b23b3b;
+  --warn: #8a6a1f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #e6eaee;
+    --ink-soft: #9aa5b1;
+    --paper: #14181c;
+    --line: #2b3239;
+    --accent: #6fb0e0;
+    --ok: #63c48d;
+    --bad: #e08a8a;
+    --warn: #d9b45f;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 0.92em;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* The shell */
+
+.shell__header {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--line);
+}
+
+.shell__title {
+  font-weight: 600;
+}
+
+.shell__nav {
+  display: flex;
+  gap: 1rem;
+}
+
+.shell__nav a {
+  color: var(--ink-soft);
+  text-decoration: none;
+  padding-bottom: 2px;
+  border-bottom: 2px solid transparent;
+}
+
+.shell__nav a.router-link-active {
+  color: var(--ink);
+  border-bottom-color: var(--accent);
+}
+
+.shell__tools {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.shell__main {
+  padding: 1.25rem;
+}
+
+/* The gate */
+
+.gate {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+}
+
+.gate__card {
+  width: min(30rem, 100%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 1.5rem;
+}
+
+.gate__title {
+  margin: 0 0 0.5rem;
+  font-size: 1.15rem;
+}
+
+.gate__intro,
+.gate__hint,
+.gate__missing {
+  color: var(--ink-soft);
+  font-size: 0.9rem;
+}
+
+.gate__missing {
+  border-top: 1px solid var(--line);
+  padding-top: 0.75rem;
+}
+
+/* Pages */
+
+.page__head {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.page__title {
+  margin: 0 0 1rem;
+  font-size: 1.15rem;
+}
+
+.page__subtitle {
+  margin: 1.75rem 0 0.5rem;
+  font-size: 1rem;
+  color: var(--ink-soft);
+}
+
+.page__lead,
+.page__empty {
+  color: var(--ink-soft);
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+  gap: 0.75rem;
+}
+
+.card {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.75rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.card__label {
+  color: var(--ink-soft);
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.card__value {
+  font-size: 1.5rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.card__note {
+  color: var(--ink-soft);
+  font-size: 0.85rem;
+}
+
+/* Tables */
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+
+.table th {
+  color: var(--ink-soft);
+  font-weight: 500;
+  font-size: 0.85rem;
+}
+
+/* Tags */
+
+.tag {
+  display: inline-block;
+  padding: 0 0.4rem;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  font-size: 0.75rem;
+  color: var(--ink-soft);
+}
+
+.tag--ok {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+
+.tag--bad {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+.tag--warn {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+
+.backend {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-right: 0.75rem;
+}
+
+/* Forms */
+
+.form {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 1rem;
+  margin-bottom: 1rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.field--check {
+  flex-direction: row;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.field__label {
+  color: var(--ink-soft);
+  font-size: 0.85rem;
+}
+
+.field__hint {
+  color: var(--ink-soft);
+  font-size: 0.8rem;
+}
+
+.field__input {
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0.35rem 0.5rem;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+}
+
+.form__actions {
+  grid-column: 1 / -1;
+  display: flex;
+  gap: 0.5rem;
+}
+
+/* Buttons */
+
+.button {
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--accent);
+  color: var(--paper);
+  padding: 0.35rem 0.75rem;
+  font: inherit;
+  cursor: pointer;
+}
+
+.button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.button--quiet {
+  background: transparent;
+  color: var(--ink);
+  border-color: var(--line);
+}
+
+.button--danger {
+  background: transparent;
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+/* Banners */
+
+.banner {
+  margin: 0.75rem 1.25rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 4px;
+  border: 1px solid var(--line);
+}
+
+.banner--error {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+.banner--ok {
+  color: var(--ok);
+  border-color: var(--ok);
+}

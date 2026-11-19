@@ -87,6 +87,7 @@ jobs:
       client: ${{ steps.paths.outputs.client }}
       android: ${{ steps.paths.outputs.android }}
       desktop: ${{ steps.paths.outputs.desktop }}
+      console: ${{ steps.paths.outputs.console }}
       image: ${{ steps.paths.outputs.image }}
       dependencies: ${{ steps.paths.outputs.dependencies }}
       desktop_lockfile: ${{ steps.paths.outputs.desktop_lockfile }}
@@ -480,6 +481,12 @@ jobs:
         if: ${{ !cancelled() }}
         working-directory: ui-desktop
         run: npm audit --omit=dev --audit-level=high
+      # The console's tree is a tree of its own, with its own lockfile and its
+      # own advisories. The desktop's audit does not see it.
+      - name: npm audit (the console)
+        if: ${{ !cancelled() }}
+        working-directory: ui-web
+        run: npm audit --omit=dev --audit-level=high
 
   # The secret scan and the dependency review.
   #
@@ -678,6 +685,59 @@ jobs:
         if: ${{ !cancelled() }}
         run: npm run test:stores
 
+  # The browser console the instance serves.
+  #
+  # Its own tree, its own lockfile and its own build, so it gets its own job:
+  # a pull request that touches nothing but the console must not make the
+  # server's tests run again, and a pull request that touches the server must
+  # not have to install npm to be checked.
+  #
+  # There is no Rust here. The console is a page the instance serves; the
+  # instance's half of it — the API it answers and the files it serves — is
+  # covered by the server's own jobs.
+  console:
+    name: console (web)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: changes
+    if: needs.changes.outputs.console == 'true'
+
+    defaults:
+      run:
+        working-directory: ui-web
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7 @ 2026-07-17
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7 @ 2026-10-08
+        with:
+          node-version-file: ui-web/.nvmrc
+          cache: npm
+          cache-dependency-path: ui-web/package-lock.json
+
+      # npm ci, not npm install: it fails outright when package-lock.json and
+      # package.json disagree.
+      - name: npm ci
+        if: ${{ !cancelled() }}
+        run: npm ci
+
+      # vue-tsc --noEmit && vite build
+      - name: typecheck + build
+        if: ${{ !cancelled() }}
+        run: npm run build
+
+      - name: lint i18n
+        if: ${{ !cancelled() }}
+        run: npm run lint:i18n
+
+      # The store tests: plain Node tests, run through Vite's SSR build
+      # because the tree has no test runner and the store's imports are
+      # extensionless. A test that nothing runs is not a test.
+      - name: store tests
+        if: ${{ !cancelled() }}
+        run: npm run test:stores
+
   # The desktop crate on the two runners that are not Linux. Catch
   # cross-platform compile breakage early: development happens on one
   # machine, so anything inside #[cfg(target_os = "linux"/"macos"/"windows")]
@@ -762,8 +822,12 @@ jobs:
             runner: ubuntu-22.04-arm
           - label: macos-x64
             runner: macos-15-intel
+          # The arm64 half of the same image: `macos-15` is arm64 by default,
+          # and `macos-15-intel` is the x64 one. `macos-14` used to be the
+          # arm64 label and no longer has a runner — the job was cancelled
+          # while queued, which a required check reads as a failure.
           - label: macos-arm64
-            runner: macos-14
+            runner: macos-15
           - label: windows-x64
             runner: windows-latest
           - label: windows-arm64

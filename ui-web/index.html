@@ -1,0 +1,22 @@
+<!doctype html>
+<!-- `lang` is corrected to the resolved locale by `applyDocumentLocale` on startup; `en`
+     is the fallback locale, so it is also the honest static default. -->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- The console is served by the instance on its own loopback listener. A page like this
+         one is worth locking down: it holds the admin token, and the instance refuses to be
+         talked into by another origin. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'"
+    />
+    <title>NexaPipe Console</title>
+  </head>
+
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

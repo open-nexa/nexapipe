@@ -92,6 +92,25 @@ ignore = [
     { id = "RUSTSEC-2026-0548", reason = "zip 4.x via tauri-plugin-updater; fixed only in zip >= 9.0.5, which no published plugin release allows yet" },
     { id = "RUSTSEC-2024-0429", reason = "glib 0.18.x via the desktop's GTK stack; fixed only in glib >= 0.20, which needs a tauri major bump" },
     { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.37.x via sqlx; fixed only in libsqlite3-sys >= 0.39.0, which sqlx-sqlite 0.9.0's range (<0.38.0) excludes" },
+    #
+    # RUSTSEC-2026-0574..0582: nine unsoundness advisories on `heapless
+    # 0.7.17` (`Deque`, `Spsc`, `IndexMap::truncate`,
+    # `SortedLinkedList::zeroize`, `FindMutView::pop`, …). All are fixed in
+    # heapless >= 0.9.4, but heapless reaches this graph through postcard
+    # 1.x, pulled in by iroh-relay and iroh-tickets, which pin the 0.7 line:
+    # the lockfile cannot move until iroh moves off postcard 1.x. None of
+    # the affected constructs are on a path this project uses. Remove these
+    # entries and bump the lockfile as soon as an iroh release allows
+    # heapless >= 0.9.4.
+    { id = "RUSTSEC-2026-0574", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0575", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0576", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0577", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0578", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0579", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0580", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0581", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0582", reason = "heapless 0.7.17 via postcard 1.x (iroh-relay/iroh-tickets); fixed only in heapless >= 0.9.4" },
 ]
 # An advisory on this list that no crate in the graph matches is worth
 # knowing about — it means the ignore can go. This file is used for two

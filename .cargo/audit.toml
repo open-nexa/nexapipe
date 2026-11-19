@@ -52,4 +52,21 @@ ignore = [
     # entry and bump the lockfile as soon as a sqlx release allows
     # libsqlite3-sys >= 0.39.
     "RUSTSEC-2026-0459",
+    # RUSTSEC-2026-0574..0582: nine unsoundness advisories on heapless
+    # 0.7.17, all fixed in heapless >= 0.9.4. heapless reaches the server's
+    # tree through postcard 1.x (iroh-relay / iroh-tickets), which pins the
+    # 0.7 line, so the lockfile cannot move to the patched release until
+    # iroh moves off postcard 1.x. cargo-audit reports these as
+    # informational, but the lists here and in deny.toml have to agree.
+    # Remove these entries and bump the lockfile as soon as an iroh release
+    # allows heapless >= 0.9.4.
+    "RUSTSEC-2026-0574",
+    "RUSTSEC-2026-0575",
+    "RUSTSEC-2026-0576",
+    "RUSTSEC-2026-0577",
+    "RUSTSEC-2026-0578",
+    "RUSTSEC-2026-0579",
+    "RUSTSEC-2026-0580",
+    "RUSTSEC-2026-0581",
+    "RUSTSEC-2026-0582",
 ]

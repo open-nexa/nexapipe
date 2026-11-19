@@ -46,4 +46,20 @@ ignore = [
     # cannot use because it pins `libsqlite3-sys >=0.30.1, <0.38.0`. It is
     # listed here so that this file and the one at the root stay in step.
     "RUSTSEC-2026-0459",
+    # RUSTSEC-2026-0574..0582: nine unsoundness advisories on heapless
+    # 0.7.17, all fixed in heapless >= 0.9.4. heapless reaches this tree
+    # through postcard 1.x (iroh-relay / iroh-tickets), which pins the 0.7
+    # line, so the lockfile cannot move to the patched release until iroh
+    # moves off postcard 1.x. Listed so this file and the one at the root
+    # stay in step. Remove these entries and bump the lockfile as soon as
+    # an iroh release allows heapless >= 0.9.4.
+    "RUSTSEC-2026-0574",
+    "RUSTSEC-2026-0575",
+    "RUSTSEC-2026-0576",
+    "RUSTSEC-2026-0577",
+    "RUSTSEC-2026-0578",
+    "RUSTSEC-2026-0579",
+    "RUSTSEC-2026-0580",
+    "RUSTSEC-2026-0581",
+    "RUSTSEC-2026-0582",
 ]
