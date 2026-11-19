@@ -23,7 +23,7 @@
 //! came from.
 
 use crate::auth::state::RuntimeState;
-use crate::config::ClientSecretWrite;
+use crate::config::{ClientSecretWrite, RouteSpec};
 
 use futures_util::future::BoxFuture;
 
@@ -442,6 +442,76 @@ impl FileStorage {
         })
     }
 
+    /// Writes one route.
+    ///
+    /// The route goes into the `[[routes]]` table as one more entry, and an
+    /// entry with the same host pattern and path pattern is replaced rather
+    /// than doubled: a route is named by those two, and the server's own
+    /// routing table names them the same way.
+    pub fn write_route(&self, route: &RouteSpec) -> anyhow::Result<()> {
+        let path = self.config_path.clone();
+        with_lock(&path, || {
+            let mut doc = read_document(&path, "route not written")?;
+
+            let routes = route_tables(doc.as_table_mut(), &path)?;
+
+            let index = routes
+                .iter()
+                .position(|table| route_is(table, &route.host_pattern, &route.path_pattern));
+            // The route that is replaced keeps its place: the order the
+            // routes are in is the order the operator wrote them in.
+            let position = index
+                .and_then(|index| routes.get(index))
+                .and_then(|table| table.position());
+
+            let mut table = route_table(route)?;
+            match index {
+                Some(index) => {
+                    if let Some(position) = position {
+                        table.set_position(Some(position));
+                    }
+                    routes.replace(index, table);
+                }
+                None => routes.push(table),
+            }
+
+            write_document(&path, doc)
+        })
+    }
+
+    /// Drops one route.
+    ///
+    /// `false` when there was no route with that name: the route is named by
+    /// its host pattern and its path pattern, and a file that does not hold it
+    /// is a file that says so rather than a failure.
+    pub fn remove_route(&self, host_pattern: &str, path_pattern: &str) -> anyhow::Result<bool> {
+        let path = self.config_path.clone();
+        with_lock(&path, || {
+            let mut doc = read_document(&path, "nothing removed")?;
+
+            // Looked for and not made: a revoke that invented an empty
+            // `[[routes]]` to delete from would leave the file changed while
+            // reporting that nothing was removed.
+            let Some(routes) = doc
+                .as_table_mut()
+                .get_mut("routes")
+                .and_then(|item| item.as_array_of_tables_mut())
+            else {
+                return Ok(false);
+            };
+            let Some(index) = routes
+                .iter()
+                .position(|table| route_is(table, host_pattern, path_pattern))
+            else {
+                return Ok(false);
+            };
+            routes.remove(index);
+
+            write_document(&path, doc)?;
+            Ok(true)
+        })
+    }
+
     /// Writes the endpoint's private key into `[iroh]`.
     pub fn write_endpoint_key(&self, key: &SecretString) -> anyhow::Result<()> {
         let path = self.config_path.clone();
@@ -675,6 +745,27 @@ impl Storage for FileStorage {
         let this = self.clone();
         let client_id = client_id.to_string();
         Box::pin(async move { blocking(move || this.remove_client(&client_id)).await })
+    }
+
+    fn write_route<'a>(&'a self, route: &'a RouteSpec) -> BoxFuture<'a, anyhow::Result<()>> {
+        let this = self.clone();
+        // Owned, because the work runs on a blocking thread and outlives the
+        // borrow.
+        let route = route.clone();
+        Box::pin(async move { blocking(move || this.write_route(&route)).await })
+    }
+
+    fn remove_route<'a>(
+        &'a self,
+        host_pattern: &'a str,
+        path_pattern: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        let this = self.clone();
+        let host_pattern = host_pattern.to_string();
+        let path_pattern = path_pattern.to_string();
+        Box::pin(
+            async move { blocking(move || this.remove_route(&host_pattern, &path_pattern)).await },
+        )
     }
 
     fn write_endpoint_key<'a>(
@@ -1023,6 +1114,69 @@ fn device_table<'a>(
             path.display()
         )
     })
+}
+
+/// The `[[routes]]` table of `doc`, created when the document has none.
+///
+/// Created rather than refused, because a configuration with no routes is a
+/// configuration that routes nothing, and a write that adds the first route is
+/// how it stops routing nothing.
+fn route_tables<'a>(
+    table: &'a mut toml_edit::Table,
+    path: &Path,
+) -> anyhow::Result<&'a mut toml_edit::ArrayOfTables> {
+    if !table.contains_key("routes") {
+        table.insert(
+            "routes",
+            toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+        );
+    }
+    table
+        .get_mut("routes")
+        .and_then(|item| item.as_array_of_tables_mut())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: routes is not a table of routes, the route was not written",
+                path.display()
+            )
+        })
+}
+
+/// Whether a table in the file is the route with this name.
+///
+/// A route is named by its host pattern and its path pattern, and the path is
+/// compared the way the schema reads it: a route written without a path and a
+/// route written with the path spelled out are the same route, and a store
+/// that thought otherwise would write a second one beside the first.
+fn route_is(table: &toml_edit::Table, host_pattern: &str, path_pattern: &str) -> bool {
+    let host = table.get("host_pattern").and_then(|item| item.as_str());
+    let path = table
+        .get("path_pattern")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    host == Some(host_pattern)
+        && crate::config::route_path_pattern(path)
+            == crate::config::route_path_pattern(path_pattern)
+}
+
+/// The table a route is written as.
+///
+/// The route is rendered by the schema and read back, so the file and the
+/// configuration cannot disagree about what a route looks like: this module
+/// does not name a single key of a route, and a key the schema grows is a key
+/// this picks up without being told.
+fn route_table(route: &RouteSpec) -> anyhow::Result<toml_edit::Table> {
+    let text =
+        toml::to_string(route).map_err(|e| anyhow::anyhow!("the route does not write: {e}"))?;
+    let document: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e| anyhow::anyhow!("the route does not parse: {e}"))?;
+
+    let mut table = toml_edit::Table::new();
+    for (key, item) in document.as_table().iter() {
+        table.insert(key, item.clone());
+    }
+    Ok(table)
 }
 
 /// The entry a device's credential is stored as: whichever of the two it is —

@@ -75,10 +75,9 @@
     "pathLabel": "Path pattern",
     "backendsLabel": "Backends",
     "modesLabel": "Modes",
-    "priorityLabel": "Priority",
     "added": "The route was added. A running instance picks it up on its next reload.",
     "removed": "The route was removed. A running instance stops serving it on its next reload.",
-    "confirmRemove": "Remove the route for {host}?"
+    "confirmRemove": "Remove the route for {host}{path}?"
   },
   "clients": {
     "title": "Clients",

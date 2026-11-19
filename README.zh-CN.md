@@ -1041,6 +1041,7 @@ Accepting at most 64 concurrent connections per peer, 4096 across the process, 1
 ```toml
 [admin]
 listen_addr = "127.0.0.1:9090"   # 不写 => 完全不绑定这个监听
+console_dir = "/app/console"     # 不写 => 不提供控制台；见下文
 
 [metrics]
 enabled = true                   # 在该监听上提供 /metrics；默认 false
@@ -1078,6 +1079,26 @@ nexapipe status --config config.toml --json   # 单个 JSON 文档，给脚本�
 `client revoke`，它们在服务端所用的同一把锁下编辑这个接口所读的那份配置。admin
 token 是一个没有作用域、也没有轮换机制的不透明值，不该被赋予写权限——一个只回答
 问题的接口，是没法被说服去改动任何东西的。
+
+#### 浏览器控制台
+
+`console_dir` 指向 `ui-web/` 构建出来的产物，这个监听随后在 `/` 上把它提供出来：
+
+```bash
+cd ui-web && npm ci && npm run build     # 产物落在 ui-web/dist
+```
+
+控制台显示这个实例正在做什么，并让你改动可以连接它的客户端，以及它提供的路由。
+它需要与 `nexapipe status` 相同的那把 admin token，而且它发出的每个请求都必须是
+**发给一个 loopback 主机的** —— 它管理的是这台机器上的实例，不是别的机器上的。
+
+控制台增删的路由走的是服务端读的那份存储 —— 配置旁边的数据库，或者配置文件本身 ——
+所以运行中的实例会在下次重载后生效，和手写一条路由被拾起的方式一样。它一次只写
+一条路由：一次重写整份配置的写入，会把其余每一条路由、以及它们旁边的每一行注释
+一起带走。
+
+不写 `console_dir` 时，这个监听既不提供页面也不提供 `/api/*`，和从前完全一样 ——
+没有东西要关掉，也没有东西要清理。
 
 `[metrics] enabled` 默认是关的，因为它所依附的监听没有认证：必须**同时**开启它
 并绑定地址，才会有东西暴露出来。只开 `enabled` 而没有 `[admin]` 段会记一条警告且

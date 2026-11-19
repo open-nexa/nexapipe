@@ -47,6 +47,7 @@ globalThis.fetch = async (path, init = {}) => {
 
 const { apiGet, apiWrite, WRITE_HEADER } = await import('../api/client');
 const { useTokenStore } = await import('./token');
+const { addRoute, removeRoute } = await import('./routes');
 
 /** A console with a token in it and nothing asked of the instance yet. */
 function consoleWithToken(token = 'a-token') {
@@ -114,4 +115,32 @@ test('forgetting the token sends nothing', () => {
 
   assert.equal(useTokenStore().hasToken(), false);
   assert.equal(stored.size, 0);
+});
+
+test('a route the console adds asks the instance for it', async () => {
+  consoleWithToken();
+  answer = { status: 200, body: '{"routes":[]}' };
+
+  await addRoute({
+    host_pattern: 'console.example',
+    path_pattern: '/api',
+    backends: ['http://127.0.0.1:9090'],
+  });
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].method, 'POST');
+  assert.equal(requests[0].path, '/api/routes');
+  assert.equal(requests[0].headers.get(WRITE_HEADER), '1');
+});
+
+test('a route the console removes is named by its host and its path', async () => {
+  consoleWithToken();
+  answer = { status: 200, body: '{"routes":[]}' };
+
+  await removeRoute('console.example', '/api');
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].method, 'DELETE');
+  assert.equal(requests[0].path, '/api/routes/console.example?path_pattern=%2Fapi');
+  assert.equal(requests[0].headers.get(WRITE_HEADER), '1');
 });

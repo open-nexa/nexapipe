@@ -44,7 +44,7 @@
 //! store that reads a configuration and writes it back writes the same one.
 
 use crate::auth::state::RuntimeState;
-use crate::config::{AuthClient, AuthDevice, ClientSecretWrite, Config};
+use crate::config::{AuthClient, AuthDevice, ClientSecretWrite, Config, RouteSpec};
 use crate::storage::{DeviceCredential, DeviceInfo, Stamp, Storage, StorageKind};
 
 use futures_util::future::BoxFuture;
@@ -286,6 +286,92 @@ impl SqliteStorage {
         Ok(())
     }
 
+    /// Writes one route, and moves the revision on.
+    ///
+    /// The routes are one row each, and a route is named by its host pattern
+    /// and its path pattern — so the row that has that name is replaced and
+    /// the others are left alone. A write of the whole configuration would
+    /// take a route somebody added while the server was running with it; this
+    /// does not.
+    async fn write_route(&self, route: &RouteSpec) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        // The settings row is the configuration without its routes. A store
+        // that holds none has no settings to write a route beside, and a route
+        // in a store with no configuration is a route nothing reads.
+        let settings: Option<String> = sqlx::query_scalar("SELECT json FROM settings WHERE id = 1")
+            .fetch_optional(&mut *tx)
+            .await?;
+        if settings.is_none() {
+            anyhow::bail!("the store holds no configuration; there is nothing to add a route to");
+        }
+
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT ordinal, json FROM routes ORDER BY ordinal")
+                .fetch_all(&mut *tx)
+                .await?;
+
+        let json = serde_json::to_string(route)?;
+        let existing = rows
+            .iter()
+            .find(|(_, json)| route_is(json, &route.host_pattern, &route.path_pattern));
+
+        match existing {
+            Some((ordinal, _)) => {
+                sqlx::query("UPDATE routes SET host_pattern = ?, json = ? WHERE ordinal = ?")
+                    .bind(&route.host_pattern)
+                    .bind(&json)
+                    .bind(*ordinal)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            None => {
+                // One past the last ordinal, so the order the routes are read
+                // in is the order they were written in.
+                let ordinal = rows.last().map(|(ordinal, _)| ordinal + 1).unwrap_or(0);
+                sqlx::query("INSERT INTO routes (ordinal, host_pattern, json) VALUES (?, ?, ?)")
+                    .bind(ordinal)
+                    .bind(&route.host_pattern)
+                    .bind(&json)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        Self::bump(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Drops one route, and says whether there was one to drop.
+    ///
+    /// The revision moves with the write, so the watcher reloads the
+    /// configuration the route was dropped from.
+    async fn remove_route(&self, host_pattern: &str, path_pattern: &str) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT ordinal, json FROM routes ORDER BY ordinal")
+                .fetch_all(&mut *tx)
+                .await?;
+        let existing = rows
+            .iter()
+            .find(|(_, json)| route_is(json, host_pattern, path_pattern));
+
+        let Some((ordinal, _)) = existing else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+
+        sqlx::query("DELETE FROM routes WHERE ordinal = ?")
+            .bind(*ordinal)
+            .execute(&mut *tx)
+            .await?;
+        Self::bump(&mut tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// The settings row, as the model holds it.
     async fn settings(&self) -> anyhow::Result<Option<Config>> {
         let row = sqlx::query("SELECT json FROM settings WHERE id = 1")
@@ -370,6 +456,20 @@ impl Rows {
 
         Ok(config)
     }
+}
+
+/// Whether a stored route is the route with this name.
+///
+/// The route is named by its host pattern and its path pattern, and the path
+/// is compared the way the schema reads it: a route written without a path
+/// and a route written with the path spelled out are the same route, and a
+/// store that thought otherwise would write a second one beside the first.
+fn route_is(json: &str, host_pattern: &str, path_pattern: &str) -> bool {
+    serde_json::from_str::<RouteSpec>(json).is_ok_and(|route| {
+        route.host_pattern == host_pattern
+            && crate::config::route_path_pattern(&route.path_pattern)
+                == crate::config::route_path_pattern(path_pattern)
+    })
 }
 
 /// The credential a device is issued, as the model holds one.
@@ -690,6 +790,19 @@ impl Storage for SqliteStorage {
             tx.commit().await?;
             Ok(())
         })
+    }
+
+    fn write_route<'a>(&'a self, route: &'a RouteSpec) -> BoxFuture<'a, anyhow::Result<()>> {
+        let route = route.clone();
+        Box::pin(async move { self.write_route(&route).await })
+    }
+
+    fn remove_route<'a>(
+        &'a self,
+        host_pattern: &'a str,
+        path_pattern: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        Box::pin(async move { self.remove_route(host_pattern, path_pattern).await })
     }
 
     fn write_endpoint_key<'a>(
