@@ -460,6 +460,7 @@ mod tests {
                 allow_ports: None,
                 allow_ports_strict: false,
                 pending_enrollment: None,
+                pending_enrollment_expires_at: None,
                 devices: HashMap::new(),
                 unnamed_device_allowed: true,
                 last_used: None,

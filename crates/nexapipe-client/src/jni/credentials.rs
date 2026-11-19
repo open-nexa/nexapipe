@@ -97,10 +97,13 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeGenerateDeviceKey(
 /// key:      the private half, as 64 hex characters — what
 ///           `nativeGenerateDeviceKey` handed out.
 ///
-/// A key is offered by the enrollment that spends the node's token, and signs
-/// every handshake after it. A node whose enrollment has not happened yet has
-/// a key but no device name, and the name is what the server answers with —
-/// so the key is an offer until then, not a credential.
+/// A key is the credential for the device it belongs to: `two_factor_auth`
+/// answers with it whenever the record holds no secret, under the fingerprint
+/// of its public half, and the private half never leaves this process. On a
+/// node still holding an enrollment token that token is spent first, so the
+/// key is offered as part of the enrollment and signs every handshake after
+/// it. No device name is needed on this side: both ends work the id out from
+/// the public half.
 ///
 /// Must be called before nativeStartProxy.
 #[unsafe(no_mangle)]
@@ -462,8 +465,11 @@ pub(crate) fn set_enrollment_for_node(
 /// would otherwise sign for a device the server only knows by secret, and every
 /// handshake would be refused while that secret was still valid.
 ///
-/// The name is not optional for a key: a key always names the device it was
-/// issued to, and the server refuses a key that names none.
+/// A key needs no name: it answers as the fingerprint of its own public half,
+/// which [`TwoFactorAuth::with_key`] works out from the private half handed to
+/// it here. A device id stored beside a key is a leftover from a credential
+/// that was filed under a name; it is not an identity this key can claim, so
+/// it is deliberately not sent on the wire.
 pub(crate) fn two_factor_auth(
     cfg: &NodeCredential,
     key: Option<&iroh::SecretKey>,
@@ -498,17 +504,17 @@ pub(crate) fn two_factor_auth(
     }
 
     // No secret at all, so the key is the credential — the TOTP path would
-    // find nothing to build from and the node would answer with nothing.
+    // find nothing to build from and the node would answer with nothing. The
+    // id it answers under is the fingerprint of this key, worked out inside
+    // `with_key`; a name the server may have filed beside it is not something
+    // this key can claim.
     if let Some(key) = key {
-        let Some(device) = device else {
-            // A key with no device name is one that has not enrolled yet: the
-            // name is what the server answers with, so before that there is
-            // nothing to present — and the enrollment is what is about to
-            // happen.
-            jni_log!("2FA: a device key is registered without a device name; it enrolls first");
-            return None;
-        };
-        return Some(TwoFactorAuth::with_key(client_id, key.clone(), device));
+        if device.is_some() {
+            jni_log!(
+                "2FA: a device id is stored beside a device key; answering as the key's fingerprint"
+            );
+        }
+        return Some(TwoFactorAuth::with_key(client_id, key.clone()));
     }
 
     None
@@ -555,9 +561,11 @@ pub(crate) fn node_device_key_for(node_id: &str) -> Option<iroh::SecretKey> {
 /// and — read as "has credentials" — never enrolls either. The node then
 /// connects with no credential at all against a server that is asking for one.
 ///
-/// A device key counts, but only once the node also names the device it was
-/// issued to: the name comes back from the enrollment, so before that the key
-/// is an offer rather than a credential, and the node still has to enroll.
+/// A device key counts once the node also names the device it was issued to.
+/// On a key enrollment the server answers with the fingerprint of that key,
+/// which Kotlin files as the device: it is the marker that the token has been
+/// spent, so a node that has no name beside its key is one that still has to
+/// enroll.
 pub(crate) fn node_has_two_factor(node_id: &str) -> bool {
     let Some(cfg) = node_two_factor_for(node_id) else {
         return false;
@@ -600,9 +608,11 @@ mod tests {
             Some("phone-1a2b3c4d".to_string()),
         );
 
+        let expected =
+            nexapipe_proto::auth::device_id_from_public_key(key.secret_key().public().as_bytes());
         let auth = two_factor_auth(&cfg, Some(key.secret_key())).expect("a key is a credential");
         assert_eq!(auth.client_id(), "client-001");
-        assert_eq!(auth.device_id(), Some("phone-1a2b3c4d"));
+        assert_eq!(auth.device_id(), Some(expected.as_str()));
         assert_eq!(
             auth.public_key_hex(),
             Some(public),
@@ -610,11 +620,13 @@ mod tests {
         );
     }
 
-    /// A key with no device name is one that has not enrolled yet: the name
-    /// is what the server answers with, so before that there is nothing to
-    /// present — and the enrollment is what is about to happen.
+    /// A key needs no name: the id it answers under is the fingerprint of its
+    /// own public half, worked out inside [`TwoFactorAuth::with_key`] from the
+    /// private half held here. A record that filed no device name is therefore
+    /// still a credential — what enrollment supplies is the server's record of
+    /// that key, not a name this side has to have been told first.
     #[test]
-    fn a_key_without_a_device_name_is_not_a_credential_yet() {
+    fn a_key_without_a_device_name_is_still_a_credential() {
         let key = DeviceKey::generate();
         let cfg: NodeCredential = (
             "client-001".to_string(),
@@ -623,9 +635,15 @@ mod tests {
             None,
         );
 
-        assert!(
-            two_factor_auth(&cfg, Some(key.secret_key())).is_none(),
-            "a key that names no device cannot answer a handshake"
+        let expected =
+            nexapipe_proto::auth::device_id_from_public_key(key.secret_key().public().as_bytes());
+        let auth = two_factor_auth(&cfg, Some(key.secret_key())).expect("a key is a credential");
+        assert_eq!(auth.client_id(), "client-001");
+        assert_eq!(auth.device_id(), Some(expected.as_str()));
+        assert_eq!(
+            auth.public_key_hex(),
+            Some(key.public_hex()),
+            "the credential proves itself with the key, not with a stored name"
         );
     }
 
@@ -712,7 +730,9 @@ mod tests {
     }
 
     /// A blank secret is not a secret, so the key is the credential again: the
-    /// precedence is "is there a secret", not "does the record have one".
+    /// precedence is "is there a secret", not "does the record have one". It
+    /// answers as the fingerprint of its key; a device name left beside it is
+    /// not an identity this key can claim.
     #[test]
     fn a_key_answers_when_the_secret_beside_it_is_blank() {
         let key = DeviceKey::generate();
@@ -724,8 +744,10 @@ mod tests {
             Some("phone-1a2b3c4d".to_string()),
         );
 
+        let expected =
+            nexapipe_proto::auth::device_id_from_public_key(key.secret_key().public().as_bytes());
         let auth = two_factor_auth(&cfg, Some(key.secret_key())).expect("a key is a credential");
-        assert_eq!(auth.device_id(), Some("phone-1a2b3c4d"));
+        assert_eq!(auth.device_id(), Some(expected.as_str()));
         assert_eq!(auth.public_key_hex(), Some(public));
     }
 }

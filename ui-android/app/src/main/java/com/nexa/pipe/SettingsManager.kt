@@ -2,7 +2,6 @@ package com.nexa.pipe
 
 import android.content.Context
 import android.content.SharedPreferences
-import android.os.Build
 import android.util.Log
 import androidx.core.content.edit
 import com.nexa.pipe.ui.NodeConfig
@@ -91,28 +90,17 @@ class SettingsManager internal constructor(
         // flag. It stays because the older versions look for it.
         const val KEY_2FA_MIGRATED = "two_factor_migrated"
 
-        /**
-         * The name this install answers as when it authenticates.
-         *
-         * It lives in [secretPrefs] rather than the backed-up file: it names
-         * *this* device, and a configuration restored onto another phone must
-         * not turn up claiming to be the one it was copied from. Sealed like
-         * the credentials beside it, because that file being ciphertext
-         * throughout is the property its exclusion from backups rests on —
-         * the name itself is not a secret.
-         */
-        const val KEY_DEVICE_ID = "device_id"
         // The private half of this device's own key: the Ed25519 key every
         // endpoint of this phone proves itself with when it has no key of its
         // own.
         //
-        // One key for the phone, as there is one name for it. The name is what
-        // the server files a credential under, and it does not change when the
-        // server does: a server that is rebuilt or copied keeps the row, while
-        // the endpoint id it answers to changes — and an endpoint id that
-        // changes must not change the key, or the device comes back to a
-        // server that holds its key under its name with a different one, and
-        // is refused as a takeover.
+        // One key for the phone, as there is one identity for it. The server
+        // files a credential under the fingerprint of that key, and it does
+        // not change when the server does: a server that is rebuilt or copied
+        // keeps the row, while the endpoint id it answers to changes — and an
+        // endpoint id that changes must not change the key, or the device
+        // comes back to a server that holds its key under that fingerprint
+        // with a different one, and is refused as a takeover.
         const val KEY_DEVICE_KEY = "device_key"
 
         // Language tag of the app UI, e.g. "zh-CN". Empty means "follow the
@@ -548,25 +536,6 @@ class SettingsManager internal constructor(
      */
     fun clearDeviceKey(nodeId: String) {
         secretPrefs.edit { remove(DEVICE_KEY_PREFIX + nodeId) }
-    }
-
-    /**
-     * The name this install answers as, generated on first call and then kept.
-     *
-     * A server can revoke one device of a client — or rate-limit it — only if
-     * that device answers with a name of its own, so every install gets one
-     * whether or not anything was asked of it.
-     *
-     * Kept rather than regenerated, because a name that changed between runs
-     * would leave the server holding a row for every device this phone has
-     * ever claimed to be.
-     */
-    fun deviceId(): String {
-        val saved = secrets.unseal(secretPrefs.getString(KEY_DEVICE_ID, "") ?: "")
-        if (saved.isNotBlank()) return saved
-        val generated = DeviceName.generate(Build.MODEL)
-        secretPrefs.edit { putString(KEY_DEVICE_ID, secrets.seal(generated)) }
-        return generated
     }
 
     /** Loads the endpoints, re-attaching each secret and token from [secretPrefs]. */

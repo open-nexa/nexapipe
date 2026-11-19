@@ -2071,6 +2071,7 @@ fn auth_config() -> AuthConfig {
             allow_ports: None,
             allow_ports_strict: false,
             pending_enrollment: None,
+            pending_enrollment_expires_at: None,
             devices: std::collections::HashMap::new(),
             unnamed_device_allowed: true,
             last_used: None,
@@ -2474,18 +2475,23 @@ fn previous_step_code(secret: &str) -> String {
 async fn a_device_key_gets_in() {
     let key = iroh::SecretKey::generate();
     let public_key = nexapipe::auth::public_key_hex(&key.public());
+    let device_id = nexapipe::auth::device_id_from_public_key(key.public().as_bytes());
 
     let mut config = auth_config();
     let client = config.clients.get_mut(CLIENT_ID).expect("the client");
     client.secret = SecretString::new(String::new());
     client.devices.insert(
-        "laptop".to_string(),
+        device_id.clone(),
         DeviceAuth {
             secret: SecretString::new(String::new()),
             public_key: Some(public_key),
             created_at: "0".to_string(),
             last_used: None,
             last_used_step: None,
+            label: None,
+            platform: None,
+            model: None,
+            app_version: None,
         },
     );
 
@@ -2494,8 +2500,8 @@ async fn a_device_key_gets_in() {
     let proxy = spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth).await;
     let tunnel = Tunnel::dial(proxy.addr).await;
 
-    let client = TwoFactorAuth::with_key(CLIENT_ID, key, "laptop");
-    let answer = handshake(&tunnel, &client, Some(String::new()), Some("laptop")).await;
+    let client = TwoFactorAuth::with_key(CLIENT_ID, key);
+    let answer = handshake(&tunnel, &client, Some(String::new()), Some(&device_id)).await;
 
     assert!(
         matches!(answer, AuthMessage::Ok),
@@ -2653,8 +2659,11 @@ async fn a_wrong_enrollment_token_is_counted_against_the_enrollment_only() {
         spawn_proxy_with_auth(vec![http_route("app.test", &backend.url)], auth.clone()).await;
     let tunnel = Tunnel::dial(proxy.addr).await;
 
-    // The guess: a token that is not the one that is outstanding.
+    // The guess: a token that is not the one that is outstanding. The key is
+    // what a device offers at a real enrollment, so the refusal is about the
+    // token rather than about a request that names no device.
     let outcome = Enrollment::new(CLIENT_ID, "0123456789abcde0")
+        .with_key(iroh::SecretKey::generate())
         .exchange(&tunnel.conn)
         .await;
     assert!(
@@ -2707,12 +2716,14 @@ async fn a_spent_token_takes_its_guesses_with_it() {
 
     let tunnel = Tunnel::dial(proxy.addr.clone()).await;
     let outcome = Enrollment::new(CLIENT_ID, "0123456789abcde0")
+        .with_key(iroh::SecretKey::generate())
         .exchange(&tunnel.conn)
         .await;
     assert!(outcome.is_err(), "the wrong token is refused");
 
     let tunnel = Tunnel::dial(proxy.addr).await;
     Enrollment::new(CLIENT_ID, "0123456789abcdef")
+        .with_key(iroh::SecretKey::generate())
         .exchange(&tunnel.conn)
         .await
         .expect("the right token enrolls");
@@ -2753,6 +2764,7 @@ async fn the_enrollment_token_has_a_ceiling_of_its_own() {
     for _ in 0..3 {
         let tunnel = Tunnel::dial(proxy.addr.clone()).await;
         let outcome = Enrollment::new(CLIENT_ID, "0123456789abcde0")
+            .with_key(iroh::SecretKey::generate())
             .exchange(&tunnel.conn)
             .await;
         assert!(outcome.is_err(), "a wrong token is refused");
@@ -2761,6 +2773,7 @@ async fn the_enrollment_token_has_a_ceiling_of_its_own() {
     // The right token does not get in either: the slot is closed.
     let tunnel = Tunnel::dial(proxy.addr.clone()).await;
     let outcome = Enrollment::new(CLIENT_ID, "0123456789abcdef")
+        .with_key(iroh::SecretKey::generate())
         .exchange(&tunnel.conn)
         .await;
     assert!(

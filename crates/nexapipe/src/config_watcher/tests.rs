@@ -177,6 +177,7 @@ fn client(secret: &str) -> ClientAuth {
         allow_ports: None,
         allow_ports_strict: false,
         pending_enrollment: None,
+        pending_enrollment_expires_at: None,
         devices: HashMap::new(),
         unnamed_device_allowed: true,
         last_used: None,
@@ -195,6 +196,10 @@ fn device(secret: &str) -> DeviceAuth {
         created_at: "0".to_string(),
         last_used: None,
         last_used_step: None,
+        label: None,
+        platform: None,
+        model: None,
+        app_version: None,
     }
 }
 
@@ -1162,6 +1167,10 @@ fn a_device_stamp_is_written_back_without_touching_its_secret() {
             created_at: "0".to_string(),
             last_used: Some(1700000000),
             last_used_step: None,
+            label: None,
+            platform: None,
+            model: None,
+            app_version: None,
         },
     )]
     .into_iter()

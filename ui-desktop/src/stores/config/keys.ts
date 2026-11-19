@@ -2,13 +2,13 @@
  * The two keys, and which of them a rule is about.
  *
  * A key belongs to the *machine*, not to the node: the server files a
- * credential under a device name, and that name is the machine's, so every
- * node of a machine that has a key answers with it — including the nodes that
- * never enrolled with one.
+ * credential under the fingerprint of its public key, and that fingerprint is
+ * the machine's, so every node of a machine that has a key answers with it —
+ * including the nodes that never enrolled with one.
  *
  * So `deviceKey` on a node is the key the node *answers with*, and the public
  * half of it (`publicKey`) is the key the node *has of its own*: the one it
- * enrolled with, the one the server holds under this machine's name. A node
+ * enrolled with, the one the server holds under that fingerprint. A node
  * without one of its own carries the machine's key all the same.
  *
  * The distinction matters wherever a rule asks "does this node have a key?".

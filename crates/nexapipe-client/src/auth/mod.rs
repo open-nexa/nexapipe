@@ -19,7 +19,7 @@ mod two_factor;
 #[cfg(test)]
 mod tests;
 
-pub use device::{DeviceKey, device_id_is_usable};
+pub use device::{DeviceInfo, DeviceKey, device_id_is_usable};
 pub use enrollment::{Enrollment, IssuedCredential};
 pub use totp::{TotpAlgorithm, TwoFactorConfig, generate_secret};
 pub use two_factor::TwoFactorAuth;

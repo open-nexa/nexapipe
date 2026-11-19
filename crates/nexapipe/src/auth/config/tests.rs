@@ -10,6 +10,7 @@ fn client() -> ClientAuth {
         allow_ports: None,
         allow_ports_strict: false,
         pending_enrollment: None,
+        pending_enrollment_expires_at: None,
         devices: HashMap::new(),
         unnamed_device_allowed: true,
         last_used: None,
@@ -28,6 +29,10 @@ fn device(secret: &str) -> DeviceAuth {
         created_at: "0".to_string(),
         last_used: None,
         last_used_step: None,
+        label: None,
+        platform: None,
+        model: None,
+        app_version: None,
     }
 }
 
@@ -384,6 +389,7 @@ fn the_memory_is_the_credential_s_own() {
             allow_ports: None,
             allow_ports_strict: false,
             pending_enrollment: None,
+            pending_enrollment_expires_at: None,
             devices: HashMap::from([(
                 "laptop".to_string(),
                 DeviceAuth {
@@ -394,6 +400,10 @@ fn the_memory_is_the_credential_s_own() {
                     created_at: "0".to_string(),
                     last_used: None,
                     last_used_step: None,
+                    label: None,
+                    platform: None,
+                    model: None,
+                    app_version: None,
                 },
             )]),
             unnamed_device_allowed: true,

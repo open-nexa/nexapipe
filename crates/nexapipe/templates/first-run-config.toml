@@ -9,12 +9,14 @@
 #
 #   * [auth] is on. Every client connection has to complete a 2FA handshake,
 #     and with no [auth.clients] entry below, that means nothing can connect
-#     yet. Enroll the first client with:
+#     yet. Create the first client and invite its first device with:
 #
-#       nexapipe --generate-invite client-001 --create-client
+#       nexapipe device invite --client client-001 --create-client
 #
-#     (add `--registration` to hand out a one-time link instead of printing the
-#     secret, and `--qr-out invite.svg` to save the code as an image).
+#     That prints a one-time link that expires after 15 minutes (`--ttl` accepts
+#     1s..30d); add `--qr-out invite.svg` to save the code as an image. To share
+#     the endpoint without enrolling a device, use `--generate-invite` instead
+#     (optionally with `--create-client`).
 #
 #   * The plaintext listener ([server] listen_addr) is closed. It is the one
 #     entry point 2FA does not cover — the handshake runs on the iroh listener —

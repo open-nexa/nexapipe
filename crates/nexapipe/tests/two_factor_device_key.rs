@@ -51,6 +51,7 @@ fn auth_config_with_key_device() -> (AuthConfig, iroh::SecretKey) {
             allow_ports: None,
             allow_ports_strict: false,
             pending_enrollment: None,
+            pending_enrollment_expires_at: None,
             devices: HashMap::from([(
                 "phone".to_string(),
                 DeviceAuth {
@@ -59,6 +60,10 @@ fn auth_config_with_key_device() -> (AuthConfig, iroh::SecretKey) {
                     created_at: "0".to_string(),
                     last_used: None,
                     last_used_step: None,
+                    label: None,
+                    platform: None,
+                    model: None,
+                    app_version: None,
                 },
             )]),
             unnamed_device_allowed: true,
@@ -95,7 +100,7 @@ fn count(config: &mut AuthConfig, outcome: &Result<Verified, AuthError>) {
 #[test]
 fn a_key_device_proves_itself_with_a_signature() {
     let (config, key) = auth_config_with_key_device();
-    let client = TwoFactorAuth::with_key("client-001", key, "phone");
+    let client = TwoFactorAuth::with_key("client-001", key);
 
     let nonce = fresh_nonce();
     let timestamp = now();
@@ -133,8 +138,8 @@ fn a_key_device_proves_itself_with_a_signature() {
 #[test]
 fn a_wrong_signature_is_refused_and_not_counted() {
     let (mut config, key) = auth_config_with_key_device();
-    let genuine = TwoFactorAuth::with_key("client-001", key, "phone");
-    let impostor = TwoFactorAuth::with_key("client-001", iroh::SecretKey::generate(), "phone");
+    let genuine = TwoFactorAuth::with_key("client-001", key);
+    let impostor = TwoFactorAuth::with_key("client-001", iroh::SecretKey::generate());
 
     for _ in 0..3 {
         let nonce = fresh_nonce();
@@ -186,7 +191,7 @@ fn a_wrong_signature_is_refused_and_not_counted() {
 #[test]
 fn a_stale_timestamp_is_refused_without_counting() {
     let (mut config, key) = auth_config_with_key_device();
-    let client = TwoFactorAuth::with_key("client-001", key, "phone");
+    let client = TwoFactorAuth::with_key("client-001", key);
 
     for _ in 0..10 {
         let nonce = fresh_nonce();
@@ -279,6 +284,10 @@ fn a_device_config_the_server_cannot_use_is_a_refusal() {
                 created_at: "0".to_string(),
                 last_used: None,
                 last_used_step: None,
+                label: None,
+                platform: None,
+                model: None,
+                app_version: None,
             },
         );
         client.devices.insert(
@@ -289,6 +298,10 @@ fn a_device_config_the_server_cannot_use_is_a_refusal() {
                 created_at: "0".to_string(),
                 last_used: None,
                 last_used_step: None,
+                label: None,
+                platform: None,
+                model: None,
+                app_version: None,
             },
         );
     }

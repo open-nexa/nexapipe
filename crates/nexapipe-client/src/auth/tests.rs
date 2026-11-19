@@ -312,6 +312,10 @@ fn enrollment_messages_keep_their_wire_names() {
         token: SecretString::new("tok".to_string()),
         device_id: None,
         public_key: None,
+        label: None,
+        platform: None,
+        model: None,
+        app_version: None,
     };
     let json = String::from_utf8(start.to_bytes().unwrap().to_vec()).unwrap();
     assert!(json.contains(r#""type":"ENROLL_START""#), "{json}");
@@ -403,17 +407,18 @@ fn a_refused_enrollment_without_a_device_names_the_client() {
     assert!(!message.contains("client revoke"), "{message}");
 }
 
-/// An enrollment that offers a key names the device it offered it under: that
-/// is the name the server files the key under, and the one it refuses to take
-/// over.
+/// An enrollment that offers a key is filed under that key's fingerprint: the
+/// server works the same id out from the public half, and a claimed name that
+/// disagrees with it is refused.
 #[test]
 fn an_enrollment_that_offers_a_key_carries_the_device_name() {
     let key = iroh::SecretKey::generate();
+    let device_id = super::device::device_id_of_key(&key);
     let enrollment = Enrollment::new("xm17", "tok")
-        .with_device("phone-1a2b3c4d")
-        .with_key(key.clone());
+        .with_device(&device_id)
+        .with_key(key);
 
-    assert_eq!(enrollment.device_id(), Some("phone-1a2b3c4d"));
+    assert_eq!(enrollment.device_id(), Some(device_id.as_str()));
     assert_eq!(enrollment.client_id(), "xm17");
 }
 
@@ -425,9 +430,7 @@ fn an_enrollment_can_offer_a_key_beside_its_device_name() {
     let key = iroh::SecretKey::generate();
     let public_key = hex::encode(key.public().as_bytes());
 
-    let enrollment = Enrollment::new("client-001", "tok")
-        .with_device("phone-1a2b3c4d")
-        .with_key(key.clone());
+    let enrollment = Enrollment::new("client-001", "tok").with_key(key.clone());
     assert!(
         enrollment.key.is_some(),
         "the offered key is kept to sign with"
@@ -442,6 +445,10 @@ fn an_enrollment_can_offer_a_key_beside_its_device_name() {
             .key
             .as_ref()
             .map(|key| hex::encode(key.public().as_bytes())),
+        label: None,
+        platform: None,
+        model: None,
+        app_version: None,
     };
     let json = String::from_utf8(start.to_bytes().unwrap().to_vec()).unwrap();
     assert!(
@@ -461,7 +468,8 @@ fn an_enrollment_can_offer_a_key_beside_its_device_name() {
 fn a_key_credential_responds_with_a_signature_and_no_code() {
     let key = iroh::SecretKey::generate();
     let public_key = hex::encode(key.public().as_bytes());
-    let auth = TwoFactorAuth::with_key("client-001", key, "phone-1a2b3c4d");
+    let device_id = super::device::device_id_of_key(&key);
+    let auth = TwoFactorAuth::with_key("client-001", key);
 
     let (totp_code, signature) = auth.prove(&test_nonce(0x0a), 1_700_000_000).unwrap();
     assert_eq!(totp_code, "", "a key device sends no code");
@@ -470,7 +478,7 @@ fn a_key_credential_responds_with_a_signature_and_no_code() {
     assert_eq!(auth.public_key_hex(), Some(public_key));
     assert_eq!(auth.secret_base32(), "", "a key credential has no secret");
     assert_eq!(auth.algorithm_name(), "", "and no algorithm to name");
-    assert_eq!(auth.device_id(), Some("phone-1a2b3c4d"));
+    assert_eq!(auth.device_id(), Some(device_id.as_str()));
     assert!(
         auth.generate_code().is_err(),
         "there is no code to generate"
@@ -485,7 +493,7 @@ fn a_key_credential_responds_with_a_signature_and_no_code() {
 fn a_key_credential_signs_the_nonce_then_the_little_endian_timestamp() {
     let key = iroh::SecretKey::generate();
     let public = key.public();
-    let auth = TwoFactorAuth::with_key("client-001", key, "phone-1a2b3c4d");
+    let auth = TwoFactorAuth::with_key("client-001", key);
 
     let nonce = test_nonce(0x01);
     let signature = auth.sign_challenge(&nonce, 0x0102030405060708).unwrap();

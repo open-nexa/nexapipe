@@ -2,16 +2,27 @@
 
 use crate::{Cli, QrFormat};
 
-/// Prints (and, with `--qr-out`, writes) a QR code of `link` in whatever format
+/// Prints (and, with `--out`, writes) a QR code of `text` in whatever format
 /// was asked for.
-pub(super) fn render_qr(link: &str, cli: &Cli, header: &str) -> anyhow::Result<()> {
+///
+/// `header` is the line above the code, when the code is one part of a longer
+/// report; `file_title` is the comment a text file carries, because a file
+/// found later has nothing else to say what it is.
+pub(super) fn render_qr(
+    text: &str,
+    cli: &Cli,
+    header: Option<&str>,
+    file_title: &str,
+) -> anyhow::Result<()> {
     if cli.qr_format != QrFormat::None {
-        println!("{header}");
+        if let Some(header) = header {
+            println!("{header}");
+        }
         let qr = match cli.qr_format {
-            QrFormat::Unicode => nexapipe::qr::render_unicode(link, cli.qr_invert)?,
-            QrFormat::Plain => nexapipe::qr::render_plain(link, cli.qr_invert)?,
-            QrFormat::Ascii => nexapipe::qr::render_ascii(link, cli.qr_invert)?,
-            QrFormat::Svg => nexapipe::qr::render_svg(link, cli.qr_invert)?,
+            QrFormat::Unicode => nexapipe::qr::render_unicode(text, cli.qr_invert)?,
+            QrFormat::Plain => nexapipe::qr::render_plain(text, cli.qr_invert)?,
+            QrFormat::Ascii => nexapipe::qr::render_ascii(text, cli.qr_invert)?,
+            QrFormat::Svg => nexapipe::qr::render_svg(text, cli.qr_invert)?,
             QrFormat::None => unreachable!("filtered above"),
         };
         print!("{qr}");
@@ -19,33 +30,42 @@ pub(super) fn render_qr(link: &str, cli: &Cli, header: &str) -> anyhow::Result<(
     }
 
     if let Some(path) = &cli.qr_out {
-        write_qr_file(path, link, cli.qr_invert)?;
+        write_qr_file(path, text, cli.qr_invert, file_title)?;
     }
     Ok(())
 }
 
+/// A QR code of the text given, and nothing else: `nexapipe qr <TEXT>`.
+pub(crate) fn print_qr(text: &str, cli: &Cli) -> anyhow::Result<()> {
+    let text = text.trim();
+    if text.is_empty() {
+        anyhow::bail!("there is no text to draw: pass the text the code should carry");
+    }
+    render_qr(text, cli, None, "NexaPipe QR code")
+}
+
 /// Writes the QR code to `path`. The extension picks the format: `.svg` is a
-/// standalone document, anything else is ASCII text with the URI on top.
+/// standalone document, anything else is ASCII text with the text on top.
 ///
-/// The file carries the TOTP secret in the clear, so it is written private: a
-/// QR code left at the default mode is a credential anybody with access to the
-/// machine can read back.
-fn write_qr_file(path: &str, link: &str, invert: bool) -> anyhow::Result<()> {
+/// The file carries a credential whenever the code does — a TOTP secret, an
+/// enrollment token — so it is written private: a QR code left at the default
+/// mode is a credential anybody with access to the machine can read back.
+fn write_qr_file(path: &str, text: &str, invert: bool, title: &str) -> anyhow::Result<()> {
     use std::io::Write;
 
     let is_svg = path.to_ascii_lowercase().ends_with(".svg");
     let content = if is_svg {
-        nexapipe::qr::render_svg(link, invert)?
+        nexapipe::qr::render_svg(text, invert)?
     } else {
         format!(
-            "# NexaPipe 2FA enrollment\n# {link}\n{}",
-            nexapipe::qr::render_ascii(link, invert)?
+            "# {title}\n# {text}\n{}",
+            nexapipe::qr::render_ascii(text, invert)?
         )
     };
 
     // Opened with the mode in the same call that creates it, rather than
     // written and then made private. `fs::write` truncates whatever is already
-    // at the path and follows a symlink to reach it, so a `--qr-out` naming a
+    // at the path and follows a symlink to reach it, so a `--out` naming a
     // file another account got there first could aim the write at something the
     // operator owns; and between the create and the chmod the file is readable
     // by anyone watching. `create_new` refuses to open a path that already

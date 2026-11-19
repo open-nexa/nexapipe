@@ -410,6 +410,7 @@ pub(super) async fn clients_json(state: &Arc<AdminState>) -> serde_json::Value {
                 "enrollment_failed_attempts": client.enrollment_failed_attempts,
                 "enrollment_locked_until": client.enrollment_locked_until,
                 "enrollment_pending": client.pending_enrollment.is_some(),
+                "enrollment_expires_at": client.pending_enrollment_expires_at,
             })
         })
         .collect();

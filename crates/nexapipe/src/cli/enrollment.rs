@@ -107,7 +107,8 @@ pub(crate) async fn print_2fa_enrollment(cli: &Cli, storage: &dyn Storage) -> an
     render_qr(
         &link,
         cli,
-        "Scan this with the NexaPipe app (2FA settings -> scan QR code):",
+        Some("Scan this with the NexaPipe app (2FA settings -> scan QR code):"),
+        "NexaPipe 2FA enrollment",
     )?;
 
     if generated {

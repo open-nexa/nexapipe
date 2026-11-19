@@ -98,46 +98,51 @@ pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDiscoveryMode(
     })
 }
 
-/// Names this device, once, for every **enrollment** it spends.
+/// Reports what this install calls itself, once, for every **enrollment** it
+/// spends.
 ///
-/// deviceId: printable ASCII without spaces, as `SettingsManager.deviceId()`
-/// generates it.
-///
-/// An enrollment is where a name is asked for: what comes back is filed under
-/// it on the server, and `nativeTakeIssuedCredential` hands the name back so
-/// Kotlin can keep it beside the secret and send it from then on. Credentials
-/// acquired any other way are answered unnamed, because a name the server's
-/// table does not carry is refused rather than falling back — see
-/// `two_factor_auth` — and the pairs an install already holds were issued to
-/// the client, not to a device.
+/// The four strings are labels for the operator — the model, the platform, the
+/// OS version and the app version — and not an identity. The device is known
+/// by the fingerprint of its key, worked out from the public half on both
+/// sides, so none of these is sent as a name to be filed under. Kotlin passes
+/// them from `Build` and the package manager; an older app that sends none is
+/// simply described by no labels.
 ///
 /// Must be called before nativeStartProxy. Its own entry point rather than one
-/// more argument on the 2FA calls, which already have enough of them and which
-/// every credential would then have to answer for itself.
+/// more argument on the calls that already have enough of them.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDeviceId(
+pub extern "system" fn Java_com_nexa_pipe_IrohProxy_nativeSetDeviceInfo(
     mut unowned_env: EnvUnowned,
     _class: JClass,
-    device_id: JString,
+    label: JString,
+    platform: JString,
+    model: JString,
+    app_version: JString,
 ) -> jint {
     with_env_or(&mut unowned_env, -1, |env| {
         if env.exception_check() {
-            jni_log!("JNI exception pending before nativeSetDeviceId");
+            jni_log!("JNI exception pending before nativeSetDeviceInfo");
             env.exception_clear();
             return -1;
         }
-        let name = read_jstring(env, &device_id).unwrap_or_default();
-        jni_log!("[DEBUG:jni] nativeSetDeviceId: {} chars", name.trim().len());
-        // A poisoned lock is a failure, not a silent skip. Skipping it left the
-        // name unset while this returned 0, so Kotlin believed the device had
-        // been named and went on connecting unnamed — which on a server that
-        // refuses unnamed peers is a connection that keeps failing for a reason
-        // nothing on either side reported.
-        let Ok(mut slot) = DEVICE_ID.lock() else {
-            jni_log!("[DEBUG:jni] nativeSetDeviceId: the device id lock is poisoned");
+        let label = read_jstring(env, &label).unwrap_or_default();
+        let platform = read_jstring(env, &platform).unwrap_or_default();
+        let model = read_jstring(env, &model).unwrap_or_default();
+        let app_version = read_jstring(env, &app_version).unwrap_or_default();
+        let info = DeviceInfo::new(
+            Some(label.trim()).filter(|value| !value.is_empty()),
+            Some(platform.trim()).filter(|value| !value.is_empty()),
+            Some(model.trim()).filter(|value| !value.is_empty()),
+            Some(app_version.trim()).filter(|value| !value.is_empty()),
+        );
+        // A poisoned lock is a failure, not a silent skip: sending no labels
+        // after reporting success would describe a device as something it is
+        // not, with nothing on either side to say why.
+        let Ok(mut slot) = DEVICE_INFO.lock() else {
+            jni_log!("[DEBUG:jni] nativeSetDeviceInfo: the device info lock is poisoned");
             return -1;
         };
-        *slot = Some(name);
+        *slot = Some(info);
         0
     })
 }

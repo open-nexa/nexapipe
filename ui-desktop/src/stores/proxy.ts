@@ -612,9 +612,13 @@ async function start(): Promise<void> {
       // A registration invite's token, spent on the first connection of this run.
       enrollment_client_id: node.enrollment?.clientId ?? null,
       enrollment_token: node.enrollment?.token ?? null,
-      // The name to be enrolled under: without it the server issues the client's own
-      // secret, and this machine is one device it cannot revoke on its own.
-      enrollment_device: node.enrollment?.device ?? null,
+      // What this device says about itself. Labels only: the id the server
+      // files it under is the fingerprint of its key, worked out there from the
+      // public half the enrollment offers.
+      enrollment_label: node.enrollment?.deviceInfo?.label ?? null,
+      enrollment_platform: node.enrollment?.deviceInfo?.platform ?? null,
+      enrollment_model: node.enrollment?.deviceInfo?.model ?? null,
+      enrollment_app_version: node.enrollment?.deviceInfo?.appVersion ?? null,
     }));
 
   const wantTun = config.useTun;
