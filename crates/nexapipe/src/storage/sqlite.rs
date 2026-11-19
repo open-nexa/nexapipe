@@ -524,14 +524,14 @@ impl Storage for SqliteStorage {
             let Some(mut client) = self.client(client_id).await? else {
                 anyhow::bail!(
                     "client {client_id:?} has no [auth.clients.{client_id}] secret in {}; \
-                     run --generate-2fa {client_id} first",
+                     run `nexapipe client enroll {client_id}` first",
                     self.path.display()
                 );
             };
             if client.secret.expose_secret().is_empty() {
                 anyhow::bail!(
                     "client {client_id:?} has no [auth.clients.{client_id}] secret in {}; \
-                     run --generate-2fa {client_id} first",
+                     run `nexapipe client enroll {client_id}` first",
                     self.path.display()
                 );
             }
@@ -604,14 +604,14 @@ impl Storage for SqliteStorage {
             let Some(mut client) = self.client(client_id).await? else {
                 anyhow::bail!(
                     "client {client_id:?} has no [auth.clients.{client_id}] secret in {}; \
-                     run --generate-2fa {client_id} first",
+                     run `nexapipe client enroll {client_id}` first",
                     self.path.display()
                 );
             };
             if client.secret.expose_secret().is_empty() {
                 anyhow::bail!(
                     "client {client_id:?} has no [auth.clients.{client_id}] secret in {}; \
-                     run --generate-2fa {client_id} first",
+                     run `nexapipe client enroll {client_id}` first",
                     self.path.display()
                 );
             }

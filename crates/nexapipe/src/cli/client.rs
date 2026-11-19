@@ -243,9 +243,7 @@ pub(crate) async fn list_clients(storage: &dyn Storage, json: bool) -> anyhow::R
     }
 
     println!();
-    println!(
-        "No secret is printed here: `nexapipe --show-2fa <CLIENT_ID>` draws the code for one."
-    );
+    println!("No secret is printed here: `nexapipe client qr <CLIENT_ID>` draws the code for one.");
     Ok(())
 }
 
@@ -425,7 +423,8 @@ pub(crate) async fn add_client(
     render_qr(
         &link,
         cli,
-        "Scan this with the NexaPipe app (2FA settings -> scan QR code):",
+        Some("Scan this with the NexaPipe app (2FA settings -> scan QR code):"),
+        "NexaPipe 2FA enrollment",
     )?;
     println!();
 

@@ -1,19 +1,18 @@
-//! The credential half of the command line.
+//! The command line: the groups an operator asks for, and the credentials
+//! behind them.
 //!
-//! Three things live here: the 2FA enrollment (`--generate-2fa`,
-//! `--show-2fa`), the invite (`--generate-invite`), and the `client`
-//! subcommand (`list`, `add`, `revoke`). All three read and write the same
-//! config file the server reads, and all three take the same lock the server
-//! takes — a `revoke` has to work while a server is running.
+//! The commands live in [`commands`], which folds every spelling — the
+//! command, or the flag it replaced — into the flat fields the implementations
+//! read. What lives here is the work: the 2FA enrollment (`client enroll`,
+//! `client qr`), the endpoint invite (`invite`), the device invitation
+//! (`device invite`), the `client` subcommand, the QR code four of them draw,
+//! and the configuration all of them work on.
 //!
-//! They were in `main.rs`, next to the server's own startup, and they are a
-//! separate thing: they never start a proxy, they never load the routing
-//! table, and they have their own failure to report.
+//! They never start a proxy, they never load the routing table, and they have
+//! their own failure to report.
 
-// The module is three commands and five pieces: the 2FA enrollment, the
-// `client` subcommand, the endpoint invite, the QR code two of them print,
-// and the config file all of them work on.
 mod client;
+mod commands;
 mod config;
 mod device;
 mod enrollment;
@@ -24,6 +23,9 @@ mod qr;
 mod tests;
 
 pub(crate) use client::{add_client, list_clients, revoke_client};
+pub(crate) use commands::{Clients, Commands, Request, fold};
+pub(crate) use config::{print_config, print_config_path};
 pub(crate) use device::invite_device;
 pub(crate) use enrollment::print_2fa_enrollment;
 pub(crate) use invite::print_endpoint_invite;
+pub(crate) use qr::print_qr;

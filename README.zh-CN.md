@@ -132,7 +132,7 @@ nexapipe                                # 默认读取 ./config.toml
 的客户端则从 `config.toml.2fa.example` 开始。
 
 这份示例是 2FA 开启且没有 enrolled 客户端的，所以在第一个客户端存在之前谁都连不上 ——
-用 `nexapipe --generate-invite client-001 --create-client` 注册它。运行时的默认值仍然是
+用 `nexapipe invite client-001 --create-client` 注册它。运行时的默认值仍然是
 2FA **关闭**：没有 `[auth]` 段的配置保持关闭，所以升级中的部署不会突然被要求一个它的
 客户端从未拿到过的凭证。示例文件才是全新安装的默认值所在之处。
 
@@ -148,7 +148,7 @@ nexapipe                                # 生成 ./config.toml 并启动
 客户端这样创建：
 
 ```bash
-nexapipe --generate-invite client-001 --create-client --config config.toml
+nexapipe invite client-001 --create-client --config config.toml
 ```
 
 已存在的配置永远不会被重新生成；已存在但解析失败的文件仍然会导致启动失败，而不是被替换掉。
@@ -186,7 +186,7 @@ secret_key = "8f2a…"
 
 - **写坏了的 `secret_key` 会拒绝启动。** 以前只是一条告警加一把临时身份，结果是每次
   重启 Node ID 都变，而日志看上去像是已经处理过了。删掉这一行让它重新生成，或者粘贴
-  `--generate-secret` 的输出。
+  `nexapipe secret` 的输出。
 - **写不进去的配置文件仍然会启动**，只是用一把临时身份并给出告警 —— 只读挂载、或者文件
   属于另一个用户，都是很常见的部署方式，在那里拒绝启动比"每次重启都是新 Node ID"更糟。
   这时 Node ID 每次重启都会变。想主动要这个行为、并让服务端完全不碰你的文件，请设置
@@ -196,7 +196,7 @@ Ticket 是另一回事：它固化的是打印时的那组地址，`secret_key` 
 必须重新生成。想手工生成一把密钥（例如把身份搬到另一台机器）才需要：
 
 ```bash
-cargo run -p nexapipe -- --generate-secret
+cargo run -p nexapipe -- secret
 ```
 
 **密钥也可以完全不放在 config.toml 里。** 把 `[iroh] secret_key_file` 指向一个只装
@@ -217,13 +217,13 @@ docker compose up -d --build
 # 示例出厂即开启 2FA，所以在 enrolled 一个客户端之前没有任何连接能进来。
 # 这一条会打印可扫描的邀请链接。
 docker compose exec nexapipe /usr/local/bin/nexapipe \
-    --config /app/config/config.toml --generate-invite client-001 --create-client
+    --config /app/config/config.toml invite client-001 --create-client
 docker compose exec nexapipe tail -f /app/logs/nexapipe.log
 ```
 
 示例出厂即开启 2FA 且没有任何已 enrolled 的客户端，因此服务端会启动，然后拒绝所有
-连接，直到有一个客户端被 enrolled —— 上面的 `--generate-invite client-001
---create-client` 就是 enrolled 第一个客户端的命令。它会把客户端写进配置文件，并
+连接，直到有一个客户端被 enrolled —— 上面的 `invite client-001 --create-client`
+就是 enrolled 第一个客户端的命令。它会把客户端写进配置文件，并
 在链接里打印一个一次性的 enrollment token；第一个扫描它的设备用该 token 换取一个
 只属于自己的 secret，而链接从那一刻起就不再是凭据。
 
@@ -302,7 +302,7 @@ gh attestation verify oci://ghcr.io/open-nexa/nexapipe@sha256:<digest> \
 ```bash
 # 用镜像自带的二进制，操作服务端真正在读的那份文件
 docker compose exec nexapipe /usr/local/bin/nexapipe \
-    --config /app/config/config.toml --generate-invite client-001 --registration
+    --config /app/config/config.toml device invite --client client-001 --create-client
 ```
 
 在宿主机上直接对这个挂载文件执行同样的命令，问题出在这几处：
@@ -320,7 +320,7 @@ docker compose exec nexapipe /usr/local/bin/nexapipe \
   2FA 计数曾经也在这个名单里——每次 2FA 尝试，服务端都要重写整个文件来落盘
   `failed_attempts` / `locked_until` / `last_used`。它们现在住在服务端自己的
   状态文件（配置旁边的 `config.state.toml`）里，这场竞争也跟着一起没了。
-- **宿主机的二进制不是服务端的二进制。** `--generate-invite` 的端点由
+- **宿主机的二进制不是服务端的二进制。** `invite` 的端点由
   `[iroh] secret_key` 推导，所以 `nexapipe` 若和正在跑的那个不是同一个提交编出来的，
   生成的邀请码会指向一个没人在跑的端点。（"宿主机那份配置缺这个键"曾经也是触发方式之一；
   现在服务端首次启动就会写一个进去，所以这个键总是有的。）
@@ -364,7 +364,7 @@ sudo chmod 600 /etc/nexapipe/config.toml
 
 ```bash
 sudo -u nexapipe nexapipe \
-    --config /etc/nexapipe/config.toml --generate-invite client-001 --create-client
+    --config /etc/nexapipe/config.toml invite client-001 --create-client
 ```
 
 它必须以服务运行所用的账号执行：配置文件的写入方式是先写一个新文件再改名覆盖，
@@ -476,26 +476,61 @@ relay 那份也是同样的声明。这些指令不是同一时期引入的，sy
 
 ## 命令行
 
-| 参数 | 说明 |
+每个请求都是一个命令。`nexapipe` 单独运行即启动服务端 —— 也就是 `nexapipe serve`
+所做的事；其余命令都是执行完就退出。
+
+| 命令 | 说明 |
+| --- | --- |
+| `nexapipe [serve] [--local-proxy]` | 启动服务端。`--local-proxy` 改为运行客户端本地 HTTP 代理。 |
+| `nexapipe status [--json]` | 询问 `[admin] listen_addr` 上的实例在做什么。 |
+| `nexapipe client list [--json]` | 列出 `[auth.clients]` 中的客户端及其设备。**不打印任何密钥** —— 那件事由 `client qr` 负责。 |
+| `nexapipe client add <CLIENT_ID> [--public-key HEX] [--force]` | 签发凭据：客户端自己的 `secret`，或单个设备用的设备密钥。已存在时拒绝替换，除非带 `--force`。 |
+| `nexapipe client revoke <CLIENT_ID> [--device DEVICE_ID]` | 删除一个客户端及其下所有凭据，或只删某一个设备的。 |
+| `nexapipe client enroll <CLIENT_ID> [--force]` | 生成 TOTP 密钥，写入配置并打印注册用二维码。已有密钥的客户端保持原样，除非用 `--force` 轮换。 |
+| `nexapipe client qr <CLIENT_ID>` | 打印客户端已有密钥的二维码，不写入任何东西。 |
+| `nexapipe device invite --client <CLIENT_ID> [--ttl 15m] [--domains a,b] [--relay URL] [--create-client]` | 打印一次性设备邀请：带 `enroll=` 令牌与 `exp=` 截止时间的 `nexapipe://` 链接和二维码。 |
+| `nexapipe invite [CLIENT_ID] [--create-client] [--domains LIST] [--name NAME] [--relay URL] [--ticket TICKET] [--endpoint-id ID]` | 打印端点邀请码。带 `CLIENT_ID` 时也带上该客户端的 2FA 凭据；不带时只携带端点与域名。 |
+| `nexapipe qr <TEXT>` | 绘制承载给定文本（链接、ticket、任意字符串）的二维码；带 `--out` 时同时写入文件。 |
+| `nexapipe secret` | 打印一个新的 iroh 密钥，不写任何文件。通常不需要 —— 服务端会在首次启动时自行写入 `[iroh] secret_key`；这条命令用于把身份搬到另一台机器。 |
+| `nexapipe config show` | 按配置被写下的格式，打印存储里持有的配置。 |
+| `nexapipe config path` | 打印持有配置的存储 —— 是文件还是数据库。 |
+
+无论运行哪个命令含义都不变的设置保持全局：
+
+| 选项 | 说明 |
 | --- | --- |
 | `-c, --config <PATH>` | 配置文件（默认 `./config.toml`；`NEXAPIPE_CONFIG_DIR` 可调整）。 |
-| `--local-proxy` | 以客户端本地 HTTP 代理运行，而非服务端。 |
-| `--generate-secret` | 打印一个新的 iroh 密钥。通常不需要 —— 服务端会在首次启动时自行写入 `[iroh] secret_key`；这条命令用于把身份搬到另一台机器。 |
-| `--generate-2fa <CLIENT_ID>` | 生成 TOTP 密钥，写入配置并打印注册用二维码。 |
-| `--force` | 配合 `--generate-2fa`：轮换已有客户端的密钥。 |
-| `--show-2fa <CLIENT_ID>` | 打印已存在于 `[auth.clients]` 中客户端的二维码。 |
+| `--storage <KIND>` | `toml` 或 `sqlite`；环境变量 `NEXAPIPE_STORAGE` 表达同一件事。 |
+| `--storage-url <URL>` | 持有配置的数据库；`NEXAPIPE_STORAGE_URL` 表达同一件事。 |
 | `--issuer <NAME>` | 认证器应用显示的签发者标签。 |
-| `--qr-format <FMT>` | `unicode`（默认）、`plain`、`ascii`、`svg`、`none`。 |
-| `--qr-invert` | 反色绘制二维码（深底浅色）。 |
-| `--qr-out <PATH>` | 同时把二维码写入文件（`.svg` → SVG，其他 → ASCII）。 |
-| `--generate-invite [CLIENT_ID]` | 打印可扫描的 `nexapipe://` 邀请码。带 `CLIENT_ID` 时也带上该客户端的 2FA 凭证 —— 对已存在的客户端是长期密钥，对同一次运行中 `--create-client` 新建的客户端则是一次性注册令牌；不带时只携带端点与域名。 |
-| `--registration` | 配合 `--generate-invite CLIENT_ID`：用一次性注册令牌代替密钥。同一次运行中 `--create-client` 新建的客户端默认拿到的就是这个。 |
-| `--create-client` | 配合 `--generate-invite CLIENT_ID`：客户端尚不存在时创建它，并在同一次运行中生成并写入其密钥。 |
-| `--invite-domains <LIST>` | 邀请码中的域名，逗号分隔（默认：`[local_proxy] proxy_domains`，否则取路由主机名）。 |
-| `--invite-name <NAME>` | 与端点一同保存的标签。 |
-| `--invite-relay <URL>` | 邀请码中的中继 URL（默认：`[iroh] relay_url`）。 |
+| `--format <FMT>` | 二维码绘制方式：`unicode`（默认）、`plain`、`ascii`、`svg`、`none`。旧拼写是 `--qr-format`。 |
+| `--invert` | 反色绘制二维码（深底浅色）。旧拼写是 `--qr-invert`。 |
+| `--out <PATH>` | 同时把二维码写入文件（`.svg` → SVG，其他 → ASCII）。旧拼写是 `--qr-out`。 |
 | `--endpoint-id <NODE_ID>` | 要对外公布的端点（默认：由 `[iroh] secret_key` 推导）。需要地址查找：客户端通过 discovery 解析它。当配置里写着本服务端自己的身份时，公布的端点必须是本服务端：会把本服务端 2FA 凭据带到别的端点的邀请码会被拒绝。 |
-| `--invite-ticket <TICKET>` | 用完整端点 ticket（服务端启动时打印的那个）代替 Node ID 对外公布。地址随链接携带，因此在 `[iroh] discovery = "none"` 下同样可用。需配合 `--generate-invite`；与 `--endpoint-id` 互斥。必须是本服务端自己的 ticket：会把本服务端的 2FA 凭据带到别的端点的邀请码会被拒绝。 |
+| `--invite-ticket <TICKET>`、`--ticket <TICKET>` | 用完整端点 ticket（服务端启动时打印的那个）代替 Node ID 对外公布。地址随链接携带，因此在 `[iroh] discovery = "none"` 下同样可用。与 `--endpoint-id` 互斥。必须是本服务端自己的 ticket：会把本服务端的 2FA 凭据带到别的端点的邀请码会被拒绝。 |
+
+### 旧拼写
+
+命令分组之前的所有旗标都会在下一个版本之前继续工作，从 `--help` 中隐藏，并在
+stderr 打印一行，指出取代它的命令。有两个拼写在此前就已退役，保持退役：
+`--registration` 与 `client add --device`，它们会拒绝并指向
+`nexapipe device invite --client <CLIENT_ID>`。
+
+| 旧旗标 | 命令 |
+| --- | --- |
+| `--local-proxy` | `nexapipe serve --local-proxy` |
+| `--generate-secret` | `nexapipe secret` |
+| `--generate-2fa <CLIENT_ID>` | `nexapipe client enroll <CLIENT_ID>` |
+| `--force` | `nexapipe client enroll <CLIENT_ID> --force` |
+| `--show-2fa <CLIENT_ID>` | `nexapipe client qr <CLIENT_ID>` |
+| `--generate-invite [CLIENT_ID]` | `nexapipe invite [CLIENT_ID]` |
+| `--create-client` | `nexapipe invite --create-client` |
+| `--invite-domains <LIST>` | `nexapipe invite --domains <LIST>` |
+| `--invite-name <NAME>` | `nexapipe invite --name <NAME>` |
+| `--invite-relay <URL>` | `nexapipe invite --relay <URL>` |
+
+`--qr-format`、`--qr-invert`、`--qr-out` 是上面绘图选项的别名而非弃用旗标，不会
+打印提示。
 
 ### `nexapipe client`
 
@@ -506,12 +541,14 @@ relay 那份也是同样的声明。这些指令不是同一时期引入的，sy
 
 | 命令 | 说明 |
 | --- | --- |
-| `client list [--json]` | 列出 `[auth.clients]` 中的客户端及其设备。**不打印任何密钥** —— 那件事由 `--show-2fa` 负责。 |
+| `client list [--json]` | 列出 `[auth.clients]` 中的客户端及其设备。**不打印任何密钥** —— 那件事由 `client qr` 负责。 |
 | `client add <CLIENT_ID>` | 签发凭据：写入客户端自己的 `secret`，也就是"未命名设备"所用的那个凭据。已存在时拒绝替换，除非带 `--force`。 |
 | `client add <CLIENT_ID> --device <NAME>` | 给单个设备签发凭据，客户端自己的 `secret` 不动 —— 因此已经在用它的设备继续可用。客户端必须先存在。 |
 | `client add <CLIENT_ID> --device <NAME> --public-key <HEX>` | 签发**设备密钥**而不是 `secret`：一对 Ed25519 密钥的公钥半边（64 位十六进制）。设备用自己保管的私钥半边为每条质询签名，服务端用这里登记的公钥验证那个签名。不写入任何 `secret`，也无从打印 —— 因为根本没有。见[设备密钥](#设备密钥)。 |
 | `client revoke <CLIENT_ID>` | 删除一个客户端及其下所有设备凭据。 |
 | `client revoke <CLIENT_ID> --device <NAME>` | 只删除某一个设备的凭据，保留客户端和它的其他设备。 |
+| `client enroll <CLIENT_ID> [--force]` | 生成 TOTP 密钥并写入配置，打印注册用二维码。已有密钥的客户端保持原样，除非 `--force` 轮换。 |
+| `client qr <CLIENT_ID>` | 打印客户端已有密钥的二维码，不写入任何东西。 |
 
 ```bash
 nexapipe client list --config config.toml
@@ -1303,7 +1340,7 @@ TUN 的网卡拒绝了 IPv6 地址的情况，此时 AAAA 应答为空，解析�
    `[auth.clients]`，所以第 2 步只是把 2FA 打开：
 
    ```bash
-   cargo run -p nexapipe -- --generate-2fa client-001 --qr-format unicode
+   cargo run -p nexapipe -- client enroll client-001 --format unicode
    ```
 
 2. 确认服务端配置里 `[auth]` 是打开的。该命令会为你添加
@@ -1320,7 +1357,7 @@ TUN 的网卡拒绝了 IPv6 地址的情况，此时 AAAA 应答为空，解析�
    max_attempts = 5
    lockout_duration = 300
 
-   [auth.clients.client-001]     # 由 --generate-2fa 写入
+   [auth.clients.client-001]     # 由 client enroll 写入
    secret = "JBSWY3DPEHPK3PXP"
    ```
 
@@ -1358,8 +1395,8 @@ otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algor
 
 - 在 `[auth]` 下设置 `issuer` 可改变应用显示的标签；`--issuer` 可覆盖单次运行的
   取值。两者默认都是 `NexaPipe`。
-- `--show-2fa CLIENT_ID` 可以再次打印已配置客户端的二维码，用于另一台设备。
-- 对一个已有密钥的客户端执行 `--generate-2fa` 会打印**那个**密钥而不是生成新的。
+- `client qr CLIENT_ID` 可以再次打印已配置客户端的二维码，用于另一台设备。
+- 对一个已有密钥的客户端执行 `client enroll` 会打印**那个**密钥而不是生成新的。
   加上 `--force` 可轮换它：所有用旧密钥注册过的设备都必须重新扫描。
 - 写入是就地编辑 `config.toml`，保留注释与格式。如果文件无法读取或写入，密钥只会
   被打印出来。
@@ -1368,7 +1405,7 @@ otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algor
 - **密钥才是凭证，不是那六位数字。** 服务端在查看验证码*之前*先校验响应签名（以
   密钥为密钥的 HMAC-SHA256；用设备密钥注册的设备则是同一段字节上的 Ed25519
   签名）。任何带 `secret=` 的 `nexapipe://` 邀请码与注册二维码都以**明文**携带它
-  —— 把两者都当作密码对待（`--qr-out` 在 Unix 上以 `0600` 写入）。
+  —— 把两者都当作密码对待（`--out` 在 Unix 上以 `0600` 写入）。
 
 ### 设备密钥
 
@@ -1422,7 +1459,7 @@ nexapipe client add client-001 --device phone --public-key <64 位十六进制> 
 而不是手输三个字段：
 
 ```bash
-cargo run -p nexapipe -- --generate-invite client-001 --qr-format unicode
+cargo run -p nexapipe -- invite client-001 --format unicode
 ```
 
 ```text
@@ -1443,7 +1480,7 @@ nexapipe://endpoint/a612…7063?v=1&name=Home&domains=app.example.com,comfyui.ex
 不带 `CLIENT_ID` 时，邀请码只携带端点与其域名，别无其他。域名默认取
 `[local_proxy] proxy_domains`，其次取 `[[routes]]` 的主机名；端点默认取
 `[iroh] secret_key` 的公钥，因此二维码在重启后依然有效。可用
-`--invite-domains`、`--invite-name`、`--invite-relay`、`--endpoint-id` 覆盖其中
+`--domains`、`--name`、`--relay`、`--endpoint-id` 覆盖其中
 任何一项。
 
 - 客户端会**忽略它不认识的参数**，因此较新的服务端可以增加字段而不破坏旧版应用。
@@ -1458,7 +1495,7 @@ nexapipe://endpoint/a612…7063?v=1&name=Home&domains=app.example.com,comfyui.ex
 - 带 `secret=` 的邀请码是**明文密码**，它的二维码渲染同样如此 —— 任何扫到它的人都
   持有该客户端的凭证。
 - **吊销曾经等于全部轮换。** 删除 `[auth.clients.client-001]` 这一段，或者
-  `--generate-2fa client-001 --force`，仍然会连该客户端下所有已注册设备一起带走。
+  `client enroll client-001 --force`，仍然会连该客户端下所有已注册设备一起带走。
   报了名字的设备现在可以单独吊销，其余设备不受影响：见
   [`nexapipe client`](#nexapipe-client)。
 - 两种吊销都只作用于**之后建立的连接**：握手里拿到的授权是当时的快照，已经通过认证的
@@ -1485,24 +1522,24 @@ nexapipe://endpoint/a612…7063?v=1&name=Home&domains=app.example.com,comfyui.ex
 
 1. **把行距设为 1.0。** Terminal.app：设置 → 配置文件 → 文本 → 行距 `1.0`。
    iTerm2：Settings → Profiles → Text → Line Spacing `1.0`。下一次
-   `--generate-invite` 打印出来就是连续的。
-2. **把二维码写到文件。** `--qr-out invite.svg` 生成像素精确的 SVG，任何终端设置都
+   `invite` 打印出来就是连续的。
+2. **把二维码写到文件。** `--out invite.svg` 生成像素精确的 SVG，任何终端设置都
    无法扭曲它 —— 用浏览器或预览打开后扫。这在改不了终端时是最佳选择，比如共享会话
    或跳板机。
-3. **改用 `--qr-format ascii`。** 每个模块占两个字符宽，符号完全不依赖半块字形的度量。
+3. **改用 `--format ascii`。** 每个模块占两个字符宽，符号完全不依赖半块字形的度量。
 
 三条都试过还扫不出来，那就要怀疑链接本身：直接粘贴到客户端的"添加端点"对话框里，
 绕开终端。
 
 ### 邀请一个尚不存在的客户端（`--create-client`）
 
-`--generate-invite CLIENT_ID` 交出的是某个客户端*已经拥有*的密钥，因此不在
+`nexapipe invite CLIENT_ID` 交出的是某个客户端*已经拥有*的密钥，因此不在
 `[auth.clients]` 中的 `CLIENT_ID` 会被拒绝。`--create-client` 把"创建"与"邀请"合为
 一次运行 —— 密钥被生成并写入配置，邀请码里放的则是它的**一次性注册令牌**：
 
 ```bash
-cargo run -p nexapipe -- --generate-invite client-001 --create-client
-cargo run -p nexapipe -- --generate-invite client-001 --create-client --registration
+cargo run -p nexapipe -- invite client-001 --create-client
+cargo run -p nexapipe -- device invite --client client-001 --create-client
 ```
 
 - **链接里是令牌，不是密钥。** 那把密钥刚刚生成出来，还不在任何人手里，所以第一台设备
@@ -1511,46 +1548,39 @@ cargo run -p nexapipe -- --generate-invite client-001 --create-client --registra
 - **它绝不触碰已存在的客户端。** 对已配置的客户端运行会复用已存的密钥，而不是再生
   成一个 —— 后者会让所有已用第一个密钥注册的设备全部被锁在外面。这种链接仍然携带密钥
   —— 只要那把密钥还在，它就一直是凭证 —— 输出也会这样说明。轮换仍然是显式的
-  `--generate-2fa CLIENT_ID --force`。
+  `client enroll CLIENT_ID --force`。
 - **它只补全完全缺失的客户端。** 一个存在但没有 `secret` 的 `[auth.clients.x]` 段
   是坏文件，不是一个待填的空白。
-- **它不是独立的"添加客户端"命令** —— 它要求配合 `--generate-invite`，因此密钥只会
+- **它不是独立的"添加客户端"命令** —— 它只存在于 `nexapipe invite` 上，因此密钥只会
   作为即将被交出去的邀请码的一部分而被创建。
 
 由于新密钥是写入 `config.toml` 的，请记住 TOTP 参数在启动时只读取一次：添加到
 `[auth.clients]` 下的客户端会被自行拾取（文件每 5 秒被重新读取一次），但改动
 `algorithm`、`time_step` 或 `digits` 仍需重启。
 
-### 注册邀请码（`--registration`）
+### 一次性注册令牌（`nexapipe device invite`）
 
-上面那个码的问题在于：只要密钥还在，它就一直是凭证。`--registration` 改为在链接中
-放入一个**一次性注册令牌** —— 而对同一次运行中 `--create-client` 新建的客户端来说，
-链接里放的本来就已经是这个了：
+上面那个码的问题在于：只要密钥还在，它就一直是凭证。设备邀请改为在链接中放入一个
+**一次性注册令牌**，并带上一个截止时间：
 
 ```bash
-cargo run -p nexapipe -- --generate-invite client-001 --registration
+cargo run -p nexapipe -- device invite --client client-001
 ```
 
 ```text
 nexapipe://endpoint/a612…7063?v=2&domains=app.example.com&client=client-001
-    &enroll=9f2c…c41b
+    &enroll=9f2c…c41b&exp=1763500000
 ```
 
 第一台连接的设备发送该令牌，服务端回复一个新生成的密钥，并**在同一次写入中烧掉
-令牌**，因此一个在传输途中被复制的链接在被使用的瞬间就不再是凭证。一个你从未送达的
-链接，通过再生成一个来吊销，这会替换掉尚未使用的令牌。
+令牌**，因此一个在传输途中被复制的链接在被使用的瞬间就不再是凭证。默认 15 分钟后
+过期（`--ttl` 接受 `1s`..`30d`）；过了截止时间服务端直接拒绝，且不计入猜错的次数。
+一个你从未送达的链接，通过再生成一个来吊销，这会替换掉尚未使用的令牌。
 
-**注册轮换的是哪一个密钥，取决于设备有没有报名字。** 以具名设备应答的安装 —— 桌面端
-取主机名、Android 取设备型号 —— 会被写到 `[auth.clients.<id>.devices.<name>]` 下，
-所以只有这台设备的凭据变了，其余设备继续可用。没有报名字的安装则被写到客户端自己的
-`secret` 下，而**这一次**才是会连带所有共用它的设备的轮换：它们都必须重新扫描。没有
-任何设备会自动重新注册，所以一个在能报名字之前就注册好的设备会一直以"未命名"应答，
-直到重新导入邀请 —— 也只有这一件事能改变它。
-
-注册**不会**覆盖一个已经存在的设备名：令牌只证明邀请送到了某个人手里，不能证明送到了
-哪台设备，而名字是客户端在注册时自己报的，所以接受任意名字就等于让一个被复制的链接
-顶替掉真设备。要换掉已有设备的凭据，用
-`nexapipe client add <id> --device <name> --force`。
+设备由它自己上报的公钥指纹标识（`d-` 加 16 位十六进制），名称只是给人看的标签，
+可以重复，也不参与身份。重新邀请不会顶替一台已经登记的设备：要换掉某台设备的凭据，
+先删掉它的那一行 —— `nexapipe client revoke <id> --device <DEVICE_ID>` —— 再发一次
+邀请。
 
 - `v=2` 是一个**独立的版本号**，因此只认识 `v=1` 的应用会拒绝该码，而不是把它当作
   一个凭证丢失的端点分享来读取。

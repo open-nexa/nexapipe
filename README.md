@@ -120,7 +120,7 @@ bindings for Swift/Kotlin/Python. See
 | `ui-android/` | Android app (Kotlin + Compose). |
 | `ui-desktop/` | Tauri 2 desktop app (Vue 3 + TypeScript). |
 | `config.toml.example` | Example server + client configuration covering every section. It ships with 2FA **on** and no client enrolled, so a fresh install refuses every connection until one is enrolled. Copy it to `config.toml` — that name is gitignored, it is the operator's live config. The docker compose file uses `config/config.toml` instead, picked up via `NEXAPIPE_CONFIG_DIR=/app/config`. |
-| `config.toml.2fa.example` | The same, with a `[auth.clients]` entry — a client that is enrolled already. **The secret in it is published**, so it is a demonstration of what an enrolled client looks like rather than one to use: replace it with `nexapipe --generate-2fa client-001 --force` before the listener is reachable. |
+| `config.toml.2fa.example` | The same, with a `[auth.clients]` entry — a client that is enrolled already. **The secret in it is published**, so it is a demonstration of what an enrolled client looks like rather than one to use: replace it with `nexapipe client enroll client-001 --force` before the listener is reachable. |
 | `run_android.ps1` | One-shot Android debug loop (build → install → launch → logcat), for Windows. |
 | `run_android.sh` | The same one-shot Android debug loop for macOS and Linux (bash). |
 
@@ -212,7 +212,7 @@ Two things are worth knowing about that:
 - **A `secret_key` that does not parse refuses the start.** It used to be a
   warning and a throwaway identity, which left the endpoint on a different Node
   ID after every restart while looking handled. Delete the line to have a
-  working one generated, or paste the output of `--generate-secret`.
+  working one generated, or paste the output of `nexapipe secret`.
 - **A config that cannot be written still starts**, on a throwaway identity, with
   a warning — a read-only mount or a file owned by another user is an ordinary
   deployment, and refusing to start there would be worse than the fresh Node ID
@@ -231,7 +231,7 @@ source — a value and a path, the environment and the config, either and
 `secret_key` — refuses the start rather than picking silently.
 
 ```bash
-cargo run -p nexapipe -- --generate-secret   # only to move an identity between hosts
+cargo run -p nexapipe -- secret   # only to move an identity between hosts
 ```
 
 ### Docker
@@ -555,26 +555,62 @@ will name.
 
 ## CLI
 
-| Flag | Meaning |
+Every request is a command. `nexapipe` on its own starts the server — which is
+what `nexapipe serve` does as well — and every other command runs and exits.
+
+| Command | Meaning |
+| --- | --- |
+| `nexapipe [serve] [--local-proxy]` | Start the server. `--local-proxy` runs the client-side local HTTP proxy instead. |
+| `nexapipe status [--json]` | Ask the instance at `[admin] listen_addr` what it is doing. |
+| `nexapipe client list [--json]` | The clients in `[auth.clients]` and the devices of each. **No secret is printed** — that is what `client qr` is for. |
+| `nexapipe client add <CLIENT_ID> [--public-key HEX] [--force]` | Issue a credential: the client's own `secret`, or a key for one device. Refuses to replace one without `--force`. |
+| `nexapipe client revoke <CLIENT_ID> [--device DEVICE_ID]` | Drop a client and every credential under it, or only one device's. |
+| `nexapipe client enroll <CLIENT_ID> [--force]` | Generate a TOTP secret, write it into the configuration and print the enrollment QR code. A client that already has a secret keeps it unless `--force` rotates it. |
+| `nexapipe client qr <CLIENT_ID>` | Print the QR code of the secret a client already has, writing nothing. |
+| `nexapipe device invite --client <CLIENT_ID> [--ttl 15m] [--domains a,b] [--relay URL] [--create-client]` | Print a one-time device invitation: a `nexapipe://` link and QR carrying an `enroll=` token with an `exp=` deadline. See [`nexapipe device`](#nexapipe-device). |
+| `nexapipe invite [CLIENT_ID] [--create-client] [--domains LIST] [--name NAME] [--relay URL] [--ticket TICKET] [--endpoint-id ID]` | Print the endpoint invite. With a `CLIENT_ID` it carries that client's 2FA credential too; without one, only the endpoint and its domains. |
+| `nexapipe qr <TEXT>` | Draw a QR code carrying the text given — a link, a ticket, anything — and write it to `--out` when that is given. |
+| `nexapipe secret` | Print a new iroh secret key, and write nothing. Usually unnecessary: the server writes `[iroh] secret_key` on first start; this is for moving an identity between hosts. |
+| `nexapipe config show` | Print the configuration the store holds, in the format it is written in. |
+| `nexapipe config path` | Print the store that holds the configuration — the file, or the database. |
+
+The settings that mean the same thing whichever command runs stay global:
+
+| Option | Meaning |
 | --- | --- |
 | `-c, --config <PATH>` | Config file (default `./config.toml`; `NEXAPIPE_CONFIG_DIR` shifts it). |
-| `--local-proxy` | Run as a client-side local HTTP proxy instead of a server. |
-| `--generate-secret` | Print a new iroh secret key. Usually unnecessary — the server writes `[iroh] secret_key` on first start; this is for moving an identity between hosts. |
-| `--generate-2fa <CLIENT_ID>` | Generate a TOTP secret, write it to the config and print the enrollment QR code. |
-| `--force` | With `--generate-2fa`: rotate an existing client's secret. |
-| `--show-2fa <CLIENT_ID>` | Print the QR code of a client already in `[auth.clients]`. |
+| `--storage <KIND>` | `toml` or `sqlite`; `NEXAPIPE_STORAGE` says the same thing. |
+| `--storage-url <URL>` | The database the configuration is kept in; `NEXAPIPE_STORAGE_URL` says the same thing. |
 | `--issuer <NAME>` | Issuer label shown by the authenticator app. |
-| `--qr-format <FMT>` | `unicode` (default), `plain`, `ascii`, `svg`, `none`. |
-| `--qr-invert` | Draw the QR code inverted (light on dark). |
-| `--qr-out <PATH>` | Also write the QR code to a file (`.svg` → SVG, anything else → ASCII). |
-| `--generate-invite [CLIENT_ID]` | Print a scannable `nexapipe://` endpoint invite. With a `CLIENT_ID` it carries that client's 2FA secret too; without one, only endpoint and domains. To enroll a device, use `device invite` instead. |
-| `--registration` | **Removed** — it now fails with a pointer to `device invite`. Use `nexapipe device invite --client <CLIENT_ID>` for a one-time enrollment link, which also has a deadline. |
-| `--create-client` | With `--generate-invite CLIENT_ID`: create the client if it does not exist yet, generating and writing its secret in the same run. `device invite` has its own `--create-client` for the same purpose. |
-| `--invite-domains <LIST>` | Domains to put in the invite, comma-separated (default: `[local_proxy] proxy_domains`, else the route hosts). |
-| `--invite-name <NAME>` | Label stored alongside the endpoint. |
-| `--invite-relay <URL>` | Relay URL in the invite (default: `[iroh] relay_url`). |
+| `--format <FMT>` | How to draw the QR code: `unicode` (default), `plain`, `ascii`, `svg`, `none`. The older spelling is `--qr-format`. |
+| `--invert` | Draw the QR code inverted (light on dark). The older spelling is `--qr-invert`. |
+| `--out <PATH>` | Also write the QR code to a file (`.svg` → SVG, anything else → ASCII). The older spelling is `--qr-out`. |
 | `--endpoint-id <NODE_ID>` | Endpoint to publish (default: derived from `[iroh] secret_key`). Requires lookup: the client resolves it through discovery. When the configuration names this server's identity, the endpoint has to be this server's own: an invite that would carry this server's 2FA credential to another endpoint is refused. |
-| `--invite-ticket <TICKET>` | Publish a full endpoint ticket (as printed at server start) instead of a Node ID. The addresses ride in the link, so the invite works with `[iroh] discovery = "none"`. Requires `--generate-invite`; conflicts with `--endpoint-id`. It has to be this server's own ticket: an invite that would carry this server's 2FA credential to another endpoint is refused. |
+| `--invite-ticket <TICKET>`, `--ticket <TICKET>` | Publish a full endpoint ticket (as printed at server start) instead of a Node ID. The addresses ride in the link, so the invite works with `[iroh] discovery = "none"`. Conflicts with `--endpoint-id`. It has to be this server's own ticket: an invite that would carry this server's 2FA credential to another endpoint is refused. |
+
+### The older spellings
+
+Every flag this binary had before the command groups keeps working for one
+release, hidden from `--help`, and prints one line on stderr naming the command
+that replaced it. Two spellings were retired before that and stay retired:
+`--registration` and `client add --device`, which refuse and point at
+`nexapipe device invite --client <CLIENT_ID>`.
+
+| Old flag | Command |
+| --- | --- |
+| `--local-proxy` | `nexapipe serve --local-proxy` |
+| `--generate-secret` | `nexapipe secret` |
+| `--generate-2fa <CLIENT_ID>` | `nexapipe client enroll <CLIENT_ID>` |
+| `--force` | `nexapipe client enroll <CLIENT_ID> --force` |
+| `--show-2fa <CLIENT_ID>` | `nexapipe client qr <CLIENT_ID>` |
+| `--generate-invite [CLIENT_ID]` | `nexapipe invite [CLIENT_ID]` |
+| `--create-client` | `nexapipe invite --create-client` |
+| `--invite-domains <LIST>` | `nexapipe invite --domains <LIST>` |
+| `--invite-name <NAME>` | `nexapipe invite --name <NAME>` |
+| `--invite-relay <URL>` | `nexapipe invite --relay <URL>` |
+
+`--qr-format`, `--qr-invert` and `--qr-out` are aliases of the drawing options
+above rather than deprecated flags, so they print no notice.
 
 ### `nexapipe device`
 
@@ -602,7 +638,7 @@ reload.
 
 | Command | Meaning |
 | --- | --- |
-| `client list [--json]` | The clients in `[auth.clients]` and the devices of each. **No secret is printed** — that is what `--show-2fa` is for. JSON includes `invite_expires_at` and each device's `label`/`platform`/`model`/`app_version`. |
+| `client list [--json]` | The clients in `[auth.clients]` and the devices of each. **No secret is printed** — that is what `client qr` is for. JSON includes `invite_expires_at` and each device's `label`/`platform`/`model`/`app_version`. |
 | `client add <CLIENT_ID>` | Issue a credential: writes the client's own `secret`, which is the credential of a device with no row of its own. Refuses to replace one without `--force`. |
 | `client add <CLIENT_ID> --device <NAME>` | **Removed** — it now fails with a pointer to `device invite`. Devices are identified by the fingerprint of their key, not a name the operator picks; re-enroll old name-keyed devices with a fresh invitation. |
 | `client add <CLIENT_ID> --public-key <HEX>` | Issue a **key** instead of a secret: the public half of an Ed25519 pair (64 hex chars). The device id is derived from the key fingerprint (`d-` plus 16 hex chars), so no `--device` is needed or allowed. No secret is written and none is printed — there is none. See [Device keys](#device-keys). |
@@ -1521,7 +1557,7 @@ with a key, a signature over that connection's challenge (see
    about turning 2FA on:
 
    ```bash
-   cargo run -p nexapipe -- --generate-2fa client-001 --qr-format unicode
+   cargo run -p nexapipe -- client enroll client-001 --format unicode
    ```
 
 2. Make sure `[auth]` is on in the server config. The command adds
@@ -1538,7 +1574,7 @@ with a key, a signature over that connection's challenge (see
    max_attempts = 5
    lockout_duration = 300
 
-   [auth.clients.client-001]     # written by --generate-2fa
+   [auth.clients.client-001]     # written by client enroll
    secret = "JBSWY3DPEHPK3PXP"
    ```
 
@@ -1581,9 +1617,9 @@ otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algor
 
 - Set `issuer` under `[auth]` to change the label shown by the app; `--issuer`
   overrides it for a single run. Both default to `NexaPipe`.
-- `--show-2fa CLIENT_ID` prints an already configured client's code again, for
+- `client qr CLIENT_ID` prints an already configured client's code again, for
   another device.
-- `--generate-2fa` on a client that already has a secret prints **that** secret
+- `client enroll` on a client that already has a secret prints **that** secret
   instead of a new one. Add `--force` to rotate it: every device enrolled with
   the old secret has to scan again.
 - Both ways of revoking apply to **connections made afterwards**: the
@@ -1598,8 +1634,8 @@ otpauth://totp/NexaPipe:client-001?secret=JBSWY3DPEHPK3PXP&issuer=NexaPipe&algor
 - **The secret is the credential, not the six digits.** The server checks the
   response signature (HMAC-SHA256 keyed by the secret; an Ed25519 signature over
   the same bytes, for a device registered with a key) *before* it looks at the
-  code. Any `nexapipe://` invite with `secret=` and the `--generate-2fa` QR carry
-  it **in the clear** — treat both as passwords (`--qr-out` writes `0600` on
+  code. Any `nexapipe://` invite with `secret=` and the `client enroll` QR carry
+  it **in the clear** — treat both as passwords (`--out` writes `0600` on
   Unix). A [device invitation](#device-invitations) carries a one-time token
   instead, and is a credential only until it is spent or expires.
 
@@ -1674,7 +1710,7 @@ That code hands out the client's long-lived secret; to enroll a device with a
 credential of its own, use a [device invitation](#device-invitations) instead:
 
 ```bash
-cargo run -p nexapipe -- --generate-invite client-001 --qr-format unicode
+cargo run -p nexapipe -- invite client-001 --format unicode
 ```
 
 ```text
@@ -1695,8 +1731,8 @@ nexapipe://endpoint/a612…7063?v=1&name=Home&domains=app.example.com,comfyui.ex
 Without a `CLIENT_ID` the invite carries the endpoint and its domains and nothing
 else. Domains default to `[local_proxy] proxy_domains`, then to the `[[routes]]`
 hosts; the endpoint defaults to the public key of `[iroh] secret_key`, so the
-code stays valid across restarts. Override any of it with `--invite-domains`,
-`--invite-name`, `--invite-relay`, `--endpoint-id`.
+code stays valid across restarts. Override any of it with `--domains`,
+`--name`, `--relay`, `--endpoint-id`.
 
 - Clients **ignore parameters they do not recognise**, so a newer server can add
   fields without breaking older apps. What is strict is `v` (must be `1` or `2`)
@@ -1713,7 +1749,7 @@ code stays valid across restarts. Override any of it with `--invite-domains`,
 - An invite that carries `secret=` is a **password in the clear**, and so is its
   QR rendering — anyone who scans it holds that client's credentials.
 - **Revoking one used to mean rotating all.** Deleting the
-  `[auth.clients.client-001]` section, or `--generate-2fa client-001 --force`,
+  `[auth.clients.client-001]` section, or `client enroll client-001 --force`,
   still takes every device enrolled under that client with it. Each device now
   has its own row under its key fingerprint, so one can be dropped on its own
   and the rest left alone: see [`nexapipe client`](#nexapipe-client).
@@ -1744,12 +1780,12 @@ Fix it in whichever order suits you:
 
 1. **Set line spacing to 1.0.** Terminal.app: Settings → Profiles → Text → Line
    spacing `1.0`. iTerm2: Settings → Profiles → Text → Line Spacing `1.0`. The
-   next `--generate-invite` prints seamlessly.
-2. **Write the code to a file.** `--qr-out invite.svg` produces a pixel-exact SVG
+   next `invite` prints seamlessly.
+2. **Write the code to a file.** `--out invite.svg` produces a pixel-exact SVG
    that no terminal setting can distort — open it in a browser or Preview and
    scan that. Best option when you cannot change the terminal, e.g. a shared
    session or a jump host.
-3. **Use `--qr-format ascii`.** Every module is two characters wide, so the
+3. **Use `--format ascii`.** Every module is two characters wide, so the
    symbol does not depend on half-block metrics at all.
 
 If it still will not scan after all three, the link is the suspect: paste it into
@@ -1758,13 +1794,13 @@ terminal entirely.
 
 ### Inviting a client that does not exist yet (`--create-client`)
 
-`--generate-invite CLIENT_ID` hands out the secret a client *already* has, so it
+`nexapipe invite CLIENT_ID` hands out the secret a client *already* has, so it
 refuses a `CLIENT_ID` that is not in `[auth.clients]`. `--create-client` folds
 "create" and "invite" into one run — the secret is generated, written to the
 config and put into the invite:
 
 ```bash
-cargo run -p nexapipe -- --generate-invite client-001 --create-client
+cargo run -p nexapipe -- invite client-001 --create-client
 cargo run -p nexapipe -- device invite --client client-001 --create-client
 ```
 
@@ -1775,11 +1811,11 @@ cargo run -p nexapipe -- device invite --client client-001 --create-client
 - **It never touches a client that already exists.** A run against a configured
   client reuses the stored secret instead of minting a second one, which would
   lock out every device enrolled with the first. Rotating stays the explicit
-  `--generate-2fa CLIENT_ID --force`.
+  `client enroll CLIENT_ID --force`.
 - **It only fills in a client that is missing entirely.** A `[auth.clients.x]`
   section that exists with no `secret` is a broken file, not a blank to fill in.
-- **It is not a standalone "add a client" command** — it requires
-  `--generate-invite`, so a secret is only ever created as part of an invite
+- **It is not a standalone "add a client" command** — it only exists on
+  `nexapipe invite`, so a secret is only ever created as part of an invite
   someone is about to hand out. `device invite --create-client` does the same
   for a device invitation: it creates the client and an expiring enrollment link
   in one run.

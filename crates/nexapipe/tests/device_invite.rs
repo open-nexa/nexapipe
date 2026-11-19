@@ -352,7 +352,7 @@ fn an_invite_ticket_without_an_invite_is_rejected() {
 
     assert!(!ok, "a stray ticket was silently ignored:\n{output}");
     assert!(
-        output.contains("is used with --generate-invite or"),
+        output.contains("is used with `nexapipe invite` or"),
         "{output}"
     );
 }
@@ -368,7 +368,7 @@ fn an_invite_ticket_is_rejected_before_other_early_returns() {
 
     assert!(!ok, "the ticket was silently ignored:\n{output}");
     assert!(
-        output.contains("is used with --generate-invite or"),
+        output.contains("is used with `nexapipe invite` or"),
         "{output}"
     );
     assert!(
