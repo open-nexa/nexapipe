@@ -31,12 +31,12 @@ The `client` command SHALL carry the operations that read and write the credenti
 
 #### Scenario: Issuing a credential
 
-- **WHEN** the operator asks the `client` command to add a client, with a device name and a public key
+- **WHEN** the operator asks the `client` command to add a client, with a public key
 - **THEN** that device is issued the credential, and the client's own credential is left alone
 
 #### Scenario: Withdrawing a credential
 
-- **WHEN** the operator asks the `client` command to revoke a client, with a device name
+- **WHEN** the operator asks the `client` command to revoke a client, naming a device
 - **THEN** that device's credential is dropped, and the client and its other devices are left alone
 
 #### Scenario: Enrolling a client in 2FA
@@ -48,6 +48,25 @@ The `client` command SHALL carry the operations that read and write the credenti
 
 - **WHEN** the operator asks the `client` command for the QR code of a client
 - **THEN** the QR code of the secret that client already has is printed, and no secret is written
+
+### Requirement: The device invitation is its own command
+
+The `device` command SHALL print the one-time invitation a device enrolls with.
+
+#### Scenario: An invitation for a device
+
+- **WHEN** the operator asks the `device` command for an invitation naming a client
+- **THEN** a one-time invitation is printed, carrying the client, the domains and an expiry
+
+#### Scenario: How long the invitation is good for
+
+- **WHEN** the operator asks the `device` command for an invitation and names a lifetime
+- **THEN** the invitation expires after that lifetime, and after the default when none is named
+
+#### Scenario: A client that does not exist yet
+
+- **WHEN** the operator asks the `device` command for an invitation naming a client that does not exist, and asks for the client to be created
+- **THEN** the client is created, and the invitation is printed
 
 ### Requirement: The endpoint invite is its own command
 
@@ -62,11 +81,6 @@ The `invite` command SHALL print the endpoint invite, and SHALL take the options
 
 - **WHEN** the operator asks the `invite` command for an invite naming a client
 - **THEN** the invite carries that client's credential as well
-
-#### Scenario: An invite that carries a one-time token
-
-- **WHEN** the operator asks the `invite` command for an invite naming a client and asks for the one-time form
-- **THEN** the invite carries a one-time enrollment token rather than the client's secret, and the token is recorded for that client
 
 #### Scenario: An invite for a client that does not exist yet
 
@@ -117,7 +131,7 @@ The `config` command SHALL report the configuration the store holds and where th
 
 ### Requirement: The older spellings keep working
 
-Every flag the command line has today SHALL keep working for one release, and the instance SHALL say which command has replaced the flag.
+Every flag the command line has today SHALL keep working for one release, and the instance SHALL say which command has replaced it.
 
 #### Scenario: A flag that has become a command
 
@@ -133,6 +147,11 @@ Every flag the command line has today SHALL keep working for one release, and th
 
 - **WHEN** an operator types a flag that only means something next to another flag, without that other flag
 - **THEN** the instance says the flag has been replaced, and the request it would have changed is not made
+
+#### Scenario: A spelling that was retired before this change
+
+- **WHEN** an operator types a flag that another change has already retired
+- **THEN** the instance refuses it, and points at the command that replaced it — this change does not bring the spelling back
 
 ### Requirement: The messages name the commands
 

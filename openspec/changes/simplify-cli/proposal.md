@@ -8,8 +8,8 @@ Grouping the flags into named commands makes the surface say what it does: `nexa
 
 ## What Changes
 
-- The twenty-one top-level flags become eight command groups: `serve`, `status`, `client`, `invite`, `qr`, `secret`, `config`.
-- Every flag the command line has today keeps working for one release, and says which command has replaced it.
+- The twenty-one top-level flags become eight command groups: `serve`, `status`, `client`, `device`, `invite`, `qr`, `secret`, `config`.
+- Every flag the command line has today keeps working for one release, and says which command has replaced it. Two of them have already been retired — `--registration` and `client add --device` now refuse and point at `nexapipe device invite` — and this change does not bring them back.
 - Running the server still needs no command: `nexapipe` on its own starts the server, as it does now.
 - The messages the binary prints name the commands instead of the flags.
 - Three flags are renamed rather than moved, because they describe how a QR code is drawn and that is now a property of the command rather than of the whole binary: `--qr-format` becomes `--format`, `--qr-invert` becomes `--invert`, `--qr-out` becomes `--out`. The old spellings keep working.
@@ -20,11 +20,12 @@ The commands, in full:
 nexapipe [serve] [--local-proxy]
 nexapipe status [--json]
 nexapipe client list [--json]
-nexapipe client add <CLIENT_ID> [--device NAME] [--public-key HEX] [--force]
-nexapipe client revoke <CLIENT_ID> [--device NAME]
+nexapipe client add <CLIENT_ID> [--public-key HEX] [--force]
+nexapipe client revoke <CLIENT_ID> [--device DEVICE_ID]
 nexapipe client enroll <CLIENT_ID> [--force]
 nexapipe client qr <CLIENT_ID>
-nexapipe invite [CLIENT_ID] [--registration] [--create-client] [--domains LIST] [--name NAME] [--relay URL] [--ticket TICKET] [--endpoint-id ID]
+nexapipe device invite --client <CLIENT_ID> [--ttl DURATION] [--domains LIST] [--relay URL] [--create-client]
+nexapipe invite [CLIENT_ID] [--create-client] [--domains LIST] [--name NAME] [--relay URL] [--ticket TICKET] [--endpoint-id ID]
 nexapipe qr <TEXT>
 nexapipe secret
 nexapipe config show

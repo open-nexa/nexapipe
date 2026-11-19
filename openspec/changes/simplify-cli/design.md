@@ -6,7 +6,7 @@ The command line today is one clap struct with a few global arguments and twenty
 
 Those modules are also where the messages that name flags live — the invite tells the operator to run `--generate-invite <client> --registration` and `--generate-2fa <client> --force`, and the enrollment tells the operator to "pass `--force` to rotate it instead".
 
-Two things shape the approach. The credential commands are about to be touched by other work — the device identity and the one-time enrollment token are changing shape — so the grouping should not rewrite them. And the old flags cannot simply be deleted: a deployment script that runs `nexapipe --generate-invite phone` has to keep working for a release.
+Two things shape the approach. The credential commands were restructured by the one-time device invitation that landed just before this change: `cli/invite.rs` now hands out `build_invite_base` and `create_client_for_invite` to the new `cli/device.rs`, and `--registration` and `client add --device` already refuse and point at `nexapipe device invite`. That change is still moving, so this one has to be written on top of it rather than beside it. And the old flags cannot simply be deleted: a deployment script that runs `nexapipe --generate-invite phone` has to keep working for a release.
 
 ## Goals / Non-Goals
 
@@ -27,19 +27,23 @@ Two things shape the approach. The credential commands are about to be touched b
 
 ### The commands live in `cli/commands.rs`, and `Cli` stays the internal request
 
-The command enums move out of `main.rs` into a new `crates/nexapipe/src/cli/commands.rs`, next to the commands they dispatch to. The parser folds the command into the flat fields the implementations already read — `Commands::Invite { client_id, domains, … }` becomes `cli.generate_invite`, `cli.invite_domains` and the rest — and the implementations are called exactly as they are today.
+The command enums move out of `main.rs` into a new `crates/nexapipe/src/cli/commands.rs`, next to the commands they dispatch to — `serve`, `status`, `client`, `device`, `invite`, `qr`, `secret` and `config`. The parser folds the command into the flat fields the implementations already read — `Commands::Invite { client_id, domains, … }` becomes `cli.generate_invite`, `cli.invite_domains` and the rest — and the implementations are called exactly as they are today.
 
 **Why:** every spelling, old or new, then converges on one internal request, so there is one implementation per behaviour rather than one per spelling. The second half of that is the point: the credential modules are not rewritten, and the diff is the parser plus the messages.
 
-**Alternative considered:** giving each command its own arguments struct and changing the four credential functions to take it. That is the cleaner shape, and it is what the code would look like with no history. It rewrites every `cli.` into `req.` across `cli/invite.rs`, `cli/enrollment.rs` and `cli/client.rs` — the three files the device-identity work is about to touch — and every one of those renames is a merge conflict waiting to happen, over a refactor nobody asked for. The indirection it removes is one `&Cli` parameter, and the price is not worth it now.
+**The `device` group is carried over as it is.** The one-time device invitation already is a command, and it already lives in `cli/device.rs` with its own arguments. This change moves it into the same enum as the others and gives it a place in the help, but it does not change what it does.
+
+**Alternative considered:** giving each command its own arguments struct and changing the four credential functions to take it. That is the cleaner shape, and it is what the code would look like with no history. It rewrites every `cli.` into `req.` across `cli/invite.rs`, `cli/enrollment.rs` and `cli/client.rs` — the three files the device-identity work has just rewritten — and every one of those renames is a merge conflict waiting to happen, over a refactor nobody asked for. The indirection it removes is one `&Cli` parameter, and the price is not worth it now.
 
 **The cost, named:** the internal request uses the older names for things — `cli.generate_invite` for the invite command. That reads oddly next to `Commands::Invite`, and the fold deserves a comment saying why it is there. When the credential modules are next rewritten for another reason, the request can be renamed with them.
 
 ### The old flags stay on `Cli`, hidden, and are folded before dispatch
 
-The thirteen action flags keep their fields. They are hidden from `--help`, and the parser folds them into the equivalent command before anything is dispatched — `--generate-invite phone --registration` becomes `Commands::Invite { client_id: "phone", registration: true, … }`, and `client enroll` reuses the implementation the flag used.
+The action flags keep their fields. They are hidden from `--help`, and the parser folds them into the equivalent command before anything is dispatched — `--generate-invite phone` becomes `Commands::Invite { client_id: "phone", … }`, and `client enroll` reuses the implementation the flag used.
 
 **Why:** the implementations are the flag's behaviour, and folding keeps one of each. Hiding them keeps the help honest about what the command line is now, while the code keeps accepting them.
+
+**The two flags that were retired before this change stay retired.** `--registration` and `client add --device` refuse and point at `nexapipe device invite`, and this change does not bring either spelling back: the deprecation budget was spent once, on the device invitation, and spending it twice would give an operator two different deprecation notices for the same thing.
 
 ### A flag and the command that replaced it are an error
 
@@ -51,9 +55,9 @@ Giving both is refused, and the refusal names both.
 
 ### The modifier flags only mean something next to the flag they modified
 
-`--invite-domains`, `--invite-name`, `--invite-relay`, `--invite-ticket`, `--endpoint-id`, `--registration`, `--create-client` and `--force` keep behaving as they do today: on their own they change nothing. They are reported as replaced, and the request they would have changed is not made.
+`--invite-domains`, `--invite-name`, `--invite-relay`, `--invite-ticket`, `--endpoint-id`, `--create-client` and `--force` keep behaving as they do today: on their own they change nothing. They are reported as replaced, and the request they would have changed is not made.
 
-**Why:** that is what they do today. Making `--invite-domains a,b` print an invite would change what a command does, which this change is not about — and it would surprise anyone who typed them expecting them to be inert.
+**Why:** that is what they do today. Making `--invite-domains a,b` print an invite would change what a command does, which this change is not about — and it would surprise anyone who typed them expecting them to be inert. `--invite-ticket` is the exception the device invitation asked for: it is global now, because `device invite` carries a ticket too, and it says so when it is given on its own.
 
 ### The drawing options are renamed, and stay global
 
