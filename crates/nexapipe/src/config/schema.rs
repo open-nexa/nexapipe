@@ -68,6 +68,16 @@ pub struct AdminConfig {
     /// and that is the default: an instance that is not being scraped or
     /// supervised should not hold a port open for it.
     pub listen_addr: Option<String>,
+
+    /// The directory the browser console is served from. **Absent means "no
+    /// console"**, and that is the default: the console is a bundle an
+    /// operator has to build and point at, and an instance that has not been
+    /// pointed at one serves no page and no `/api/*`.
+    ///
+    /// The bundle is a directory of files rather than one file, because a
+    /// bundle is a directory: an index, a script, a stylesheet, and assets
+    /// with hashed names in them.
+    pub console_dir: Option<String>,
 }
 
 /// The `[metrics]` section: whether `/metrics` is served at all.

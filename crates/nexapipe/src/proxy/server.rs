@@ -538,6 +538,36 @@ pub async fn run_proxy(
         // never binds it should not find a credential on disk next to its
         // config.
         let token = admin::token::load_or_create_from(storage.as_ref()).await;
+
+        // The console, when one is pointed at. It is built here rather than
+        // where the configuration is read, because a console without a
+        // listener has nowhere to be served from.
+        let console = match admin_config
+            .as_ref()
+            .and_then(|admin| admin.console_dir.as_ref())
+        {
+            Some(dir) => {
+                let dir = std::path::PathBuf::from(dir);
+                if !dir.is_dir() {
+                    // Said rather than refused: a console that is pointed at a
+                    // directory that is not there is a deployment mistake, and
+                    // the rest of the instance is fine.
+                    tracing::warn!(
+                        "[admin] console_dir = {} is not a directory, so no console is served",
+                        dir.display()
+                    );
+                    None
+                } else {
+                    tracing::info!("Serving the console from {}", dir.display());
+                    Some(admin::Console {
+                        dir,
+                        storage: storage.clone(),
+                    })
+                }
+            }
+            None => None,
+        };
+
         let state = Arc::new(admin::AdminState::new(
             config.clone(),
             in_flight.clone(),
@@ -545,6 +575,7 @@ pub async fn run_proxy(
             auth_state.clone(),
             metrics_config.enabled,
             token,
+            console,
         ));
         let shutdown_signal_clone = shutdown_signal.clone();
 

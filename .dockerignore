@@ -8,6 +8,10 @@ certs/
 examples/
 ui-android/
 ui-desktop/
+# The console is not baked into the image: it is built on the operator's
+# machine and mounted at /app/console, which `[admin] console_dir` points at.
+# Its node_modules would be tens of megabytes of build context for nothing.
+ui-web/
 logs/
 *.md
 

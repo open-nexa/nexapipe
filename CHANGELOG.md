@@ -37,6 +37,30 @@ says they are to be answered; and take the delay out of the path a phone's
 traffic takes. Every configuration key that shipped in 1.0.0 keeps its name
 and its meaning.
 
+## [Unreleased]
+
+### Added
+
+- **A browser console.** `ui-web/` is a Vue 3 and TypeScript application — the
+  same shape as the desktop app — that the instance serves from its own
+  loopback listener. Point `[admin] console_dir` at a built copy and the
+  listener serves the page at `/` and answers its API at `/api/*`: what the
+  instance is doing, the route table, the clients and the devices under them,
+  the peers connected right now, and the health of the backends. It can issue
+  a client's credential and drop one.
+  Absent `console_dir`, the listener serves no page and no `/api/*` and is
+  exactly what it was before.
+  A request to the console's API is answered only when it was **addressed to a
+  loopback host** (the DNS-rebinding guard), **carries the admin token** (the
+  same one `nexapipe status` uses), and — for a write — **carries
+  `X-NexaPipe-Admin: 1`**. The listener sends no cross-origin allowance, and a
+  browser will not let a page on another origin add a custom header without
+  asking the server first, so a write is unreachable from one.
+  The token is asked for once and kept in the browser's local storage. The
+  instance never puts it in the page it serves: the token file's permissions
+  are what keep another user on a shared machine out, and a token in the page
+  would hand it to anyone who can fetch the page.
+
 ## [1.2.0] — 2026-11-05
 
 A minor release. Nothing on the wire changes: the handshake, the ALPN and the
