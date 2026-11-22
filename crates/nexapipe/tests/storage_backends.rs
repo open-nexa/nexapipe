@@ -666,7 +666,11 @@ async fn a_route_dropped_from_a_store_is_gone() {
         .write_route(&route(), None)
         .await
         .expect("the route is written");
-    let dropped = store.remove_route(0).await.expect("the route is dropped");
+    let id = nexapipe::storage::route_id(&route());
+    let dropped = store
+        .remove_route(id.clone())
+        .await
+        .expect("the route is dropped");
     assert!(dropped, "there was a route to drop");
 
     let config = configuration(&store).await;
@@ -679,7 +683,7 @@ async fn a_route_dropped_from_a_store_is_gone() {
     );
 
     // A route that is not there is an answer, not a failure.
-    let again = store.remove_route(0).await.expect("the store answers");
+    let again = store.remove_route(id).await.expect("the store answers");
     assert!(!again, "there was no route to drop the second time");
 }
 
@@ -708,7 +712,10 @@ async fn two_routes_on_one_host_are_dropped_one_at_a_time() {
         .await
         .expect("the route is written");
 
-    let dropped = store.remove_route(0).await.expect("the route is dropped");
+    let dropped = store
+        .remove_route(nexapipe::storage::route_id(&api))
+        .await
+        .expect("the route is dropped");
     assert!(dropped, "there was a route to drop");
 
     let config = configuration(&store).await;
@@ -770,7 +777,7 @@ async fn routes_sharing_host_and_path_are_addressed_by_id() {
     )
     .expect("the route parses");
     store
-        .write_route(&edited, Some(1))
+        .write_route(&edited, Some(nexapipe::storage::route_id(&passthrough)))
         .await
         .expect("the route is edited");
     let routes = configuration(&store).await.routes.unwrap_or_default();
@@ -784,8 +791,12 @@ async fn routes_sharing_host_and_path_are_addressed_by_id() {
         "the passthrough route is the one that changed: {routes:?}"
     );
 
-    // Removing by id is just as precise.
-    let dropped = store.remove_route(1).await.expect("the route is dropped");
+    // Removing by id is just as precise. The edit gave the row a new
+    // identity, so the id the console now reads is the edited one.
+    let dropped = store
+        .remove_route(nexapipe::storage::route_id(&edited))
+        .await
+        .expect("the route is dropped");
     assert!(dropped, "there was a route at that id");
     let routes = configuration(&store).await.routes.unwrap_or_default();
     assert_eq!(routes.len(), 1, "only the named row went: {routes:?}");
@@ -815,14 +826,29 @@ backends = [\"http://127.0.0.1:9090\"] # until we move it
     );
     let store = store(&dir);
 
+    let original: RouteSpec = toml::from_str(
+        "host_pattern = \"console.example\"\npath_pattern = \"/api\"\nbackends = [\"http://127.0.0.1:9090\"]\n",
+    )
+    .expect("the route parses");
     let edited: RouteSpec = toml::from_str(
         "host_pattern = \"console.example\"\npath_pattern = \"/api\"\nbackends = [\"http://127.0.0.1:9091\"]\n",
     )
     .expect("the route parses");
     store
-        .write_route(&edited, None)
+        .write_route(&edited, Some(nexapipe::storage::route_id(&original)))
         .await
         .expect("the route is written");
+
+    let routes = configuration(&store).await.routes.unwrap_or_default();
+    assert_eq!(
+        routes.len(),
+        1,
+        "the row was replaced, not appended: {routes:?}"
+    );
+    assert_eq!(
+        routes[0].backends[0], "http://127.0.0.1:9091",
+        "and it is the edited one: {routes:?}"
+    );
 
     let file = std::fs::read_to_string(dir.path().join("config.toml")).expect("the file is read");
     assert!(
@@ -940,5 +966,87 @@ async fn a_rejected_route_write_changes_nothing() {
         std::fs::read_to_string(&path).expect("the file is read"),
         text,
         "the file is unchanged"
+    );
+}
+
+/// A stale id cannot name a different route: a console that read the list
+/// before another row went away still removes the row it selected.
+#[tokio::test]
+async fn a_stale_id_cannot_remove_or_replace_a_different_route() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    seed(&dir);
+    let store = store(&dir);
+
+    let a: RouteSpec =
+        toml::from_str("host_pattern = \"a.example\"\nbackends = [\"http://127.0.0.1:8001\"]\n")
+            .expect("the route parses");
+    let b: RouteSpec =
+        toml::from_str("host_pattern = \"b.example\"\nbackends = [\"http://127.0.0.1:8002\"]\n")
+            .expect("the route parses");
+    let c: RouteSpec =
+        toml::from_str("host_pattern = \"c.example\"\nbackends = [\"http://127.0.0.1:8003\"]\n")
+            .expect("the route parses");
+    for route in [&a, &b, &c] {
+        store
+            .write_route(route, None)
+            .await
+            .expect("the route is written");
+    }
+
+    let id_a = nexapipe::storage::route_id(&a);
+    let id_b = nexapipe::storage::route_id(&b);
+    let id_c = nexapipe::storage::route_id(&c);
+    assert_ne!(id_a, id_b, "each row has its own id");
+    assert_ne!(id_b, id_c, "each row has its own id");
+
+    // A goes away first. A console that listed [A, B, C] still holds B's id.
+    assert!(
+        store
+            .remove_route(id_a)
+            .await
+            .expect("the first route is dropped"),
+        "A was there"
+    );
+    assert!(
+        store
+            .remove_route(id_b.clone())
+            .await
+            .expect("the second removal is answered"),
+        "B is the row the stale id still names"
+    );
+
+    let routes = configuration(&store).await.routes.unwrap_or_default();
+    assert_eq!(routes.len(), 1, "only A and B went: {routes:?}");
+    assert_eq!(
+        routes[0].host_pattern, "c.example",
+        "C is untouched: {routes:?}"
+    );
+
+    // The same id in a write is refused too, rather than editing C.
+    let edited: RouteSpec =
+        toml::from_str("host_pattern = \"b.example\"\nbackends = [\"http://127.0.0.1:9999\"]\n")
+            .expect("the route parses");
+    assert!(
+        store.write_route(&edited, Some(id_b)).await.is_err(),
+        "a stale id is refused, not applied to another row"
+    );
+    let routes = configuration(&store).await.routes.unwrap_or_default();
+    assert_eq!(
+        routes.len(),
+        1,
+        "the refused write changed nothing: {routes:?}"
+    );
+    assert_eq!(
+        routes[0].host_pattern, "c.example",
+        "and C is still the only row: {routes:?}"
+    );
+
+    // C's own id still works after both other rows went away.
+    assert!(
+        store
+            .remove_route(id_c)
+            .await
+            .expect("the last removal is answered"),
+        "C is still addressable by the id it was given"
     );
 }

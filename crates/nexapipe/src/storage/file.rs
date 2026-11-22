@@ -470,12 +470,20 @@ impl FileStorage {
                 &route.backends,
             );
 
+            // An id is the fingerprint of the row's identity, not its
+            // position: resolving it against the rows the lock just read is
+            // what keeps a stale id from landing on a different route.
             let index = match replace {
-                Some(id) if id < routes.len() => Some(id),
-                Some(id) => anyhow::bail!(
-                    "{}: there is no route at position {id}; the route was not written",
-                    path.display()
-                ),
+                Some(id) => match routes.iter().position(|table| {
+                    table_route_name(table)
+                        .is_some_and(|name| super::route_id_of_identity(&name) == id)
+                }) {
+                    Some(index) => Some(index),
+                    None => anyhow::bail!(
+                        "{}: there is no route with that id; the route was not written",
+                        path.display()
+                    ),
+                },
                 None => routes
                     .iter()
                     .position(|table| table_route_name(table).as_deref() == Some(name.as_str())),
@@ -500,12 +508,13 @@ impl FileStorage {
         })
     }
 
-    /// Drops the route at `id`.
+    /// Drops the route `id` names.
     ///
-    /// `false` when there is no route at that position: the store answered
-    /// the question rather than failing it, and the file is left untouched.
-    /// The id is the one the route list handed out, so two routes that share
-    /// a host and a path are told apart by the row the console selected.
+    /// `false` when there is no route with that id: the store answered the
+    /// question rather than failing it, and the file is left untouched. The
+    /// id is the stable fingerprint the route list handed out, resolved
+    /// against the rows the lock just read, so it cannot land on a different
+    /// row after the table changed.
     pub fn remove_route(&self, id: RouteId) -> anyhow::Result<bool> {
         let path = self.config_path.clone();
         with_lock(&path, || {
@@ -517,10 +526,12 @@ impl FileStorage {
             let Some(routes) = route_tables(doc.as_table_mut(), &path, false)? else {
                 return Ok(false);
             };
-            if id >= routes.len() {
+            let Some(index) = routes.iter().position(|table| {
+                table_route_name(table).is_some_and(|name| super::route_id_of_identity(&name) == id)
+            }) else {
                 return Ok(false);
-            }
-            routes.remove(id);
+            };
+            routes.remove(index);
 
             write_document(&path, doc)?;
             Ok(true)

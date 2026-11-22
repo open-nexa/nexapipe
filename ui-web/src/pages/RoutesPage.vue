@@ -51,7 +51,7 @@ async function submit(): Promise<void> {
   }
 }
 
-async function remove(id: number, host: string, path: string | null): Promise<void> {
+async function remove(id: string, host: string, path: string | null): Promise<void> {
   if (!window.confirm(t('routes.confirmRemove', { host, path: path ?? '/' }))) return;
   try {
     await removeRoute(id);

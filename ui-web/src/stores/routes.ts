@@ -47,11 +47,13 @@ export async function addRoute(request: RouteRequest): Promise<void> {
 /**
  * Removes the route the list named by `id`.
  *
- * The id is the row's place in the table the console is showing. Two routes
- * may share a host and a path when their modes or backends differ, and the
- * id is what lets the instance remove exactly the row that was selected.
+ * The id is the stable fingerprint the instance handed out, not a position:
+ * it still names the same route after other rows have been added or removed.
+ * Two routes may share a host and a path when their modes or backends differ,
+ * and the id is what lets the instance remove exactly the row that was
+ * selected.
  */
-export async function removeRoute(id: number): Promise<void> {
+export async function removeRoute(id: string): Promise<void> {
   try {
     const answer = await apiWrite<RoutesAnswer>(`${API.routes}/${id}`, 'DELETE');
     routes.value = answer.routes ?? [];

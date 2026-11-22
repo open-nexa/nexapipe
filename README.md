@@ -280,13 +280,23 @@ on the Docker host are reachable. Moving an existing deployment over is one
 command: `mkdir -p config && mv config.toml config/config.toml`.
 
 The **console is mounted, not baked in**. `ui-web/dist` is built on the host
-and mounted read-only at `/app/console`, and one line in
-`config/config.toml` turns it on:
+and mounted read-only at `/app/console`. Add this to `config/config.toml`:
 
 ```toml
 [admin]
 console_dir = "/app/console"
+listen_addr = "127.0.0.1:9090"
 ```
+
+The listener binds only when `[admin] listen_addr` is set; `console_dir`
+alone leaves it closed. **Write the `[admin]` block before the first
+`docker compose up`**: that first start imports `config/config.toml` into
+`/app/config/nexapipe.db`, and after the import the instance reads the
+database, so adding `[admin]` to the TOML later does not turn the console on.
+On a deployment that has already started, stop it, remove
+`config/nexapipe.db` and start it again with the edited `config/config.toml`
+so the file is imported once more — that also discards the runtime counters
+and the admin token the database kept.
 
 Build the console **before** the first `docker compose up`: a `ui-web/dist`
 that does not exist yet is created as an empty directory by the container

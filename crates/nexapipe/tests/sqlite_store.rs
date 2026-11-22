@@ -536,15 +536,16 @@ async fn configuration(store: &SqliteStorage) -> Config {
     Config::from_toml_text(text.expose_secret()).expect("the configuration parses")
 }
 
-/// The id the route list gives the route with this host and path.
-async fn route_id(store: &SqliteStorage, host: &str, path: &str) -> usize {
-    configuration(store)
+/// The stable id the route list gives the route with this host and path.
+async fn route_id(store: &SqliteStorage, host: &str, path: &str) -> String {
+    let spec = configuration(store)
         .await
         .routes
         .unwrap_or_default()
-        .iter()
-        .position(|route| route.host_pattern == host && route.path_pattern == path)
-        .expect("the route is in the store")
+        .into_iter()
+        .find(|route| route.host_pattern == host && route.path_pattern == path)
+        .expect("the route is in the store");
+    nexapipe::storage::route_id(&spec)
 }
 
 /// A route written into the store is in the configuration it hands back, and
@@ -629,7 +630,10 @@ async fn a_route_dropped_from_the_store_is_gone() {
 
     let before = store.stamp().await.expect("the store answers");
     let id = route_id(&store, "console.example", "/api").await;
-    let dropped = store.remove_route(id).await.expect("the route is dropped");
+    let dropped = store
+        .remove_route(id.clone())
+        .await
+        .expect("the route is dropped");
     assert!(dropped, "there was a route to drop");
     let after = store.stamp().await.expect("the store answers");
     assert_ne!(after, before, "the drop moved the revision");
@@ -773,12 +777,8 @@ async fn routes_sharing_host_and_path_are_addressed_by_id() {
         "CONFIG holds two, and the two new ones are distinct rows: {routes:?}"
     );
 
-    let passthrough_id = routes
-        .iter()
-        .position(|route| route.mode.as_deref() == Some("passthrough"))
-        .expect("the passthrough row is there");
     let dropped = store
-        .remove_route(passthrough_id)
+        .remove_route(nexapipe::storage::route_id(&passthrough))
         .await
         .expect("the route is dropped");
     assert!(dropped, "there was a route at that id");
@@ -790,5 +790,102 @@ async fn routes_sharing_host_and_path_are_addressed_by_id() {
             .iter()
             .any(|route| route.host_pattern == "app.example" && route.mode.is_none()),
         "the HTTP row is still there: {routes:?}"
+    );
+}
+
+/// A stale id cannot name a different row in the database either: the id is
+/// resolved against the rows the transaction just read, not a position.
+#[tokio::test]
+async fn a_stale_id_cannot_remove_or_replace_a_different_route() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (store, _) = store(&dir).await;
+    store
+        .put_config(&Config::from_toml_text(CONFIG).expect("the configuration parses"))
+        .await
+        .expect("the configuration is written");
+
+    let a: RouteSpec =
+        toml::from_str("host_pattern = \"a.example\"\nbackends = [\"http://127.0.0.1:8001\"]\n")
+            .expect("the route parses");
+    let b: RouteSpec =
+        toml::from_str("host_pattern = \"b.example\"\nbackends = [\"http://127.0.0.1:8002\"]\n")
+            .expect("the route parses");
+    let c: RouteSpec =
+        toml::from_str("host_pattern = \"c.example\"\nbackends = [\"http://127.0.0.1:8003\"]\n")
+            .expect("the route parses");
+    for route in [&a, &b, &c] {
+        store
+            .write_route(route, None)
+            .await
+            .expect("the route is written");
+    }
+
+    let id_a = nexapipe::storage::route_id(&a);
+    let id_b = nexapipe::storage::route_id(&b);
+    let id_c = nexapipe::storage::route_id(&c);
+
+    // CONFIG holds two routes. A and B go away, and the stale id for B must
+    // not take one of the others with it.
+    assert!(
+        store
+            .remove_route(id_a)
+            .await
+            .expect("the first route is dropped"),
+        "A was there"
+    );
+    assert!(
+        store
+            .remove_route(id_b.clone())
+            .await
+            .expect("the second removal is answered"),
+        "B is the row the stale id still names"
+    );
+
+    let routes = configuration(&store).await.routes.unwrap_or_default();
+    assert_eq!(routes.len(), 3, "only A and B went: {routes:?}");
+    assert!(
+        routes.iter().any(|route| route.host_pattern == "c.example"),
+        "C is untouched: {routes:?}"
+    );
+    assert!(
+        !routes
+            .iter()
+            .any(|route| route.host_pattern == "a.example" || route.host_pattern == "b.example"),
+        "A and B are gone: {routes:?}"
+    );
+    assert!(
+        routes
+            .iter()
+            .any(|route| route.host_pattern == "example.com"),
+        "the CONFIG rows are untouched: {routes:?}"
+    );
+
+    // The same id in a write is refused rather than editing another row.
+    let edited: RouteSpec =
+        toml::from_str("host_pattern = \"b.example\"\nbackends = [\"http://127.0.0.1:9999\"]\n")
+            .expect("the route parses");
+    assert!(
+        store.write_route(&edited, Some(id_b)).await.is_err(),
+        "a stale id is refused, not applied to another row"
+    );
+    let routes = configuration(&store).await.routes.unwrap_or_default();
+    assert_eq!(
+        routes.len(),
+        3,
+        "the refused write changed nothing: {routes:?}"
+    );
+    assert!(
+        !routes
+            .iter()
+            .any(|route| route.backends[0].contains("9999")),
+        "no row was silently edited: {routes:?}"
+    );
+
+    assert!(
+        store
+            .remove_route(id_c)
+            .await
+            .expect("the last removal is answered"),
+        "C is still addressable by the id it was given"
     );
 }

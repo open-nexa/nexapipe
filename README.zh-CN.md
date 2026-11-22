@@ -244,12 +244,20 @@ logs 卷。`secrets/` 挂载配合 `NEXAPIPE_IROH_SECRET_KEY_FILE=/app/secrets/i
 `mkdir -p config && mv config.toml config/config.toml`。
 
 **控制台是挂载进去的，不是烤进镜像的。** `ui-web/dist` 在宿主机上构建，然后只读挂载
-到 `/app/console`；在 `config/config.toml` 里加一行就能打开它：
+到 `/app/console`；把下面这段写进 `config/config.toml`：
 
 ```toml
 [admin]
 console_dir = "/app/console"
+listen_addr = "127.0.0.1:9090"
 ```
+
+只有设置了 `[admin] listen_addr`，监听器才会绑定；只写 `console_dir` 不会打开它。
+**`[admin]` 必须在第一次 `docker compose up` 之前写好**：首次启动会把
+`config/config.toml` 导入 `/app/config/nexapipe.db`，此后实例读取的是数据库，所以之后
+往 TOML 里补 `[admin]` 不会打开控制台。已经启动过的部署需要先停止，删除
+`config/nexapipe.db`，再用改好的 `config/config.toml` 重新启动，让文件被重新导入 ——
+这同时会清掉数据库里保存的运行时计数和 admin token。
 
 请在**第一次** `docker compose up` **之前**构建控制台：还不存在的 `ui-web/dist` 会被
 容器运行时建成一个空目录，之后的构建就会因为属主而失败。控制台由 admin 监听器提供，

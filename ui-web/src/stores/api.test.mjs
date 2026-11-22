@@ -137,10 +137,10 @@ test('a route the console removes is named by the id the list gave it', async ()
   consoleWithToken();
   answer = { status: 200, body: '{"routes":[]}' };
 
-  await removeRoute(3);
+  await removeRoute('a1b2c3d4e5f60718');
 
   assert.equal(requests.length, 1);
   assert.equal(requests[0].method, 'DELETE');
-  assert.equal(requests[0].path, '/api/routes/3');
+  assert.equal(requests[0].path, '/api/routes/a1b2c3d4e5f60718');
   assert.equal(requests[0].headers.get(WRITE_HEADER), '1');
 });

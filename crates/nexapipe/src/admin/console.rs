@@ -320,7 +320,9 @@ async fn add_route(
         }
     };
 
-    let replace = request.replace;
+    // `replace` is a String now, so it cannot be moved out before
+    // `into_spec` consumes the rest of the request.
+    let replace = request.replace.clone();
     let spec = match request.into_spec() {
         Ok(spec) => spec,
         Err(why) => return text(StatusCode::BAD_REQUEST, &safe_reason(&why)),
@@ -341,8 +343,10 @@ async fn add_route(
     json(&routes_json(&state.routes).await)
 }
 
-/// Removes the route at the id the list gave it, and answers with the table.
+/// Removes the route the id names, and answers with the table.
 ///
+/// The id is the stable fingerprint the list gave the row, not a position:
+/// an id read before the table changed cannot land on a different route.
 /// A route that is not there is a question the store answered, not a failure:
 /// the answer says there was no such route, and the table is the one the
 /// instance is serving.
@@ -351,11 +355,12 @@ async fn remove_route(
     state: Arc<AdminState>,
     storage: &Arc<dyn Storage>,
 ) -> Response<Body> {
-    let Ok(id) = id.trim().parse::<RouteId>() else {
+    let id = id.trim();
+    if id.is_empty() {
         return text(StatusCode::BAD_REQUEST, "a route id is required");
-    };
+    }
 
-    match storage.remove_route(id).await {
+    match storage.remove_route(id.to_string()).await {
         Ok(true) => json(&routes_json(&state.routes).await),
         Ok(false) => text(StatusCode::NOT_FOUND, "there is no route with that id"),
         Err(e) => text(StatusCode::CONFLICT, &safe_reason(&e)),
@@ -381,10 +386,10 @@ struct RouteWrite {
     /// The modes the route serves. Absent is the one the schema picks.
     #[serde(default)]
     modes: Option<Vec<String>>,
-    /// The row this write replaces, when it is an edit of a route the list
-    /// already shows. Absent, the store finds a route with the same name or
-    /// appends a new one — an add cannot silently overwrite a second route
-    /// that happens to share the host and the path.
+    /// The stable id of the row this write replaces, when it is an edit of a
+    /// route the list already shows. Absent, the store finds a route with the
+    /// same identity or appends a new one — an add cannot silently overwrite
+    /// a second route that happens to share the host and the path.
     #[serde(default)]
     replace: Option<RouteId>,
 }

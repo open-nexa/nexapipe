@@ -13,6 +13,12 @@ use super::*;
 /// between `://` and the next `@` is replaced, without needing the URL to
 /// parse: an address that fails to parse is exactly the one most likely to
 /// be quoted in an error.
+///
+/// A malformed address can put that `@` past the end of the authority — a
+/// password with a space in it, `ftp://alice:sec ret@example.test`, splits
+/// the userinfo in two. When the `@` cannot be isolated, the whole backend is
+/// omitted rather than risk printing half of the password: an error that
+/// names no address is safer than one that names a secret.
 pub fn redact_credentials(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
@@ -30,6 +36,13 @@ pub fn redact_credentials(text: &str) -> String {
             out.push_str("***@");
             out.push_str(&text[scheme_end + at + 1..authority_end]);
             cursor = authority_end;
+        } else if let Some(skipped) = split_userinfo_len(&text[authority_end..]) {
+            // No `@` in the authority, but the next token carries one: the
+            // userinfo was cut in two by whitespace. Nothing between `://`
+            // and the end of that token can be shown safely.
+            out.push_str(&text[cursor..scheme_end]);
+            out.push_str("[redacted]");
+            cursor = authority_end + skipped;
         } else {
             out.push_str(&text[cursor..scheme_end]);
             cursor = scheme_end;
@@ -37,6 +50,22 @@ pub fn redact_credentials(text: &str) -> String {
     }
     out.push_str(&text[cursor..]);
     out
+}
+
+/// How much of the text after a credential-free authority is unsafe to show.
+///
+/// `Some` when the next token carries an `@`: the address was written with a
+/// space inside its password, so the credentials cannot be isolated. The
+/// number is how much of the input the caller has to omit.
+fn split_userinfo_len(text: &str) -> Option<usize> {
+    let trimmed = text.trim_start_matches(|c: char| c.is_whitespace() || c == '"');
+    let leading = text.len() - trimmed.len();
+    let token_len = trimmed
+        .find(|c: char| c.is_whitespace() || c == '"')
+        .unwrap_or(trimmed.len());
+    trimmed[..token_len]
+        .contains('@')
+        .then_some(leading + token_len)
 }
 
 /// Reads the `strategy` key.
@@ -296,5 +325,25 @@ mod tests {
             "http://127.0.0.1:8080",
             "an address with no credentials is unchanged"
         );
+    }
+
+    #[test]
+    fn a_malformed_credential_is_omitted_entirely() {
+        // A space inside the password puts the `@` past the end of the
+        // authority. Neither half can be shown on its own.
+        let shown = redact_credentials("ftp://alice:sec ret@example.test:invalid");
+        assert!(
+            !shown.contains("sec"),
+            "the first half of the password is not in the reason: {shown}"
+        );
+        assert!(!shown.contains("ret@"), "nor the second half: {shown}");
+        assert!(
+            shown.contains("[redacted]"),
+            "the backend is omitted instead: {shown}"
+        );
+
+        // The conservative fallback is itself safe to run a second time,
+        // which is what the console's API-side guard does.
+        assert_eq!(redact_credentials(&shown), shown);
     }
 }

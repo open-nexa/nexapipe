@@ -84,10 +84,12 @@ and its meaning.
   beside the configuration, or the configuration file itself — one route at a
   time, so a running instance picks it up on its next reload and the other
   routes and the comments around their own tables are left alone. Each row
-  of the route list carries an id, and a write or a removal names that id, so
-  two routes sharing a host and a path but differing in modes or backends
-  stay independently addressable. The table being changed keeps its own
-  header and inline comments, but a removal takes that table with it.
+  of the route list carries a stable id — the fingerprint of its host, path,
+  modes and backends — and a write or a removal names that id, so two routes
+  sharing a host and a path but differing in modes or backends stay
+  independently addressable, and an id read before another route was removed
+  still names the same one. The table being changed keeps its own header and
+  inline comments, but a removal takes that table with it.
   Absent `console_dir`, the listener serves no page and no `/api/*` and is
   exactly what it was before.
   The container image does not carry the console: it is a directory the

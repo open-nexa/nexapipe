@@ -509,12 +509,20 @@ mod console {
             reply.body
         );
 
-        // The route list hands out an id with each row; the one just written
-        // is the first and only row in this store.
+        // The id is the fingerprint of the row the store just wrote, not its
+        // position: read it back from the same store the removal will use.
+        let written = stored(&config).await;
+        let spec = written
+            .routes
+            .unwrap_or_default()
+            .into_iter()
+            .find(|route| route.host_pattern == "console.example")
+            .expect("the route the console wrote is in the store");
+        let id = nexapipe::storage::route_id(&spec);
         let reply = ask(
             &admin,
             "DELETE",
-            "/api/routes/0",
+            &format!("/api/routes/{id}"),
             Some(TOKEN),
             "localhost",
             true,
@@ -641,6 +649,26 @@ mod console {
         assert!(
             reply.body.contains("***@"),
             "the reason still names the backend it refused: {}",
+            reply.body
+        );
+
+        // A space in the password puts the `@` past the authority. The
+        // conservative fallback omits the backend rather than print either
+        // half of the password.
+        let reply = ask(
+            &admin,
+            "POST",
+            "/api/routes",
+            Some(TOKEN),
+            "localhost",
+            true,
+            r#"{"host_pattern":"console.example","backends":["ftp://alice:s3cr3t p4ss@example.test:invalid"]}"#,
+        )
+        .await;
+        assert_eq!(reply.status, 400, "the backend was refused: {}", reply.body);
+        assert!(
+            !reply.body.contains("s3cr3t") && !reply.body.contains("p4ss"),
+            "neither half of the password is in the reason: {}",
             reply.body
         );
 
@@ -946,9 +974,13 @@ async fn routes_are_listed_with_their_modes_and_backends() {
     let body: serde_json::Value = serde_json::from_str(&reply.body).expect("valid JSON");
     let routes = body["routes"].as_array().expect("a routes array");
     assert_eq!(routes.len(), 1, "{body}");
-    assert_eq!(
-        routes[0]["id"], 0,
-        "each row names the id a write addresses: {body}"
+    let id = routes[0]["id"]
+        .as_str()
+        .expect("the id is a fingerprint, not a position");
+    assert_eq!(id.len(), 32, "the id is a digest: {body}");
+    assert!(
+        id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "the id is hex: {body}"
     );
     assert_eq!(routes[0]["host_pattern"], "app.test");
     assert_eq!(routes[0]["modes"][0], "http");

@@ -324,11 +324,20 @@ impl SqliteStorage {
             &route.modes,
             &route.backends,
         );
+        // Resolve the id against the rows this transaction read: it is the
+        // fingerprint of a row's identity, not a position, so an id from an
+        // older list cannot quietly name a different route.
         let index = match replace {
-            Some(id) if id < rows.len() => Some(id),
-            Some(id) => {
-                anyhow::bail!("there is no route at position {id}; the route was not written")
-            }
+            Some(id) => match rows.iter().position(|(_, json)| {
+                serde_json::from_str::<RouteSpec>(json)
+                    .ok()
+                    .is_some_and(|route| crate::storage::route_id(&route) == id)
+            }) {
+                Some(index) => Some(index),
+                None => {
+                    anyhow::bail!("there is no route with that id; the route was not written")
+                }
+            },
             None => rows.iter().position(|(_, json)| route_is(json, &name)),
         };
 
@@ -361,12 +370,13 @@ impl SqliteStorage {
         Ok(())
     }
 
-    /// Drops the route at `id`, and says whether there was one to drop.
+    /// Drops the route `id` names, and says whether there was one to drop.
     ///
-    /// The id is a position in the ordered rows, the one `GET /api/routes`
-    /// answered with. Deleting by host and path alone cannot address two
-    /// routes that share both. The revision moves with the write, so the
-    /// watcher reloads the configuration the route was dropped from.
+    /// The id is the stable fingerprint `GET /api/routes` answered with,
+    /// resolved against the rows this transaction read — so a stale id cannot
+    /// land on a different row. Deleting by host and path alone cannot
+    /// address two routes that share both. The revision moves with the write,
+    /// so the watcher reloads the configuration the route was dropped from.
     async fn remove_route(&self, id: RouteId) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
 
@@ -375,13 +385,21 @@ impl SqliteStorage {
                 .fetch_all(&mut *tx)
                 .await?;
 
-        let Some((ordinal, _)) = rows.get(id) else {
+        let Some(ordinal) = rows
+            .iter()
+            .find(|(_, json)| {
+                serde_json::from_str::<RouteSpec>(json)
+                    .ok()
+                    .is_some_and(|route| crate::storage::route_id(&route) == id)
+            })
+            .map(|(ordinal, _)| *ordinal)
+        else {
             tx.rollback().await?;
             return Ok(false);
         };
 
         sqlx::query("DELETE FROM routes WHERE ordinal = ?")
-            .bind(*ordinal)
+            .bind(ordinal)
             .execute(&mut *tx)
             .await?;
         Self::bump(&mut tx).await?;

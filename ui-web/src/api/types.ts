@@ -51,11 +51,13 @@ export interface RouteBackend {
 /** One route, as the instance is serving it right now. */
 export interface Route {
   /**
-   * The id a write or a removal names this row by. The instance answers
-   * with it, and the console hands it back unchanged: two routes may share
-   * a host and a path, and the id is what keeps them apart.
+   * The stable id a write or a removal names this row by: the fingerprint of
+   * this row's identity. The instance answers with it, and the console hands
+   * it back unchanged: two routes may share a host and a path, and the id is
+   * what keeps them apart. It is not a position, so other rows changing does
+   * not change it.
    */
-  id: number;
+  id: string;
   host_pattern: string;
   path_pattern: string | null;
   modes: string[];
@@ -147,7 +149,7 @@ export interface RouteRequest {
   path_pattern?: string | null;
   backends?: string[];
   modes?: string[];
-  /** The id of the row this write replaces, when it is an edit of one the
-   * route list already shows. Absent means an add. */
-  replace?: number | null;
+  /** The stable id of the row this write replaces, when it is an edit of one
+   * the route list already shows. Absent means an add. */
+  replace?: string | null;
 }
