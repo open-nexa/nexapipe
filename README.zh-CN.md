@@ -215,6 +215,7 @@ cargo run -p nexapipe -- secret
 mkdir -p config secrets logs
 cp config.toml.example config/config.toml   # config.toml 已被 gitignore
 sudo chown -R 1000:1000 config secrets logs # 镜像以 uid 1000 运行
+cd ui-web && npm ci && npm run build && cd ..  # 控制台落在 ui-web/dist
 docker compose up -d --build
 # 示例出厂即开启 2FA，所以在 enrolled 一个客户端之前没有任何连接能进来。
 # 这一条会打印可扫描的邀请链接。
@@ -242,8 +243,31 @@ logs 卷。`secrets/` 挂载配合 `NEXAPIPE_IROH_SECRET_KEY_FILE=/app/secrets/i
 已配置好，因此运行在 Docker 宿主机上的后端可以被访问到。已有部署迁移过来只需一条：
 `mkdir -p config && mv config.toml config/config.toml`。
 
+**控制台是挂载进去的，不是烤进镜像的。** `ui-web/dist` 在宿主机上构建，然后只读挂载
+到 `/app/console`；把下面这段写进 `config/config.toml`：
+
+```toml
+[admin]
+console_dir = "/app/console"
+listen_addr = "127.0.0.1:9090"
+```
+
+只有设置了 `[admin] listen_addr`，监听器才会绑定；只写 `console_dir` 不会打开它。
+**`[admin]` 必须在第一次 `docker compose up` 之前写好**：首次启动会把
+`config/config.toml` 导入 `/app/config/nexapipe.db`，此后实例读取的是数据库，所以之后
+往 TOML 里补 `[admin]` 不会打开控制台。已经启动过的部署需要先停止，删除
+`config/nexapipe.db`，再用改好的 `config/config.toml` 重新启动，让文件被重新导入 ——
+这同时会清掉数据库里保存的运行时计数和 admin token。
+
+请在**第一次** `docker compose up` **之前**构建控制台：还不存在的 `ui-web/dist` 会被
+容器运行时建成一个空目录，之后的构建就会因为属主而失败。控制台由 admin 监听器提供，
+而它绑定的是**容器自己的 loopback** —— 因此要从容器内部访问
+（`docker compose exec nexapipe wget -qO- http://127.0.0.1:9090/`），发布端口是到不了
+它的（发布端口指向的是容器的外部）。要在宿主机的浏览器里打开它，需要把容器的
+loopback 转发出来。
+
 镜像以 **uid 1000 运行，不是 root** —— 这个代理不需要特权，而一个从公网可达、
-手里握着 2FA 种子和端点身份的服务器不该是 root。上面挂载的三个目录因此必须对该
+手里握着 2FA 种子和端点身份的服务器不该是 root。上面挂载的三个可写目录因此必须对该
 uid 可写，这正是上面那条 `chown` 的作用：`mkdir` 建出的目录属于执行它的用户，恰好是
 uid 1000 只是巧合。**从旧的 root 镜像升级**也要在首次启动前执行同一条命令，而且必须
 加 `sudo` —— 旧镜像写下的文件属于 root：
@@ -1041,10 +1065,14 @@ Accepting at most 64 concurrent connections per peer, 4096 across the process, 1
 ```toml
 [admin]
 listen_addr = "127.0.0.1:9090"   # 不写 => 完全不绑定这个监听
+console_dir = "/app/console"     # 不写 => 不提供控制台；见下文
 
 [metrics]
 enabled = true                   # 在该监听上提供 /metrics；默认 false
 ```
+
+示例里的 `/app/console` 是容器内挂载点（见下文 Docker 一节）；直接在本机运行时，
+把 `console_dir` 指向 `ui-web/dist`。
 
 第二个监听，回答的是**本实例自身**的问题，而不转发流量：
 
@@ -1078,6 +1106,34 @@ nexapipe status --config config.toml --json   # 单个 JSON 文档，给脚本�
 `client revoke`，它们在服务端所用的同一把锁下编辑这个接口所读的那份配置。admin
 token 是一个没有作用域、也没有轮换机制的不透明值，不该被赋予写权限——一个只回答
 问题的接口，是没法被说服去改动任何东西的。
+
+#### 浏览器控制台
+
+`console_dir` 指向 `ui-web/` 构建出来的产物，这个监听随后在 `/` 上把它提供出来：
+
+```bash
+cd ui-web && npm ci && npm run build     # 产物落在 ui-web/dist
+```
+
+不在容器里运行时，把 `console_dir` 直接指向 `ui-web/dist`；容器里的 `/app/console`
+是 `docker-compose.yaml` 为这份产物挂上的只读挂载点。
+
+控制台显示这个实例正在做什么，并让你改动可以连接它的客户端，以及它提供的路由。
+它需要与 `nexapipe status` 相同的那把 admin token，而且它发出的每个请求都必须是
+**发给一个 loopback 主机的** —— 它管理的是这台机器上的实例，不是别的机器上的。
+
+控制台增删的路由走的是服务端读的那份存储 —— 配置旁边的数据库，或者配置文件本身 ——
+所以运行中的实例会在下次重载后生效，和手写一条路由被拾起的方式一样。路由列表的
+每一行都带一个 id，写入和删除都按这个 id 指名：两条路由可以有相同的主机和路径，
+只要它们的 modes 或 backends 不同，id 就是把它们区分开的东西。
+
+它一次只写一条路由，因此其它路由以及它们自己表周围的注释都会留在原处。被改动的
+那张表是另一回事：删除会带走整张 `[[routes]]` 表，包括它表头上方的注释；替换会
+保留这张表自己的表头注释和各字段的行内注释。写在别的表头上方、却是在描述这条路由
+的注释不会因此留下 —— 这类注释请写在它所描述的那条路由上方。
+
+不写 `console_dir` 时，这个监听既不提供页面也不提供 `/api/*`，和从前完全一样 ——
+没有东西要关掉，也没有东西要清理。
 
 `[metrics] enabled` 默认是关的，因为它所依附的监听没有认证：必须**同时**开启它
 并绑定地址，才会有东西暴露出来。只开 `enabled` 而没有 `[admin]` 段会记一条警告且

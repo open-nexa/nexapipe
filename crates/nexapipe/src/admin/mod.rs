@@ -342,20 +342,36 @@ pub(super) async fn status_json(state: &Arc<AdminState>) -> serde_json::Value {
 }
 
 /// `GET /v1/routes`: the table as it is now, including what a reload changed.
+///
+/// Each row carries the route id a write or a removal names it by. The id is
+/// the fingerprint of the row's identity, so it survives other rows being
+/// added or removed: a console holding an older list still names the same
+/// route.
 pub(super) async fn routes_json(routes: &Arc<RoutingTable>) -> serde_json::Value {
     let mut out = Vec::new();
 
     for route in routes.routes().await {
-        let modes: Vec<&str> = route.modes().iter().map(|mode| mode.name()).collect();
-        let backends: Vec<serde_json::Value> = route
-            .backend_pool()
-            .get_backend_statuses()
-            .await
-            .into_iter()
+        let served: Vec<String> = route
+            .modes()
+            .iter()
+            .map(|mode| mode.name().to_string())
+            .collect();
+        let modes: Vec<&str> = served.iter().map(String::as_str).collect();
+        let statuses = route.backend_pool().get_backend_statuses().await;
+        let urls: Vec<String> = statuses.iter().map(|(url, _)| url.clone()).collect();
+        let backends: Vec<serde_json::Value> = statuses
+            .iter()
             .map(|(url, healthy)| serde_json::json!({ "url": url, "healthy": healthy }))
             .collect();
+        let id = crate::storage::route_id_of_identity(&crate::storage::route_identity(
+            route.host_pattern(),
+            route.path_pattern(),
+            &served,
+            &urls,
+        ));
 
         out.push(serde_json::json!({
+            "id": id,
             "host_pattern": route.host_pattern(),
             "path_pattern": route.path_pattern(),
             "modes": modes,

@@ -21,14 +21,12 @@ const hostPattern = ref('');
 const pathPattern = ref('');
 const backends = ref('');
 const modes = ref('');
-const priority = ref('');
 
 function reset(): void {
   hostPattern.value = '';
   pathPattern.value = '';
   backends.value = '';
   modes.value = '';
-  priority.value = '';
 }
 
 async function submit(): Promise<void> {
@@ -44,7 +42,6 @@ async function submit(): Promise<void> {
         .split(',')
         .map((entry) => entry.trim())
         .filter(Boolean),
-      priority: priority.value.trim() ? Number(priority.value.trim()) : undefined,
     });
     notice.value = t('routes.added');
     reset();
@@ -54,10 +51,10 @@ async function submit(): Promise<void> {
   }
 }
 
-async function remove(host: string): Promise<void> {
-  if (!window.confirm(t('routes.confirmRemove', { host }))) return;
+async function remove(id: string, host: string, path: string | null): Promise<void> {
+  if (!window.confirm(t('routes.confirmRemove', { host, path: path ?? '/' }))) return;
   try {
-    await removeRoute(host);
+    await removeRoute(id);
     notice.value = t('routes.removed');
   } catch {
     // The store has the reason; the banner shows it.
@@ -92,11 +89,7 @@ async function remove(host: string): Promise<void> {
       </label>
       <label class="field">
         <span class="field__label">{{ t('routes.modesLabel') }}</span>
-        <input v-model="modes" class="field__input" spellcheck="false" placeholder="http, https" />
-      </label>
-      <label class="field">
-        <span class="field__label">{{ t('routes.priorityLabel') }}</span>
-        <input v-model="priority" class="field__input" type="number" />
+        <input v-model="modes" class="field__input" spellcheck="false" placeholder="http, tcp" />
       </label>
       <div class="form__actions">
         <button class="button" type="submit">{{ t('routes.add') }}</button>
@@ -120,7 +113,7 @@ async function remove(host: string): Promise<void> {
         </tr>
       </thead>
       <tbody>
-        <tr v-for="route in routes" :key="route.host_pattern">
+        <tr v-for="route in routes" :key="route.id">
           <td class="mono">{{ route.host_pattern }}</td>
           <td class="mono">{{ route.path_pattern ?? t('common.dash') }}</td>
           <td>{{ route.modes.join(', ') || t('common.dash') }}</td>
@@ -135,7 +128,11 @@ async function remove(host: string): Promise<void> {
             </span>
           </td>
           <td>
-            <button class="button button--danger" type="button" @click="remove(route.host_pattern)">
+            <button
+              class="button button--danger"
+              type="button"
+              @click="remove(route.id, route.host_pattern, route.path_pattern)"
+            >
               {{ t('routes.remove') }}
             </button>
           </td>

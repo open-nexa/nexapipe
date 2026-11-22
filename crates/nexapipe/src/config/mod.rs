@@ -29,12 +29,14 @@ pub use io::{FIRST_RUN_CONFIG, should_warn_about_permissions, warn_about_readabl
 pub use load::{load_config, load_config_with_auth};
 pub use schema::{
     AdminConfig, BackendProtocol, BackendsConfig, CircuitBreaker, CircuitBreakerConfig, Config,
-    CredentialSource, HealthCheckConfig, IrohConfig, LocalProxyConfig, LocalProxyNode,
-    LocalProxyTwoFactorConfig, LogConfig, MetricsConfig, PeersConfig, Retry, RetryConfig,
-    RouteMode, RouteSpec, ServerConfig, Timeouts, TimeoutsConfig, get_backend_protocol,
+    CredentialSource, DEFAULT_PATH_PATTERN, HealthCheckConfig, IrohConfig, LocalProxyConfig,
+    LocalProxyNode, LocalProxyTwoFactorConfig, LogConfig, MetricsConfig, PeersConfig, Retry,
+    RetryConfig, RouteMode, RouteSpec, ServerConfig, Timeouts, TimeoutsConfig,
+    get_backend_protocol, route_path_pattern,
 };
 pub use validate::{
-    get_route_mode, get_route_modes, get_strategy, parse_route_mode, validate_backend,
+    get_route_mode, get_route_modes, get_strategy, parse_route_mode, redact_credentials,
+    validate_backend,
 };
 
 #[cfg(test)]

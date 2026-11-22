@@ -375,8 +375,27 @@ pub struct RouteSpec {
     pub redirect_to_https: Option<bool>,
 }
 
+/// The path a route matches when it does not name one.
+pub const DEFAULT_PATH_PATTERN: &str = "/";
+
 pub(crate) fn default_path_pattern() -> String {
-    "/".to_string()
+    DEFAULT_PATH_PATTERN.to_string()
+}
+
+/// The path a route matches, with the default applied.
+///
+/// A route that does not name a path matches the root, and the two places
+/// that have to agree on which route a name refers to — the store that
+/// compares a route it read with one it is asked about, and the console that
+/// asks — have to compare them the way the schema reads them. Without this,
+/// the same route looks like two: one written with the path spelled out and
+/// one written without it.
+pub fn route_path_pattern(path_pattern: &str) -> &str {
+    if path_pattern.is_empty() {
+        DEFAULT_PATH_PATTERN
+    } else {
+        path_pattern
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

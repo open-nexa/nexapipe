@@ -93,6 +93,8 @@ The five reads the instance already answers, and the two writes:
 
 The clients are already entities in the `Storage` trait: `write_client_secret`, `write_device_credential`, `remove_client`, `remove_device`. The routes are not — the trait has no way to write one — so it grows `write_route` and `remove_route`.
 
+**A route is addressed by the id the route list gives it.** The schema permits two entries with the same host and path when their modes or backends differ, so a name made of host and path alone cannot say which one a removal or an edit means. `GET /api/routes` puts an id on each row: the SHA-256 fingerprint of the row's identity — host, path, served modes and backends, folded the way the configuration reader folds them — not its position in the list. Removing a route leaves every other id unchanged, so an id a console read before somebody else edited the table still names the same route. Both stores resolve it inside the same lock or transaction as the mutation, and an id that no longer matches any row is refused rather than applied to a different one. The id is a digest, so backend URLs — which may carry credentials — never reach a request path or a log line.
+
 **Why through the seam:** the server reads the configuration through the seam, so a change the console makes has to be a change the seam can see. A write that went around the trait would be a write the server's watcher does not know about, and the console would show a change the instance has not made.
 
 **Why the trait grows rather than the console rewriting the configuration:** a write that re-rendered the whole configuration would take a route somebody added while the server was running with it — the reason the SQLite store writes by entity in the first place.
@@ -101,7 +103,9 @@ The clients are already entities in the `Storage` trait: `write_client_secret`, 
 
 ### The bundle ships beside the binary
 
-The container image copies `ui-web/dist` into the image and the configuration points `[admin] console_dir` at it. The release scripts do the same for the packages they build.
+The bundle is a directory of files, and it is **mounted** rather than copied into the image: `ui-web/dist` is built on the host, mounted read-only at `/app/console`, and the configuration points `[admin] console_dir` at it.
+
+**Why mounted and not copied in:** the image would otherwise carry a node toolchain to build a bundle that changes with every commit, and the build context would carry the console's `node_modules` — tens of megabytes the image has no use for. Mounted, the image is the same image whether or not a console is wanted, the bundle is rebuilt with `npm run build` rather than with the release, and a deployment that does not configure `console_dir` serves no console.
 
 **Why not embed:** see above — an npm build inside every cargo build.
 
@@ -110,6 +114,6 @@ The container image copies `ui-web/dist` into the image and the configuration po
 - **The token sits in the browser's local storage.** → Any script running on the console's origin could read it. The console serves nothing but itself, loads nothing from another origin, and is sent a content security policy that says so; the loopback listener is the only origin it has.
 - **A write from another local process is possible with the token.** → The token is the same authority `nexapipe status` already has, and the token file's permissions are the perimeter, exactly as they are today. A process that cannot read the token file cannot write.
 - **The console and the command line can write at the same time.** → The stores already take a lock per write and move a revision with it; the console's writes go through the same methods the command line uses, so they serialize the same way.
-- **The bundle has to be built and shipped.** → A build step in the image and in the release scripts, and a configuration key that points at the result. A deployment that does not configure `console_dir` serves no console, and nothing else changes.
+- **The bundle has to be built and shipped.** → A build step on the host and a mount into the container, and a configuration key that points at the result. A deployment that does not configure `console_dir` serves no console, and nothing else changes.
 - **The console can only manage an instance on this machine.** → That is the listener's own rule, and the design keeps it rather than widening it.
 - **The routes a console writes have to survive the configuration model.** → The console writes the same route type the configuration file holds, so a route written in the console and a route written in the file are the same thing.

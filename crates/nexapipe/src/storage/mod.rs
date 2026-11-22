@@ -63,7 +63,7 @@ pub use file::FileStorage;
 pub use open::{choose, import_legacy_config, open};
 
 use crate::auth::state::RuntimeState;
-use crate::config::{ClientSecretWrite, Config};
+use crate::config::{ClientSecretWrite, Config, RouteSpec};
 
 use futures_util::future::BoxFuture;
 
@@ -71,6 +71,97 @@ use nexapipe_proto::secret::SecretString;
 
 use std::path::Path;
 use std::time::SystemTime;
+
+/// A route's stable id, as `GET /api/routes` hands it out.
+///
+/// It is the fingerprint of the route's identity — its host and path
+/// patterns, the modes it serves and the backends it points at — not its
+/// place in a list. Removing a route does not change any other route's id,
+/// so an id a console read before somebody else changed the table still names
+/// the same route. It is a digest, so an id never carries the backend URLs,
+/// which may hold credentials, into a request path or a log line.
+pub type RouteId = String;
+
+/// The identity both stores and the console agree a route has.
+///
+/// A route is **not** named by its host pattern and path pattern alone. The
+/// schema lets two entries share both when their modes or their backends
+/// differ — an HTTP route and a passthrough route on `app.example` and `/`,
+/// say — and a store that called those one route would replace or drop the
+/// first match whenever the console asked for the second one.
+///
+/// Every operand is folded the way the configuration reader folds it: the
+/// host by `normalize_pattern`, the path with its default applied, the modes
+/// as the set the server will actually serve, and the backends as a set
+/// because their order is not part of what a route is.
+pub(crate) fn route_identity(
+    host_pattern: &str,
+    path_pattern: &str,
+    served_modes: &[String],
+    backends: &[String],
+) -> String {
+    let host = crate::routes::normalize_pattern(host_pattern);
+    let path = crate::config::route_path_pattern(path_pattern);
+
+    let mut served = served_modes.to_vec();
+    served.sort_unstable();
+    served.dedup();
+
+    let mut backends = backends.to_vec();
+    backends.sort_unstable();
+
+    format!(
+        "{host}\0{path}\0{}\0{}",
+        served.join(","),
+        backends.join("\0")
+    )
+}
+
+/// The identity a `RouteSpec` — a route as the configuration spells it — has.
+pub(crate) fn route_name(
+    host_pattern: &str,
+    path_pattern: &str,
+    mode: &Option<String>,
+    modes: &Option<Vec<String>>,
+    backends: &[String],
+) -> String {
+    let served: Vec<String> = match crate::config::get_route_modes(mode, modes) {
+        Ok(resolved) => resolved
+            .iter()
+            .map(|mode| mode.name().to_string())
+            .collect(),
+        // A mode neither side can read is not one it can match. Keep the raw
+        // spellings so the comparison is still well defined, and let the
+        // startup validation be the thing that refuses such a config.
+        Err(_) => mode.iter().chain(modes.iter().flatten()).cloned().collect(),
+    };
+    route_identity(host_pattern, path_pattern, &served, backends)
+}
+
+/// The stable id of an identity, cut to sixteen bytes as the token
+/// fingerprint beside it is.
+pub(crate) fn route_id_of_identity(identity: &str) -> RouteId {
+    use sha2::{Digest, Sha256};
+
+    let digest = Sha256::digest(identity.as_bytes());
+    hex::encode(&digest[..16])
+}
+
+/// The id of a route as the configuration spells it.
+///
+/// A store resolves the id a write or a removal names by computing this for
+/// each row inside its lock or transaction; the console's tests name the row
+/// they just wrote the same way. Both read the same `RouteSpec`, so both get
+/// the id the route list hands out.
+pub fn route_id(route: &RouteSpec) -> RouteId {
+    route_id_of_identity(&route_name(
+        &route.host_pattern,
+        &route.path_pattern,
+        &route.mode,
+        &route.modes,
+        &route.backends,
+    ))
+}
 
 /// What a store is, for the log line that says which one is in use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,6 +494,52 @@ pub trait Storage: Send + Sync + 'static {
     /// Drops a client and every device under it.
     fn remove_client<'a>(&'a self, client_id: &'a str) -> BoxFuture<'a, anyhow::Result<()>>;
 
+    /// Writes one route.
+    ///
+    /// A write by entity, like a client's secret: the backend decides what that
+    /// means in its own terms — an edit of the file for the file backend, an
+    /// update of a row for a database one — and neither of them re-renders the
+    /// whole configuration. So a route somebody added by hand, and the comments
+    /// they wrote beside it, are not taken away by a write of another route.
+    ///
+    /// A route is named by `route_identity`: its host pattern, its path
+    /// pattern, the modes it serves and the backends it points at. Two routes
+    /// may share a host and a path when their modes or backends differ, and a
+    /// store that called those one route would replace or drop the wrong one.
+    ///
+    /// `replace` names the row this write replaces, as the [`RouteId`]
+    /// `GET /api/routes` handed out. The id is a stable fingerprint, so it
+    /// still names that row after other rows have been added or removed; both
+    /// stores resolve it inside the same lock or transaction as the write, so
+    /// a stale id cannot quietly land on a different route. A write that names
+    /// none looks for a route with the same identity and replaces it, or
+    /// appends a new one when there is none — so writing the same route twice
+    /// is one route, while writing a second route on the same host and path
+    /// is two.
+    ///
+    /// The route is written as it is given: a store does not second-guess the
+    /// backends or the modes, because the caller has already had them
+    /// validated by the same code a cold start validates them with.
+    fn write_route<'a>(
+        &'a self,
+        route: &'a RouteSpec,
+        replace: Option<RouteId>,
+    ) -> BoxFuture<'a, anyhow::Result<()>>;
+
+    /// Drops the route `id` names, and says whether there was one to drop.
+    ///
+    /// The id is the stable fingerprint `GET /api/routes` answered with, not
+    /// a position: a stale id cannot land on a different row after the table
+    /// changed. Deleting by host and path alone cannot address two routes
+    /// that share both, and the first match is not necessarily the one the
+    /// console selected.
+    ///
+    /// `false` is an answer, not a failure: a route that is not there is a
+    /// question the caller asked and the store answered. The two backends
+    /// answer it the same way, so the console does not have to know which one
+    /// it is talking to.
+    fn remove_route(&self, id: RouteId) -> BoxFuture<'_, anyhow::Result<bool>>;
+
     /// Writes the endpoint's private key.
     ///
     /// The key is the endpoint's identity: it is written once, on the first
@@ -429,4 +566,40 @@ pub trait Storage: Send + Sync + 'static {
     /// Refuses to replace one that is already there: whoever is using it would
     /// be locked out without being told.
     fn put_admin_token<'a>(&'a self, token: &'a SecretString) -> BoxFuture<'a, anyhow::Result<()>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The console builds an id from a running `Route`, while a store builds
+    /// one from the `RouteSpec` it read. They have to agree, or an id the
+    /// console hands back could not be resolved by either store.
+    #[test]
+    fn the_console_and_the_stores_give_one_route_the_same_id() {
+        let spec: RouteSpec = toml::from_str(
+            "host_pattern = \"Console.Example.\"\npath_pattern = \"/api\"\n\
+             backends = [\"http://127.0.0.1:9091\", \"http://127.0.0.1:9090\"]\n",
+        )
+        .expect("the route parses");
+
+        let from_spec = route_id(&spec);
+
+        // What `routes_json` sees: the running Route `Route::try_from` built,
+        // whose host is already folded and whose pool keeps the URLs verbatim.
+        let route = crate::routes::Route::try_from(spec.clone()).expect("the route is valid");
+        let served: Vec<String> = route
+            .modes()
+            .iter()
+            .map(|mode| mode.name().to_string())
+            .collect();
+        let from_console = route_id_of_identity(&route_identity(
+            route.host_pattern(),
+            route.path_pattern(),
+            &served,
+            &spec.backends,
+        ));
+
+        assert_eq!(from_spec, from_console, "one route, one id");
+    }
 }

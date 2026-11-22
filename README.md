@@ -245,6 +245,7 @@ cargo run -p nexapipe -- secret   # only to move an identity between hosts
 mkdir -p config secrets logs
 cp config.toml.example config/config.toml   # config.toml is gitignored
 sudo chown -R 1000:1000 config secrets logs # the image runs as uid 1000
+cd ui-web && npm ci && npm run build && cd ..  # the console lands in ui-web/dist
 docker compose up -d --build
 # The example starts with 2FA on, so nothing can connect until a client is
 # enrolled. This one prints the expiring device invitation to scan.
@@ -278,9 +279,38 @@ the same mount, so the configuration and its counters are backed up together.
 on the Docker host are reachable. Moving an existing deployment over is one
 command: `mkdir -p config && mv config.toml config/config.toml`.
 
+The **console is mounted, not baked in**. `ui-web/dist` is built on the host
+and mounted read-only at `/app/console`. Add this to `config/config.toml`:
+
+```toml
+[admin]
+console_dir = "/app/console"
+listen_addr = "127.0.0.1:9090"
+```
+
+The listener binds only when `[admin] listen_addr` is set; `console_dir`
+alone leaves it closed. **Write the `[admin]` block before the first
+`docker compose up`**: that first start imports `config/config.toml` into
+`/app/config/nexapipe.db`, and after the import the instance reads the
+database, so adding `[admin]` to the TOML later does not turn the console on.
+On a deployment that has already started, stop it, remove
+`config/nexapipe.db` and start it again with the edited `config/config.toml`
+so the file is imported once more — that also discards the runtime counters
+and the admin token the database kept.
+
+Build the console **before** the first `docker compose up`: a `ui-web/dist`
+that does not exist yet is created as an empty directory by the container
+runtime, and the build then fails on the ownership.
+
+The console is served by the admin listener, which binds the **container's own
+loopback** — so it is answered from inside the container
+(`docker compose exec nexapipe wget -qO- http://127.0.0.1:9090/`) and not
+through a published port, which targets the container's outside. To open it in
+a browser on the host, forward the container's loopback into it.
+
 The image runs as **uid 1000, not root** — the proxy needs no privileges, and a
 server reachable from the internet holding the 2FA seeds and the endpoint
-identity should not be root. The three mounted directories therefore have to be
+identity should not be root. The three writable mounts therefore have to be
 writable by that uid, which is what the `chown` above is for: `mkdir` leaves
 them owned by whoever ran it, and that is uid 1000 only by coincidence.
 **Upgrading a deployment that ran the root image** needs the same command
@@ -1270,10 +1300,30 @@ listen_addr = "127.0.0.1:9090"
 console_dir = "/app/console"
 ```
 
+Outside a container, point `console_dir` at `ui-web/dist` itself;
+`/app/console` above is the read-only mount `docker-compose.yaml` gives the
+built bundle.
+
 The console shows what the instance is doing and lets you change the clients
-that may connect to it. It asks for the same admin token `nexapipe status`
-uses, and every request it makes has to be **addressed to a loopback host**:
-it manages this machine's instance and not one somewhere else.
+that may connect to it and the routes it serves. It asks for the same admin
+token `nexapipe status` uses, and every request it makes has to be
+**addressed to a loopback host**: it manages this machine's instance and not
+one somewhere else.
+
+A route it adds or removes goes through the store the server reads — the
+database beside the configuration, or the configuration file itself — so a
+running instance picks it up on its next reload, the same way a route written
+by hand is picked up. Each row of the route list carries an id, and a write
+or a removal names that id: two routes may share a host and a path when their
+modes or backends differ, and the id is what keeps them apart.
+
+It is written one route at a time, so the other routes and the comments
+around their own tables stay where the operator put them. The table being
+changed is a different matter: a removal takes that whole `[[routes]]` table
+with it, including the comment lines above its header, and a replacement
+keeps that table's own header and inline comments. A note about a different
+route that happens to sit above the changed table's header is therefore not
+kept — keep a note like that above the route it describes.
 
 Absent `console_dir`, the listener serves no page and no `/api/*` and is
 exactly what it was before — nothing to turn off, nothing to clean up.

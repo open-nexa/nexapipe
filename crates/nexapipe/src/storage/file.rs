@@ -23,7 +23,7 @@
 //! came from.
 
 use crate::auth::state::RuntimeState;
-use crate::config::ClientSecretWrite;
+use crate::config::{ClientSecretWrite, RouteSpec};
 
 use futures_util::future::BoxFuture;
 
@@ -36,7 +36,7 @@ use std::path::{Path, PathBuf};
 
 use zeroize::Zeroize;
 
-use super::{DeviceCredential, DeviceInfo, Stamp, Storage, StorageKind};
+use super::{DeviceCredential, DeviceInfo, RouteId, Stamp, Storage, StorageKind, route_name};
 
 use crate::toml_zeroize::zeroize_document;
 
@@ -442,6 +442,102 @@ impl FileStorage {
         })
     }
 
+    /// Writes one route.
+    ///
+    /// The route goes into the `[[routes]]` table as one more entry, unless
+    /// `replace` names the row this write edits or a route with the same
+    /// `route_name` is already there. Naming the identity as well as the
+    /// row is what keeps two routes that share a host and a path separate:
+    /// the console can add a passthrough route beside an HTTP one without
+    /// silently overwriting it.
+    ///
+    /// A replaced row keeps its place, the comment above its header and the
+    /// inline comments beside its values. A write of another route still
+    /// leaves every other `[[routes]]` table, and the comments around them,
+    /// exactly where the operator put them.
+    pub fn write_route(&self, route: &RouteSpec, replace: Option<RouteId>) -> anyhow::Result<()> {
+        let path = self.config_path.clone();
+        with_lock(&path, || {
+            let mut doc = read_document(&path, "route not written")?;
+
+            let routes = route_tables(doc.as_table_mut(), &path, true)?
+                .expect("a missing routes key was just created");
+            let name = route_name(
+                &route.host_pattern,
+                &route.path_pattern,
+                &route.mode,
+                &route.modes,
+                &route.backends,
+            );
+
+            // An id is the fingerprint of the row's identity, not its
+            // position: resolving it against the rows the lock just read is
+            // what keeps a stale id from landing on a different route.
+            let index = match replace {
+                Some(id) => match routes.iter().position(|table| {
+                    table_route_name(table)
+                        .is_some_and(|name| super::route_id_of_identity(&name) == id)
+                }) {
+                    Some(index) => Some(index),
+                    None => anyhow::bail!(
+                        "{}: there is no route with that id; the route was not written",
+                        path.display()
+                    ),
+                },
+                None => routes
+                    .iter()
+                    .position(|table| table_route_name(table).as_deref() == Some(name.as_str())),
+            };
+
+            let mut table = route_table(route)?;
+            match index {
+                Some(index) => {
+                    // The route that is replaced keeps its place: the order
+                    // the routes are in is the order the operator wrote them.
+                    let old = routes.get(index).expect("the index came from these routes");
+                    if let Some(position) = old.position() {
+                        table.set_position(Some(position));
+                    }
+                    carry_decor(&mut table, old);
+                    routes.replace(index, table);
+                }
+                None => routes.push(table),
+            }
+
+            write_document(&path, doc)
+        })
+    }
+
+    /// Drops the route `id` names.
+    ///
+    /// `false` when there is no route with that id: the store answered the
+    /// question rather than failing it, and the file is left untouched. The
+    /// id is the stable fingerprint the route list handed out, resolved
+    /// against the rows the lock just read, so it cannot land on a different
+    /// row after the table changed.
+    pub fn remove_route(&self, id: RouteId) -> anyhow::Result<bool> {
+        let path = self.config_path.clone();
+        with_lock(&path, || {
+            let mut doc = read_document(&path, "nothing removed")?;
+
+            // Looked for and not made: a removal that invented an empty
+            // `[[routes]]` to delete from would leave the file changed while
+            // reporting that nothing was removed.
+            let Some(routes) = route_tables(doc.as_table_mut(), &path, false)? else {
+                return Ok(false);
+            };
+            let Some(index) = routes.iter().position(|table| {
+                table_route_name(table).is_some_and(|name| super::route_id_of_identity(&name) == id)
+            }) else {
+                return Ok(false);
+            };
+            routes.remove(index);
+
+            write_document(&path, doc)?;
+            Ok(true)
+        })
+    }
+
     /// Writes the endpoint's private key into `[iroh]`.
     pub fn write_endpoint_key(&self, key: &SecretString) -> anyhow::Result<()> {
         let path = self.config_path.clone();
@@ -675,6 +771,23 @@ impl Storage for FileStorage {
         let this = self.clone();
         let client_id = client_id.to_string();
         Box::pin(async move { blocking(move || this.remove_client(&client_id)).await })
+    }
+
+    fn write_route<'a>(
+        &'a self,
+        route: &'a RouteSpec,
+        replace: Option<RouteId>,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        let this = self.clone();
+        // Owned, because the work runs on a blocking thread and outlives the
+        // borrow.
+        let route = route.clone();
+        Box::pin(async move { blocking(move || this.write_route(&route, replace)).await })
+    }
+
+    fn remove_route(&self, id: RouteId) -> BoxFuture<'_, anyhow::Result<bool>> {
+        let this = self.clone();
+        Box::pin(async move { blocking(move || this.remove_route(id)).await })
     }
 
     fn write_endpoint_key<'a>(
@@ -1023,6 +1136,163 @@ fn device_table<'a>(
             path.display()
         )
     })
+}
+
+/// The `[[routes]]` tables a write or a removal edits.
+///
+/// `create` says whether a configuration with no `routes` key should grow
+/// one: a write does (that is how the first route is added), a removal does
+/// not (a removal that found nothing must not leave the file changed).
+///
+/// The loader also accepts the routes as a value array — `routes = []` or
+/// `routes = [{ ... }]` — which `ArrayOfTables` cannot represent. Those
+/// spellings are folded into `[[routes]]`, keeping every entry and its
+/// comments, so a console write works on a file the loader already accepts.
+fn route_tables<'a>(
+    table: &'a mut toml_edit::Table,
+    path: &Path,
+    create: bool,
+) -> anyhow::Result<Option<&'a mut toml_edit::ArrayOfTables>> {
+    if !table.contains_key("routes") {
+        if !create {
+            return Ok(None);
+        }
+        table.insert(
+            "routes",
+            toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()),
+        );
+    }
+
+    if table
+        .get("routes")
+        .is_some_and(|item| item.as_array().is_some())
+    {
+        let Some(item) = table.remove("routes") else {
+            unreachable!("the key was just checked")
+        };
+        let decor = item
+            .as_value()
+            .map(|value| value.decor().clone())
+            .unwrap_or_default();
+        let toml_edit::Item::Value(toml_edit::Value::Array(values)) = item else {
+            unreachable!("the item was just checked")
+        };
+
+        let mut tables = toml_edit::ArrayOfTables::new();
+        for value in values.iter() {
+            let toml_edit::Value::InlineTable(inline) = value else {
+                anyhow::bail!(
+                    "{}: routes is not a table of routes, the route was not written",
+                    path.display()
+                );
+            };
+            let mut entry = toml_edit::Table::new();
+            for (key, value) in inline.iter() {
+                entry.insert(key, toml_edit::Item::Value(value.clone()));
+            }
+            if let Some(prefix) = value.decor().prefix() {
+                entry.decor_mut().set_prefix(prefix.clone());
+            }
+            tables.push(entry);
+        }
+        // The array's own prefix is the comment above the assignment; it
+        // belongs in front of the first `[[routes]]` header now.
+        if let (Some(prefix), Some(first)) = (decor.prefix(), tables.get_mut(0)) {
+            first.decor_mut().set_prefix(prefix.clone());
+        }
+        table.insert("routes", toml_edit::Item::ArrayOfTables(tables));
+    }
+
+    match table
+        .get_mut("routes")
+        .and_then(|item| item.as_array_of_tables_mut())
+    {
+        Some(routes) => Ok(Some(routes)),
+        None => anyhow::bail!(
+            "{}: routes is not a table of routes, the route was not written",
+            path.display()
+        ),
+    }
+}
+
+/// Keeps the comments the operator wrote on the route a write replaces.
+///
+/// The replacement is rendered from the new route, so without this the
+/// comment lines above `[[routes]]` and the inline comment after a value
+/// would be lost on every edit of that route.
+fn carry_decor(into: &mut toml_edit::Table, from: &toml_edit::Table) {
+    if let Some(prefix) = from.decor().prefix() {
+        into.decor_mut().set_prefix(prefix.clone());
+    }
+    for (key, item) in into.iter_mut() {
+        let Some(value) = item.as_value_mut() else {
+            continue;
+        };
+        let Some(old) = from.get(key.get()).and_then(|item| item.as_value()) else {
+            continue;
+        };
+        *value.decor_mut() = old.decor().clone();
+    }
+}
+
+/// The name a `[[routes]]` table has, read the way the schema reads it.
+///
+/// `None` when the table does not even have a host pattern, so a malformed
+/// entry is never mistaken for the route a write asked about.
+fn table_route_name(table: &toml_edit::Table) -> Option<String> {
+    let host = table.get("host_pattern")?.as_str()?;
+    let path = table
+        .get("path_pattern")
+        .and_then(|item| item.as_str())
+        .unwrap_or_default();
+    let mode = table
+        .get("mode")
+        .and_then(|item| item.as_str())
+        .map(str::to_string);
+    let modes: Option<Vec<String>> =
+        table
+            .get("modes")
+            .and_then(|item| item.as_array())
+            .map(|array| {
+                array
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(str::to_string)
+                    .collect()
+            });
+    let backends: Vec<String> = table
+        .get("backends")
+        .and_then(|item| item.as_array())
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Some(route_name(host, path, &mode, &modes, &backends))
+}
+
+/// The table a route is written as.
+///
+/// The route is rendered by the schema and read back, so the file and the
+/// configuration cannot disagree about what a route looks like: this module
+/// does not name a single key of a route, and a key the schema grows is a key
+/// this picks up without being told.
+fn route_table(route: &RouteSpec) -> anyhow::Result<toml_edit::Table> {
+    let text =
+        toml::to_string(route).map_err(|e| anyhow::anyhow!("the route does not write: {e}"))?;
+    let document: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e| anyhow::anyhow!("the route does not parse: {e}"))?;
+
+    let mut table = toml_edit::Table::new();
+    for (key, item) in document.as_table().iter() {
+        table.insert(key, item.clone());
+    }
+    Ok(table)
 }
 
 /// The entry a device's credential is stored as: whichever of the two it is —

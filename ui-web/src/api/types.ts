@@ -50,6 +50,14 @@ export interface RouteBackend {
 
 /** One route, as the instance is serving it right now. */
 export interface Route {
+  /**
+   * The stable id a write or a removal names this row by: the fingerprint of
+   * this row's identity. The instance answers with it, and the console hands
+   * it back unchanged: two routes may share a host and a path, and the id is
+   * what keeps them apart. It is not a position, so other rows changing does
+   * not change it.
+   */
+  id: string;
   host_pattern: string;
   path_pattern: string | null;
   modes: string[];
@@ -128,11 +136,20 @@ export interface ClientRequest {
   force?: boolean;
 }
 
-/** What a route write asks for. */
+/**
+ * What a route write asks for.
+ *
+ * The keys are the configuration's own: a route is written in the
+ * configuration's spelling, and the instance refuses a key that is not one of
+ * them. The priority is not among them — the server derives it from the host
+ * pattern — so the console does not offer it.
+ */
 export interface RouteRequest {
   host_pattern: string;
   path_pattern?: string | null;
   backends?: string[];
   modes?: string[];
-  priority?: number;
+  /** The stable id of the row this write replaces, when it is an edit of one
+   * the route list already shows. Absent means an add. */
+  replace?: string | null;
 }

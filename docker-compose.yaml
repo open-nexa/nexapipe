@@ -50,6 +50,20 @@ services:
       # Log files, written by the [log] section of config.toml.
       # `docker compose exec nexapipe tail -f /app/logs/nexapipe.log`
       - ./logs:/app/logs
+      # The browser console, built on the host and mounted read-only.
+      #
+      # It is a page the instance serves, so it is a directory of files rather
+      # than something baked into the image: `cd ui-web && npm ci && npm run
+      # build` puts it in `ui-web/dist`, and `[admin] console_dir =
+      # "/app/console"` points the instance at it. Build it **before** the first
+      # `docker compose up`: a missing `ui-web/dist` is created as an empty
+      # directory by the container runtime, and a build that then tries to
+      # write into it fails on the ownership.
+      #
+      # Read-only because the instance serves the console and never writes to
+      # it — and a console the container could rewrite is a console whose
+      # contents a compromised process could change.
+      - ./ui-web/dist:/app/console:ro
     # The image runs as uid 1000, not root, so all three mounts above must exist
     # and be writable by it. `mkdir` alone is not enough: the directories land
     # owned by whoever ran it, and on a host where that is not uid 1000 the

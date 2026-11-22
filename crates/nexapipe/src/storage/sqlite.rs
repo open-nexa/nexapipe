@@ -44,8 +44,10 @@
 //! store that reads a configuration and writes it back writes the same one.
 
 use crate::auth::state::RuntimeState;
-use crate::config::{AuthClient, AuthDevice, ClientSecretWrite, Config};
-use crate::storage::{DeviceCredential, DeviceInfo, Stamp, Storage, StorageKind};
+use crate::config::{AuthClient, AuthDevice, ClientSecretWrite, Config, RouteSpec};
+use crate::storage::{
+    DeviceCredential, DeviceInfo, RouteId, Stamp, Storage, StorageKind, route_name,
+};
 
 use futures_util::future::BoxFuture;
 
@@ -286,6 +288,125 @@ impl SqliteStorage {
         Ok(())
     }
 
+    /// Writes one route, and moves the revision on.
+    ///
+    /// The routes are one row each. A write either names the row it replaces
+    /// or looks one up by `route_name`, so two routes that share a host and
+    /// a path but differ in modes or backends stay two rows: the first match
+    /// is not necessarily the route the console selected.
+    ///
+    /// The row and the revision move in one transaction, so a reload that
+    /// sees one sees the other. A write of the whole configuration would take
+    /// a route somebody added while the server was running with it; this does
+    /// not.
+    async fn write_route(&self, route: &RouteSpec, replace: Option<RouteId>) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        // The settings row is the configuration without its routes. A store
+        // that holds none has no settings to write a route beside, and a route
+        // in a store with no configuration is a route nothing reads.
+        let settings: Option<String> = sqlx::query_scalar("SELECT json FROM settings WHERE id = 1")
+            .fetch_optional(&mut *tx)
+            .await?;
+        if settings.is_none() {
+            anyhow::bail!("the store holds no configuration; there is nothing to add a route to");
+        }
+
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT ordinal, json FROM routes ORDER BY ordinal")
+                .fetch_all(&mut *tx)
+                .await?;
+
+        let name = route_name(
+            &route.host_pattern,
+            &route.path_pattern,
+            &route.mode,
+            &route.modes,
+            &route.backends,
+        );
+        // Resolve the id against the rows this transaction read: it is the
+        // fingerprint of a row's identity, not a position, so an id from an
+        // older list cannot quietly name a different route.
+        let index = match replace {
+            Some(id) => match rows.iter().position(|(_, json)| {
+                serde_json::from_str::<RouteSpec>(json)
+                    .ok()
+                    .is_some_and(|route| crate::storage::route_id(&route) == id)
+            }) {
+                Some(index) => Some(index),
+                None => {
+                    anyhow::bail!("there is no route with that id; the route was not written")
+                }
+            },
+            None => rows.iter().position(|(_, json)| route_is(json, &name)),
+        };
+
+        let json = serde_json::to_string(route)?;
+        match index {
+            Some(index) => {
+                let ordinal = rows[index].0;
+                sqlx::query("UPDATE routes SET host_pattern = ?, json = ? WHERE ordinal = ?")
+                    .bind(&route.host_pattern)
+                    .bind(&json)
+                    .bind(ordinal)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            None => {
+                // One past the last ordinal, so the order the routes are read
+                // in is the order they were written in.
+                let ordinal = rows.last().map(|(ordinal, _)| ordinal + 1).unwrap_or(0);
+                sqlx::query("INSERT INTO routes (ordinal, host_pattern, json) VALUES (?, ?, ?)")
+                    .bind(ordinal)
+                    .bind(&route.host_pattern)
+                    .bind(&json)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+
+        Self::bump(&mut tx).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Drops the route `id` names, and says whether there was one to drop.
+    ///
+    /// The id is the stable fingerprint `GET /api/routes` answered with,
+    /// resolved against the rows this transaction read — so a stale id cannot
+    /// land on a different row. Deleting by host and path alone cannot
+    /// address two routes that share both. The revision moves with the write,
+    /// so the watcher reloads the configuration the route was dropped from.
+    async fn remove_route(&self, id: RouteId) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT ordinal, json FROM routes ORDER BY ordinal")
+                .fetch_all(&mut *tx)
+                .await?;
+
+        let Some(ordinal) = rows
+            .iter()
+            .find(|(_, json)| {
+                serde_json::from_str::<RouteSpec>(json)
+                    .ok()
+                    .is_some_and(|route| crate::storage::route_id(&route) == id)
+            })
+            .map(|(ordinal, _)| *ordinal)
+        else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+
+        sqlx::query("DELETE FROM routes WHERE ordinal = ?")
+            .bind(ordinal)
+            .execute(&mut *tx)
+            .await?;
+        Self::bump(&mut tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// The settings row, as the model holds it.
     async fn settings(&self) -> anyhow::Result<Option<Config>> {
         let row = sqlx::query("SELECT json FROM settings WHERE id = 1")
@@ -370,6 +491,23 @@ impl Rows {
 
         Ok(config)
     }
+}
+
+/// Whether a stored route has the name a write asked for.
+///
+/// Both operands are built by `route_name`, so a host folded by the routing
+/// table, a path with its default applied and the set of served modes compare
+/// the same way the file backend compares its `[[routes]]` tables.
+fn route_is(json: &str, name: &str) -> bool {
+    serde_json::from_str::<RouteSpec>(json).is_ok_and(|route| {
+        route_name(
+            &route.host_pattern,
+            &route.path_pattern,
+            &route.mode,
+            &route.modes,
+            &route.backends,
+        ) == name
+    })
 }
 
 /// The credential a device is issued, as the model holds one.
@@ -690,6 +828,19 @@ impl Storage for SqliteStorage {
             tx.commit().await?;
             Ok(())
         })
+    }
+
+    fn write_route<'a>(
+        &'a self,
+        route: &'a RouteSpec,
+        replace: Option<RouteId>,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
+        let route = route.clone();
+        Box::pin(async move { self.write_route(&route, replace).await })
+    }
+
+    fn remove_route(&self, id: RouteId) -> BoxFuture<'_, anyhow::Result<bool>> {
+        Box::pin(async move { self.remove_route(id).await })
     }
 
     fn write_endpoint_key<'a>(

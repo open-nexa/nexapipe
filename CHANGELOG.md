@@ -79,9 +79,22 @@ and its meaning.
   listener serves the page at `/` and answers its API at `/api/*`: what the
   instance is doing, the route table, the clients and the devices under them,
   the peers connected right now, and the health of the backends. It can issue
-  a client's credential and drop one.
+  a client's credential and drop one, and it can add a route and remove one.
+  A route it writes goes through the store the server reads — the database
+  beside the configuration, or the configuration file itself — one route at a
+  time, so a running instance picks it up on its next reload and the other
+  routes and the comments around their own tables are left alone. Each row
+  of the route list carries a stable id — the fingerprint of its host, path,
+  modes and backends — and a write or a removal names that id, so two routes
+  sharing a host and a path but differing in modes or backends stay
+  independently addressable, and an id read before another route was removed
+  still names the same one. The table being changed keeps its own header and
+  inline comments, but a removal takes that table with it.
   Absent `console_dir`, the listener serves no page and no `/api/*` and is
   exactly what it was before.
+  The container image does not carry the console: it is a directory the
+  operator builds and mounts, and `docker-compose.yaml` mounts `ui-web/dist`
+  read-only at `/app/console` for the `[admin] console_dir` that points at it.
   A request to the console's API is answered only when it was **addressed to a
   loopback host** (the DNS-rebinding guard), **carries the admin token** (the
   same one `nexapipe status` uses), and — for a write — **carries
