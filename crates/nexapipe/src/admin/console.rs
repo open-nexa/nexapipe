@@ -40,12 +40,12 @@
 //! has a rule, and a write that re-rendered the whole configuration would take
 //! a route somebody added while the server was running with it. The clients
 //! are entities in the storage seam and can be written one at a time, and so
-//! are the routes: a route is written by its host pattern and its path
-//! pattern, and everything else in the configuration is left exactly as the
-//! operator wrote it.
+//! are the routes: each is named by the id the route list handed out, so two
+//! routes that share a host and a path are still two routes, and everything
+//! else in the configuration is left exactly as the operator wrote it.
 
-use crate::config::{ClientSecretWrite, RouteSpec};
-use crate::storage::Storage;
+use crate::config::{ClientSecretWrite, RouteSpec, redact_credentials};
+use crate::storage::{RouteId, Storage};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
@@ -162,7 +162,6 @@ pub(super) async fn api_response(req: Request<Incoming>, state: Arc<AdminState>)
         ("DELETE", other) if other.starts_with("routes/") => {
             remove_route(
                 other.strip_prefix("routes/").unwrap_or_default(),
-                &query,
                 state,
                 &storage,
             )
@@ -283,6 +282,15 @@ struct ClientWrite {
 
 /// Adds a route, and answers with the route table.
 ///
+/// The reason an error response carries.
+///
+/// A backend may have credentials in it, and a validation error quotes the
+/// backend it refused. The validation layer already clears it; this is the
+/// second, API-side guard so no caller upstream can put one back.
+fn safe_reason(why: &anyhow::Error) -> String {
+    redact_credentials(&format!("{why:#}"))
+}
+
 /// The route goes into the store the server reads, so a running instance
 /// serves it after its next reload — the same way a route written into the
 /// configuration file by hand is picked up. The answer is the table the
@@ -312,9 +320,10 @@ async fn add_route(
         }
     };
 
+    let replace = request.replace;
     let spec = match request.into_spec() {
         Ok(spec) => spec,
-        Err(why) => return text(StatusCode::BAD_REQUEST, &format!("{why:#}")),
+        Err(why) => return text(StatusCode::BAD_REQUEST, &safe_reason(&why)),
     };
 
     // Validated the way a cold start validates it: a route the server would
@@ -322,46 +331,34 @@ async fn add_route(
     // the operator reads the reason instead of finding it in the log of the
     // next reload.
     if let Err(why) = crate::routes::Route::try_from(spec.clone()) {
-        return text(StatusCode::BAD_REQUEST, &format!("{why:#}"));
+        return text(StatusCode::BAD_REQUEST, &safe_reason(&why));
     }
 
-    if let Err(e) = storage.write_route(&spec).await {
-        return text(StatusCode::CONFLICT, &format!("{e:#}"));
+    if let Err(e) = storage.write_route(&spec, replace).await {
+        return text(StatusCode::CONFLICT, &safe_reason(&e));
     }
 
     json(&routes_json(&state.routes).await)
 }
 
-/// Removes a route, and answers with the route table.
+/// Removes the route at the id the list gave it, and answers with the table.
 ///
 /// A route that is not there is a question the store answered, not a failure:
 /// the answer says there was no such route, and the table is the one the
 /// instance is serving.
 async fn remove_route(
-    host_pattern: &str,
-    query: &str,
+    id: &str,
     state: Arc<AdminState>,
     storage: &Arc<dyn Storage>,
 ) -> Response<Body> {
-    let host_pattern = percent_decode(host_pattern).trim().to_string();
-    if host_pattern.is_empty() {
-        return text(StatusCode::BAD_REQUEST, "a host pattern is required");
-    }
-    let path_pattern = query
-        .split('&')
-        .filter_map(|pair| pair.split_once('='))
-        .find(|(key, _)| *key == "path_pattern")
-        .map(|(_, value)| percent_decode(value))
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| crate::config::DEFAULT_PATH_PATTERN.to_string());
+    let Ok(id) = id.trim().parse::<RouteId>() else {
+        return text(StatusCode::BAD_REQUEST, "a route id is required");
+    };
 
-    match storage.remove_route(&host_pattern, &path_pattern).await {
+    match storage.remove_route(id).await {
         Ok(true) => json(&routes_json(&state.routes).await),
-        Ok(false) => text(
-            StatusCode::NOT_FOUND,
-            "there is no route with that host pattern and path",
-        ),
-        Err(e) => text(StatusCode::CONFLICT, &format!("{e:#}")),
+        Ok(false) => text(StatusCode::NOT_FOUND, "there is no route with that id"),
+        Err(e) => text(StatusCode::CONFLICT, &safe_reason(&e)),
     }
 }
 
@@ -384,6 +381,12 @@ struct RouteWrite {
     /// The modes the route serves. Absent is the one the schema picks.
     #[serde(default)]
     modes: Option<Vec<String>>,
+    /// The row this write replaces, when it is an edit of a route the list
+    /// already shows. Absent, the store finds a route with the same name or
+    /// appends a new one — an add cannot silently overwrite a second route
+    /// that happens to share the host and the path.
+    #[serde(default)]
+    replace: Option<RouteId>,
 }
 
 impl RouteWrite {

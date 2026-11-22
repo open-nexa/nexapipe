@@ -133,14 +133,14 @@ test('a route the console adds asks the instance for it', async () => {
   assert.equal(requests[0].headers.get(WRITE_HEADER), '1');
 });
 
-test('a route the console removes is named by its host and its path', async () => {
+test('a route the console removes is named by the id the list gave it', async () => {
   consoleWithToken();
   answer = { status: 200, body: '{"routes":[]}' };
 
-  await removeRoute('console.example', '/api');
+  await removeRoute(3);
 
   assert.equal(requests.length, 1);
   assert.equal(requests[0].method, 'DELETE');
-  assert.equal(requests[0].path, '/api/routes/console.example?path_pattern=%2Fapi');
+  assert.equal(requests[0].path, '/api/routes/3');
   assert.equal(requests[0].headers.get(WRITE_HEADER), '1');
 });

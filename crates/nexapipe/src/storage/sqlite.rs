@@ -45,7 +45,9 @@
 
 use crate::auth::state::RuntimeState;
 use crate::config::{AuthClient, AuthDevice, ClientSecretWrite, Config, RouteSpec};
-use crate::storage::{DeviceCredential, DeviceInfo, Stamp, Storage, StorageKind};
+use crate::storage::{
+    DeviceCredential, DeviceInfo, RouteId, Stamp, Storage, StorageKind, route_name,
+};
 
 use futures_util::future::BoxFuture;
 
@@ -288,12 +290,16 @@ impl SqliteStorage {
 
     /// Writes one route, and moves the revision on.
     ///
-    /// The routes are one row each, and a route is named by its host pattern
-    /// and its path pattern — so the row that has that name is replaced and
-    /// the others are left alone. A write of the whole configuration would
-    /// take a route somebody added while the server was running with it; this
-    /// does not.
-    async fn write_route(&self, route: &RouteSpec) -> anyhow::Result<()> {
+    /// The routes are one row each. A write either names the row it replaces
+    /// or looks one up by `route_name`, so two routes that share a host and
+    /// a path but differ in modes or backends stay two rows: the first match
+    /// is not necessarily the route the console selected.
+    ///
+    /// The row and the revision move in one transaction, so a reload that
+    /// sees one sees the other. A write of the whole configuration would take
+    /// a route somebody added while the server was running with it; this does
+    /// not.
+    async fn write_route(&self, route: &RouteSpec, replace: Option<RouteId>) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
 
         // The settings row is the configuration without its routes. A store
@@ -311,17 +317,29 @@ impl SqliteStorage {
                 .fetch_all(&mut *tx)
                 .await?;
 
-        let json = serde_json::to_string(route)?;
-        let existing = rows
-            .iter()
-            .find(|(_, json)| route_is(json, &route.host_pattern, &route.path_pattern));
+        let name = route_name(
+            &route.host_pattern,
+            &route.path_pattern,
+            &route.mode,
+            &route.modes,
+            &route.backends,
+        );
+        let index = match replace {
+            Some(id) if id < rows.len() => Some(id),
+            Some(id) => {
+                anyhow::bail!("there is no route at position {id}; the route was not written")
+            }
+            None => rows.iter().position(|(_, json)| route_is(json, &name)),
+        };
 
-        match existing {
-            Some((ordinal, _)) => {
+        let json = serde_json::to_string(route)?;
+        match index {
+            Some(index) => {
+                let ordinal = rows[index].0;
                 sqlx::query("UPDATE routes SET host_pattern = ?, json = ? WHERE ordinal = ?")
                     .bind(&route.host_pattern)
                     .bind(&json)
-                    .bind(*ordinal)
+                    .bind(ordinal)
                     .execute(&mut *tx)
                     .await?;
             }
@@ -343,22 +361,21 @@ impl SqliteStorage {
         Ok(())
     }
 
-    /// Drops one route, and says whether there was one to drop.
+    /// Drops the route at `id`, and says whether there was one to drop.
     ///
-    /// The revision moves with the write, so the watcher reloads the
-    /// configuration the route was dropped from.
-    async fn remove_route(&self, host_pattern: &str, path_pattern: &str) -> anyhow::Result<bool> {
+    /// The id is a position in the ordered rows, the one `GET /api/routes`
+    /// answered with. Deleting by host and path alone cannot address two
+    /// routes that share both. The revision moves with the write, so the
+    /// watcher reloads the configuration the route was dropped from.
+    async fn remove_route(&self, id: RouteId) -> anyhow::Result<bool> {
         let mut tx = self.pool.begin().await?;
 
         let rows: Vec<(i64, String)> =
             sqlx::query_as("SELECT ordinal, json FROM routes ORDER BY ordinal")
                 .fetch_all(&mut *tx)
                 .await?;
-        let existing = rows
-            .iter()
-            .find(|(_, json)| route_is(json, host_pattern, path_pattern));
 
-        let Some((ordinal, _)) = existing else {
+        let Some((ordinal, _)) = rows.get(id) else {
             tx.rollback().await?;
             return Ok(false);
         };
@@ -458,17 +475,20 @@ impl Rows {
     }
 }
 
-/// Whether a stored route is the route with this name.
+/// Whether a stored route has the name a write asked for.
 ///
-/// The route is named by its host pattern and its path pattern, and the path
-/// is compared the way the schema reads it: a route written without a path
-/// and a route written with the path spelled out are the same route, and a
-/// store that thought otherwise would write a second one beside the first.
-fn route_is(json: &str, host_pattern: &str, path_pattern: &str) -> bool {
+/// Both operands are built by `route_name`, so a host folded by the routing
+/// table, a path with its default applied and the set of served modes compare
+/// the same way the file backend compares its `[[routes]]` tables.
+fn route_is(json: &str, name: &str) -> bool {
     serde_json::from_str::<RouteSpec>(json).is_ok_and(|route| {
-        route.host_pattern == host_pattern
-            && crate::config::route_path_pattern(&route.path_pattern)
-                == crate::config::route_path_pattern(path_pattern)
+        route_name(
+            &route.host_pattern,
+            &route.path_pattern,
+            &route.mode,
+            &route.modes,
+            &route.backends,
+        ) == name
     })
 }
 
@@ -792,17 +812,17 @@ impl Storage for SqliteStorage {
         })
     }
 
-    fn write_route<'a>(&'a self, route: &'a RouteSpec) -> BoxFuture<'a, anyhow::Result<()>> {
+    fn write_route<'a>(
+        &'a self,
+        route: &'a RouteSpec,
+        replace: Option<RouteId>,
+    ) -> BoxFuture<'a, anyhow::Result<()>> {
         let route = route.clone();
-        Box::pin(async move { self.write_route(&route).await })
+        Box::pin(async move { self.write_route(&route, replace).await })
     }
 
-    fn remove_route<'a>(
-        &'a self,
-        host_pattern: &'a str,
-        path_pattern: &'a str,
-    ) -> BoxFuture<'a, anyhow::Result<bool>> {
-        Box::pin(async move { self.remove_route(host_pattern, path_pattern).await })
+    fn remove_route(&self, id: RouteId) -> BoxFuture<'_, anyhow::Result<bool>> {
+        Box::pin(async move { self.remove_route(id).await })
     }
 
     fn write_endpoint_key<'a>(

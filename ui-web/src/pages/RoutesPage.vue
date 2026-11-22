@@ -51,10 +51,10 @@ async function submit(): Promise<void> {
   }
 }
 
-async function remove(host: string, path: string | null): Promise<void> {
+async function remove(id: number, host: string, path: string | null): Promise<void> {
   if (!window.confirm(t('routes.confirmRemove', { host, path: path ?? '/' }))) return;
   try {
-    await removeRoute(host, path);
+    await removeRoute(id);
     notice.value = t('routes.removed');
   } catch {
     // The store has the reason; the banner shows it.
@@ -89,7 +89,7 @@ async function remove(host: string, path: string | null): Promise<void> {
       </label>
       <label class="field">
         <span class="field__label">{{ t('routes.modesLabel') }}</span>
-        <input v-model="modes" class="field__input" spellcheck="false" placeholder="http, https" />
+        <input v-model="modes" class="field__input" spellcheck="false" placeholder="http, tcp" />
       </label>
       <div class="form__actions">
         <button class="button" type="submit">{{ t('routes.add') }}</button>
@@ -113,7 +113,7 @@ async function remove(host: string, path: string | null): Promise<void> {
         </tr>
       </thead>
       <tbody>
-        <tr v-for="route in routes" :key="`${route.host_pattern}${route.path_pattern ?? ''}`">
+        <tr v-for="route in routes" :key="route.id">
           <td class="mono">{{ route.host_pattern }}</td>
           <td class="mono">{{ route.path_pattern ?? t('common.dash') }}</td>
           <td>{{ route.modes.join(', ') || t('common.dash') }}</td>
@@ -131,7 +131,7 @@ async function remove(host: string, path: string | null): Promise<void> {
             <button
               class="button button--danger"
               type="button"
-              @click="remove(route.host_pattern, route.path_pattern)"
+              @click="remove(route.id, route.host_pattern, route.path_pattern)"
             >
               {{ t('routes.remove') }}
             </button>

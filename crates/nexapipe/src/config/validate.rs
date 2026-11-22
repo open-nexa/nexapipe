@@ -5,6 +5,40 @@
 
 use super::*;
 
+/// The spelling of a value that is safe to put in an error or a log line.
+///
+/// A backend may carry credentials — `ftp://alice:secret@example.test:21` —
+/// and a validation error that quoted it verbatim would print the password
+/// into a startup failure, a log line or an HTTP response. Whatever sits
+/// between `://` and the next `@` is replaced, without needing the URL to
+/// parse: an address that fails to parse is exactly the one most likely to
+/// be quoted in an error.
+pub fn redact_credentials(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find("://") {
+        let scheme_end = cursor + offset + 3;
+        // The authority ends where the path, the query, the fragment, a
+        // surrounding quote or a space begins; userinfo can only precede it.
+        let authority_end = text[scheme_end..]
+            .find(['/', '?', '#', ' ', '"'])
+            .map(|position| scheme_end + position)
+            .unwrap_or(text.len());
+        let authority = &text[scheme_end..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            out.push_str(&text[cursor..scheme_end]);
+            out.push_str("***@");
+            out.push_str(&text[scheme_end + at + 1..authority_end]);
+            cursor = authority_end;
+        } else {
+            out.push_str(&text[cursor..scheme_end]);
+            cursor = scheme_end;
+        }
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
 /// Reads the `strategy` key.
 ///
 /// **Refused rather than guessed.** A strategy the operator did not ask for is
@@ -105,6 +139,11 @@ pub(crate) fn push_mode(resolved: &mut Vec<RouteMode>, mode: RouteMode) {
 /// request to it cannot work and the operator would rather read about it here
 /// than in a 502.
 pub fn validate_backend(label: &str, mode: RouteMode, backend: &str) -> anyhow::Result<()> {
+    // The error messages quote the backend, and a backend may carry a
+    // password. The validation still reads the address as written; only the
+    // spelling that reaches a log or an error is cleared of credentials.
+    let shown = redact_credentials(backend);
+
     // Passthrough only needs a host and a port — the scheme carries no meaning
     // because those bytes are never interpreted — but it still has to name one.
     // Checked with the function the route will dial it with, so what starts is
@@ -114,7 +153,7 @@ pub fn validate_backend(label: &str, mode: RouteMode, backend: &str) -> anyhow::
         return match crate::passthrough::parse_backend_addr(backend) {
             Some((host, port)) if !host.is_empty() && port != 0 => Ok(()),
             _ => anyhow::bail!(
-                "{label}: backend \"{backend}\" is not an address a passthrough route can dial; \
+                "{label}: backend \"{shown}\" is not an address a passthrough route can dial; \
                  expected host:port, for example \"10.0.0.5:443\" or \"[::1]:443\""
             ),
         };
@@ -128,14 +167,14 @@ pub fn validate_backend(label: &str, mode: RouteMode, backend: &str) -> anyhow::
 
     let url = url::Url::parse(backend).map_err(|e| {
         anyhow::anyhow!(
-            "{label}: backend \"{backend}\" is not a URL ({e}); expected http://host:port"
+            "{label}: backend \"{shown}\" is not a URL ({e}); expected http://host:port"
         )
     })?;
 
     match url.scheme() {
         "http" | "https" => Ok(()),
         scheme => anyhow::bail!(
-            "{label}: backend \"{backend}\" uses {scheme}://, which is not a scheme this proxy can \
+            "{label}: backend \"{shown}\" uses {scheme}://, which is not a scheme this proxy can \
              fetch; expected http://host:port or https://host:port. A backend that serves TLS \
              only, with no plain listener beside it, belongs to a passthrough route."
         ),
@@ -151,6 +190,7 @@ pub fn validate_backend(label: &str, mode: RouteMode, backend: &str) -> anyhow::
 /// wrong for somebody. Failing at startup beats a tunnel that connects to the wrong
 /// service.
 pub(crate) fn validate_l4_backend(label: &str, backend: &str) -> anyhow::Result<()> {
+    let shown = redact_credentials(backend);
     let trimmed = backend.trim();
     if trimmed.is_empty() {
         anyhow::bail!("{label}: backend is empty; expected host:port");
@@ -158,17 +198,17 @@ pub(crate) fn validate_l4_backend(label: &str, backend: &str) -> anyhow::Result<
 
     let (host, port) = if trimmed.contains("://") {
         let url = url::Url::parse(trimmed).map_err(|e| {
-            anyhow::anyhow!("{label}: backend \"{backend}\" is not a URL ({e}); expected host:port")
+            anyhow::anyhow!("{label}: backend \"{shown}\" is not a URL ({e}); expected host:port")
         })?;
         let host = url.host_str().unwrap_or_default().to_string();
         if host.is_empty() {
-            anyhow::bail!("{label}: backend \"{backend}\" names no host; expected host:port");
+            anyhow::bail!("{label}: backend \"{shown}\" names no host; expected host:port");
         }
         // A special scheme (`http://`) fills in "/" for an empty path; a non-special one
         // (`tcp://`, `udp://`) leaves it empty. Both mean "no path".
         if !matches!(url.path(), "" | "/") {
             anyhow::bail!(
-                "{label}: backend \"{backend}\" has a path, but an L4 route dials an address \
+                "{label}: backend \"{shown}\" has a path, but an L4 route dials an address \
                  rather than fetching a URL; expected {host}:<port>"
             );
         }
@@ -191,7 +231,7 @@ pub(crate) fn validate_l4_backend(label: &str, backend: &str) -> anyhow::Result<
             Ok(())
         }
         None => anyhow::bail!(
-            "{label}: backend \"{backend}\" does not name a port. An L4 route dials its backend \
+            "{label}: backend \"{shown}\" does not name a port. An L4 route dials its backend \
              directly, so the port cannot be defaulted; write it as {host}:5432"
         ),
     }
@@ -235,4 +275,26 @@ pub(crate) fn validate_totp_parameters(
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacting_takes_the_userinfo_out_of_every_url() {
+        assert_eq!(
+            redact_credentials("ftp://alice:s3cr3t@example.test:21"),
+            "ftp://***@example.test:21"
+        );
+        assert_eq!(
+            redact_credentials("backend \"https://user:pass@a.test/x?y=1\" and http://b.test:8080"),
+            "backend \"https://***@a.test/x?y=1\" and http://b.test:8080"
+        );
+        assert_eq!(
+            redact_credentials("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080",
+            "an address with no credentials is unchanged"
+        );
+    }
 }

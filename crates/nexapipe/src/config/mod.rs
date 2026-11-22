@@ -35,7 +35,8 @@ pub use schema::{
     get_backend_protocol, route_path_pattern,
 };
 pub use validate::{
-    get_route_mode, get_route_modes, get_strategy, parse_route_mode, validate_backend,
+    get_route_mode, get_route_modes, get_strategy, parse_route_mode, redact_credentials,
+    validate_backend,
 };
 
 #[cfg(test)]

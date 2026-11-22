@@ -1290,6 +1290,10 @@ listen_addr = "127.0.0.1:9090"
 console_dir = "/app/console"
 ```
 
+Outside a container, point `console_dir` at `ui-web/dist` itself;
+`/app/console` above is the read-only mount `docker-compose.yaml` gives the
+built bundle.
+
 The console shows what the instance is doing and lets you change the clients
 that may connect to it and the routes it serves. It asks for the same admin
 token `nexapipe status` uses, and every request it makes has to be
@@ -1299,9 +1303,17 @@ one somewhere else.
 A route it adds or removes goes through the store the server reads — the
 database beside the configuration, or the configuration file itself — so a
 running instance picks it up on its next reload, the same way a route written
-by hand is picked up. It is written one route at a time: a write that
-re-rendered the whole configuration would take every other route, and every
-comment beside it, with it.
+by hand is picked up. Each row of the route list carries an id, and a write
+or a removal names that id: two routes may share a host and a path when their
+modes or backends differ, and the id is what keeps them apart.
+
+It is written one route at a time, so the other routes and the comments
+around their own tables stay where the operator put them. The table being
+changed is a different matter: a removal takes that whole `[[routes]]` table
+with it, including the comment lines above its header, and a replacement
+keeps that table's own header and inline comments. A note about a different
+route that happens to sit above the changed table's header is therefore not
+kept — keep a note like that above the route it describes.
 
 Absent `console_dir`, the listener serves no page and no `/api/*` and is
 exactly what it was before — nothing to turn off, nothing to clean up.

@@ -82,8 +82,12 @@ and its meaning.
   a client's credential and drop one, and it can add a route and remove one.
   A route it writes goes through the store the server reads — the database
   beside the configuration, or the configuration file itself — one route at a
-  time, so a running instance picks it up on its next reload and the routes
-  and the comments beside them are left alone.
+  time, so a running instance picks it up on its next reload and the other
+  routes and the comments around their own tables are left alone. Each row
+  of the route list carries an id, and a write or a removal names that id, so
+  two routes sharing a host and a path but differing in modes or backends
+  stay independently addressable. The table being changed keeps its own
+  header and inline comments, but a removal takes that table with it.
   Absent `console_dir`, the listener serves no page and no `/api/*` and is
   exactly what it was before.
   The container image does not carry the console: it is a directory the

@@ -606,7 +606,7 @@ async fn a_route_written_to_a_store_is_read_back() {
     let store = store(&dir);
 
     store
-        .write_route(&route())
+        .write_route(&route(), None)
         .await
         .expect("the route is written");
 
@@ -638,11 +638,11 @@ async fn a_route_written_twice_is_one_route() {
     let store = store(&dir);
 
     store
-        .write_route(&route())
+        .write_route(&route(), None)
         .await
         .expect("the route is written");
     store
-        .write_route(&route())
+        .write_route(&route(), None)
         .await
         .expect("the route is written again");
 
@@ -663,13 +663,10 @@ async fn a_route_dropped_from_a_store_is_gone() {
     let store = store(&dir);
 
     store
-        .write_route(&route())
+        .write_route(&route(), None)
         .await
         .expect("the route is written");
-    let dropped = store
-        .remove_route("console.example", "/api")
-        .await
-        .expect("the route is dropped");
+    let dropped = store.remove_route(0).await.expect("the route is dropped");
     assert!(dropped, "there was a route to drop");
 
     let config = configuration(&store).await;
@@ -682,15 +679,12 @@ async fn a_route_dropped_from_a_store_is_gone() {
     );
 
     // A route that is not there is an answer, not a failure.
-    let again = store
-        .remove_route("console.example", "/api")
-        .await
-        .expect("the store answers");
+    let again = store.remove_route(0).await.expect("the store answers");
     assert!(!again, "there was no route to drop the second time");
 }
 
-/// Two routes on the same host are two routes: the path is part of the name,
-/// so dropping one of them leaves the other one alone.
+/// Two routes on the same host are two routes: their paths differ, and each
+/// has its own id in the list, so dropping one leaves the other one alone.
 #[tokio::test]
 async fn two_routes_on_one_host_are_dropped_one_at_a_time() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -705,16 +699,16 @@ async fn two_routes_on_one_host_are_dropped_one_at_a_time() {
         "host_pattern = \"console.example\"\npath_pattern = \"/static\"\nbackends = [\"http://127.0.0.1:9091\"]\n",
     )
     .expect("the route parses");
-    store.write_route(&api).await.expect("the route is written");
     store
-        .write_route(&static_files)
+        .write_route(&api, None)
+        .await
+        .expect("the route is written");
+    store
+        .write_route(&static_files, None)
         .await
         .expect("the route is written");
 
-    let dropped = store
-        .remove_route("console.example", "/api")
-        .await
-        .expect("the route is dropped");
+    let dropped = store.remove_route(0).await.expect("the route is dropped");
     assert!(dropped, "there was a route to drop");
 
     let config = configuration(&store).await;
@@ -727,5 +721,224 @@ async fn two_routes_on_one_host_are_dropped_one_at_a_time() {
     assert_eq!(
         routes[0].path_pattern, "/static",
         "and it is the one that was not dropped"
+    );
+}
+
+/// A configuration written verbatim, for the cases a `[[routes]]` table has
+/// to be spelled by hand.
+fn seed_text(dir: &tempfile::TempDir, text: &str) {
+    std::fs::write(dir.path().join("config.toml"), text).expect("the configuration is written");
+}
+
+/// Two routes that share a host and a path but not their modes are two rows:
+/// writing the second one does not replace the first, and an edit or a drop
+/// that names an id lands on exactly the row the console selected.
+#[tokio::test]
+async fn routes_sharing_host_and_path_are_addressed_by_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    seed(&dir);
+    let store = store(&dir);
+
+    let http: RouteSpec =
+        toml::from_str("host_pattern = \"app.example\"\nbackends = [\"http://127.0.0.1:8080\"]\n")
+            .expect("the route parses");
+    let passthrough: RouteSpec = toml::from_str(
+        "host_pattern = \"app.example\"\nmode = \"passthrough\"\nbackends = [\"10.0.0.5:443\"]\n",
+    )
+    .expect("the route parses");
+
+    store
+        .write_route(&http, None)
+        .await
+        .expect("the route is written");
+    store
+        .write_route(&passthrough, None)
+        .await
+        .expect("the second route is written");
+
+    let routes = configuration(&store).await.routes.unwrap_or_default();
+    assert_eq!(
+        routes.len(),
+        2,
+        "the second route was added beside the first: {routes:?}"
+    );
+
+    // An edit names the row it replaces: changing the passthrough route
+    // cannot take the HTTP route with it.
+    let edited: RouteSpec = toml::from_str(
+        "host_pattern = \"app.example\"\nmode = \"passthrough\"\nbackends = [\"10.0.0.9:443\"]\n",
+    )
+    .expect("the route parses");
+    store
+        .write_route(&edited, Some(1))
+        .await
+        .expect("the route is edited");
+    let routes = configuration(&store).await.routes.unwrap_or_default();
+    assert_eq!(routes.len(), 2, "the edit did not add a third: {routes:?}");
+    assert_eq!(
+        routes[0].backends[0], "http://127.0.0.1:8080",
+        "the HTTP route is untouched: {routes:?}"
+    );
+    assert_eq!(
+        routes[1].backends[0], "10.0.0.9:443",
+        "the passthrough route is the one that changed: {routes:?}"
+    );
+
+    // Removing by id is just as precise.
+    let dropped = store.remove_route(1).await.expect("the route is dropped");
+    assert!(dropped, "there was a route at that id");
+    let routes = configuration(&store).await.routes.unwrap_or_default();
+    assert_eq!(routes.len(), 1, "only the named row went: {routes:?}");
+    assert_eq!(
+        routes[0].backends[0], "http://127.0.0.1:8080",
+        "and it was the passthrough one: {routes:?}"
+    );
+}
+
+/// A replaced `[[routes]]` table keeps the comment above its header and the
+/// inline comments beside its values.
+#[tokio::test]
+async fn replacing_a_route_keeps_the_comments_on_it() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    seed_text(
+        &dir,
+        "\
+[auth]
+enabled = true
+
+# The operator's note about this route.
+[[routes]]
+host_pattern = \"console.example\" # the host, inline
+path_pattern = \"/api\"
+backends = [\"http://127.0.0.1:9090\"] # until we move it
+",
+    );
+    let store = store(&dir);
+
+    let edited: RouteSpec = toml::from_str(
+        "host_pattern = \"console.example\"\npath_pattern = \"/api\"\nbackends = [\"http://127.0.0.1:9091\"]\n",
+    )
+    .expect("the route parses");
+    store
+        .write_route(&edited, None)
+        .await
+        .expect("the route is written");
+
+    let file = std::fs::read_to_string(dir.path().join("config.toml")).expect("the file is read");
+    assert!(
+        file.contains("The operator's note about this route."),
+        "the header comment survived: {file}"
+    );
+    assert!(
+        file.contains("# the host, inline"),
+        "the inline host comment survived: {file}"
+    );
+    assert!(
+        file.contains("# until we move it"),
+        "the inline backend comment survived: {file}"
+    );
+    assert!(file.contains("9091"), "the new backend is written: {file}");
+}
+
+/// The loader accepts `routes = []` and an inline array of routes; a write
+/// has to work on those spellings too, keeping the routes already there.
+#[tokio::test]
+async fn a_route_is_written_into_a_value_array_configuration() {
+    for (label, text) in [
+        ("empty", "routes = []\n\n[auth]\nenabled = true\n"),
+        (
+            "inline",
+            "routes = [{ host_pattern = \"old.example\", backends = [\"http://127.0.0.1:8080\"] }]\n\n[auth]\nenabled = true\n",
+        ),
+    ] {
+        let dir = tempfile::tempdir().expect("temp dir");
+        seed_text(&dir, text);
+        let store = store(&dir);
+
+        store
+            .write_route(&route(), None)
+            .await
+            .unwrap_or_else(|e| panic!("{label}: the route is written: {e:#}"));
+
+        let routes = configuration(&store).await.routes.unwrap_or_default();
+        assert!(
+            routes
+                .iter()
+                .any(|route| route.host_pattern == "console.example"),
+            "{label}: the new route is there: {routes:?}"
+        );
+        if label == "inline" {
+            assert!(
+                routes
+                    .iter()
+                    .any(|route| route.host_pattern == "old.example"),
+                "the route that was there before survived: {routes:?}"
+            );
+        }
+    }
+}
+
+/// The console displays the folded host, so a write has to find a route the
+/// operator spelled with capitals and a trailing dot.
+#[tokio::test]
+async fn a_route_is_found_by_the_host_the_console_displays() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    seed_text(
+        &dir,
+        "\
+[auth]
+enabled = true
+
+[[routes]]
+host_pattern = \"Console.Example.\"
+backends = [\"http://127.0.0.1:8080\"]
+",
+    );
+    let store = store(&dir);
+
+    let displayed: RouteSpec = toml::from_str(
+        "host_pattern = \"console.example\"\nbackends = [\"http://127.0.0.1:8080\"]\n",
+    )
+    .expect("the route parses");
+    store
+        .write_route(&displayed, None)
+        .await
+        .expect("the route is written");
+
+    let routes = configuration(&store).await.routes.unwrap_or_default();
+    assert_eq!(
+        routes.len(),
+        1,
+        "the folded spelling matched the stored one rather than adding a second route: {routes:?}"
+    );
+}
+
+/// A write that has nothing to write into, or a `routes` value that is not a
+/// table of routes, is refused and leaves the file alone.
+#[tokio::test]
+async fn a_rejected_route_write_changes_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    let store = store(&dir);
+
+    assert!(
+        store.write_route(&route(), None).await.is_err(),
+        "there is no configuration to add a route to"
+    );
+    assert!(
+        !path.exists(),
+        "the write did not invent a configuration file"
+    );
+
+    let text = "routes = 3\n\n[auth]\nenabled = true\n";
+    seed_text(&dir, text);
+    assert!(
+        store.write_route(&route(), None).await.is_err(),
+        "an invalid routes shape is refused"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).expect("the file is read"),
+        text,
+        "the file is unchanged"
     );
 }

@@ -72,6 +72,62 @@ use nexapipe_proto::secret::SecretString;
 use std::path::Path;
 use std::time::SystemTime;
 
+/// A route's place in the store's list of routes.
+///
+/// `GET /api/routes` answers with one of these beside each row, and a write or
+/// a removal names the row it means by handing it back. It is a position, not
+/// a value kept in the configuration: a route has no name of its own that
+/// would survive being moved, and the position is unambiguous for as long
+/// as the table the console is looking at is the table it is changing.
+pub type RouteId = usize;
+
+/// The name both stores agree a route has.
+///
+/// A route is **not** named by its host pattern and path pattern alone. The
+/// schema lets two entries share both when their modes or their backends
+/// differ — an HTTP route and a passthrough route on `app.example` and `/`,
+/// say — and a store that called those one route would replace or drop the
+/// first match whenever the console asked for the second one.
+///
+/// The host is folded the way the routing table folds it, so an operator's
+/// `Console.Example.` and the `console.example` the console displays are the
+/// same route. The path is compared with its default applied, and the modes
+/// as the set the server will actually serve, so `mode = "http"`,
+/// `modes = ["http"]` and no mode at all all name one route. Backends are
+/// compared as a set because their order is not part of what a route is.
+pub(crate) fn route_name(
+    host_pattern: &str,
+    path_pattern: &str,
+    mode: &Option<String>,
+    modes: &Option<Vec<String>>,
+    backends: &[String],
+) -> String {
+    let host = crate::routes::normalize_pattern(host_pattern);
+    let path = crate::config::route_path_pattern(path_pattern);
+
+    let mut served: Vec<String> = match crate::config::get_route_modes(mode, modes) {
+        Ok(resolved) => resolved
+            .iter()
+            .map(|mode| mode.name().to_string())
+            .collect(),
+        // A mode neither side can read is not one it can match. Keep the raw
+        // spellings so the comparison is still well defined, and let the
+        // startup validation be the thing that refuses such a config.
+        Err(_) => mode.iter().chain(modes.iter().flatten()).cloned().collect(),
+    };
+    served.sort_unstable();
+    served.dedup();
+
+    let mut backends = backends.to_vec();
+    backends.sort_unstable();
+
+    format!(
+        "{host}\0{path}\0{}\0{}",
+        served.join(","),
+        backends.join("\0")
+    )
+}
+
 /// What a store is, for the log line that says which one is in use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageKind {
@@ -411,28 +467,37 @@ pub trait Storage: Send + Sync + 'static {
     /// whole configuration. So a route somebody added by hand, and the comments
     /// they wrote beside it, are not taken away by a write of another route.
     ///
-    /// A route is named by its host pattern and its path pattern: two routes
-    /// with the same host and the same path are the same route, and writing
-    /// one of them replaces the other rather than adding a second one beside
-    /// it. The path is compared the way the schema reads it, so a route that
-    /// does not name a path and one that names it `/` are the same route.
+    /// A route is named by `route_name`: its host pattern, its path
+    /// pattern, the modes it serves and the backends it points at. Two routes
+    /// may share a host and a path when their modes or backends differ, and a
+    /// store that called those one route would replace or drop the wrong one.
+    ///
+    /// `replace` names the row this write replaces, as the [`RouteId`]
+    /// `GET /api/routes` handed out. A write that names none looks for a
+    /// route with the same name and replaces it, or appends a new one when
+    /// there is none — so writing the same route twice is one route, while
+    /// writing a second route on the same host and path is two.
     ///
     /// The route is written as it is given: a store does not second-guess the
     /// backends or the modes, because the caller has already had them
     /// validated by the same code a cold start validates them with.
-    fn write_route<'a>(&'a self, route: &'a RouteSpec) -> BoxFuture<'a, anyhow::Result<()>>;
+    fn write_route<'a>(
+        &'a self,
+        route: &'a RouteSpec,
+        replace: Option<RouteId>,
+    ) -> BoxFuture<'a, anyhow::Result<()>>;
 
-    /// Drops one route, and says whether there was one to drop.
+    /// Drops the route at `id`, and says whether there was one to drop.
+    ///
+    /// The id is the one `GET /api/routes` answered with. Deleting by host
+    /// and path alone cannot address two routes that share both, and the
+    /// first match is not necessarily the one the console selected.
     ///
     /// `false` is an answer, not a failure: a route that is not there is a
     /// question the caller asked and the store answered. The two backends
     /// answer it the same way, so the console does not have to know which one
     /// it is talking to.
-    fn remove_route<'a>(
-        &'a self,
-        host_pattern: &'a str,
-        path_pattern: &'a str,
-    ) -> BoxFuture<'a, anyhow::Result<bool>>;
+    fn remove_route(&self, id: RouteId) -> BoxFuture<'_, anyhow::Result<bool>>;
 
     /// Writes the endpoint's private key.
     ///

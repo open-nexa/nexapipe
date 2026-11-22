@@ -536,6 +536,17 @@ async fn configuration(store: &SqliteStorage) -> Config {
     Config::from_toml_text(text.expose_secret()).expect("the configuration parses")
 }
 
+/// The id the route list gives the route with this host and path.
+async fn route_id(store: &SqliteStorage, host: &str, path: &str) -> usize {
+    configuration(store)
+        .await
+        .routes
+        .unwrap_or_default()
+        .iter()
+        .position(|route| route.host_pattern == host && route.path_pattern == path)
+        .expect("the route is in the store")
+}
+
 /// A route written into the store is in the configuration it hands back, and
 /// the revision moves with the write — a watcher comparing stamps sees it.
 #[tokio::test]
@@ -549,7 +560,7 @@ async fn a_route_written_into_the_store_is_read_back() {
 
     let before = store.stamp().await.expect("the store answers");
     store
-        .write_route(&route())
+        .write_route(&route(), None)
         .await
         .expect("the route is written");
     let after = store.stamp().await.expect("the store answers");
@@ -584,11 +595,11 @@ async fn a_route_written_twice_is_one_route() {
         .expect("the configuration is written");
 
     store
-        .write_route(&route())
+        .write_route(&route(), None)
         .await
         .expect("the route is written");
     store
-        .write_route(&route())
+        .write_route(&route(), None)
         .await
         .expect("the route is written again");
 
@@ -612,15 +623,13 @@ async fn a_route_dropped_from_the_store_is_gone() {
         .await
         .expect("the configuration is written");
     store
-        .write_route(&route())
+        .write_route(&route(), None)
         .await
         .expect("the route is written");
 
     let before = store.stamp().await.expect("the store answers");
-    let dropped = store
-        .remove_route("console.example", "/api")
-        .await
-        .expect("the route is dropped");
+    let id = route_id(&store, "console.example", "/api").await;
+    let dropped = store.remove_route(id).await.expect("the route is dropped");
     assert!(dropped, "there was a route to drop");
     let after = store.stamp().await.expect("the store answers");
     assert_ne!(after, before, "the drop moved the revision");
@@ -634,10 +643,152 @@ async fn a_route_dropped_from_the_store_is_gone() {
         "the route is gone: {routes:?}"
     );
 
-    // A route that is not there is an answer, not a failure.
-    let again = store
-        .remove_route("console.example", "/api")
-        .await
-        .expect("the store answers");
+    // A route that is not there is an answer, not a failure. The same id is
+    // past the end of the list now that the row is gone.
+    let again = store.remove_route(id).await.expect("the store answers");
     assert!(!again, "there was no route to drop the second time");
+}
+
+/// A write into a store that holds no configuration is refused, and neither
+/// the revision nor the contents move.
+#[tokio::test]
+async fn a_route_write_into_an_uninitialised_store_changes_nothing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (store, _) = store(&dir).await;
+
+    let before = store.stamp().await.expect("the store answers");
+    assert!(
+        store.write_route(&route(), None).await.is_err(),
+        "there is no configuration to add a route to"
+    );
+    assert_eq!(
+        store.stamp().await.expect("the store answers"),
+        before,
+        "the revision did not move"
+    );
+    assert!(
+        store.config().await.expect("the store answers").is_none(),
+        "no configuration was invented"
+    );
+}
+
+/// A failure after the row has been mutated rolls the whole write back: the
+/// route and the revision stay as they were, so a watcher never sees a half
+/// write.
+#[tokio::test]
+async fn a_failed_route_write_rolls_back_the_row_and_the_revision() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (store, path) = store(&dir).await;
+    store
+        .put_config(&Config::from_toml_text(CONFIG).expect("the configuration parses"))
+        .await
+        .expect("the configuration is written");
+    store
+        .write_route(&route(), None)
+        .await
+        .expect("the route is written");
+    let id = route_id(&store, "console.example", "/api").await;
+
+    // An AFTER UPDATE trigger fails the mutation itself, after the store has
+    // opened its transaction: the only way out is the rollback `?` takes.
+    let pool = sqlx::SqlitePool::connect_with(
+        sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5)),
+    )
+    .await
+    .expect("the second connection opens");
+    sqlx::query(
+        "CREATE TRIGGER fail_route_write AFTER UPDATE ON routes \
+         BEGIN SELECT RAISE(FAIL, 'injected failure'); END;",
+    )
+    .execute(&pool)
+    .await
+    .expect("the trigger is installed");
+
+    let before = store.stamp().await.expect("the store answers");
+    let edited: RouteSpec = toml::from_str(
+        "host_pattern = \"console.example\"\npath_pattern = \"/api\"\nbackends = [\"http://127.0.0.1:9099\"]\n",
+    )
+    .expect("the route parses");
+    assert!(
+        store.write_route(&edited, Some(id)).await.is_err(),
+        "the mutation failed"
+    );
+
+    assert_eq!(
+        store.stamp().await.expect("the store answers"),
+        before,
+        "the revision did not move with a failed write"
+    );
+    let routes = configuration(&store).await.routes.unwrap_or_default();
+    let written = routes
+        .iter()
+        .find(|route| route.host_pattern == "console.example")
+        .expect("the route is still there");
+    assert_eq!(
+        written.backends[0], "http://127.0.0.1:9090",
+        "the row was not left half-written: {routes:?}"
+    );
+
+    sqlx::query("DROP TRIGGER fail_route_write")
+        .execute(&pool)
+        .await
+        .expect("the trigger is removed");
+    pool.close().await;
+}
+
+/// Two routes that share a host and a path but not their modes are two rows,
+/// and removing one by id leaves the other one alone.
+#[tokio::test]
+async fn routes_sharing_host_and_path_are_addressed_by_id() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let (store, _) = store(&dir).await;
+    store
+        .put_config(&Config::from_toml_text(CONFIG).expect("the configuration parses"))
+        .await
+        .expect("the configuration is written");
+
+    let http: RouteSpec =
+        toml::from_str("host_pattern = \"app.example\"\nbackends = [\"http://127.0.0.1:8080\"]\n")
+            .expect("the route parses");
+    let passthrough: RouteSpec = toml::from_str(
+        "host_pattern = \"app.example\"\nmode = \"passthrough\"\nbackends = [\"10.0.0.5:443\"]\n",
+    )
+    .expect("the route parses");
+    store
+        .write_route(&http, None)
+        .await
+        .expect("the HTTP route is written");
+    store
+        .write_route(&passthrough, None)
+        .await
+        .expect("the passthrough route is written");
+
+    let routes = configuration(&store).await.routes.unwrap_or_default();
+    assert_eq!(
+        routes.len(),
+        4,
+        "CONFIG holds two, and the two new ones are distinct rows: {routes:?}"
+    );
+
+    let passthrough_id = routes
+        .iter()
+        .position(|route| route.mode.as_deref() == Some("passthrough"))
+        .expect("the passthrough row is there");
+    let dropped = store
+        .remove_route(passthrough_id)
+        .await
+        .expect("the route is dropped");
+    assert!(dropped, "there was a route at that id");
+
+    let routes = configuration(&store).await.routes.unwrap_or_default();
+    assert_eq!(routes.len(), 3, "only the named row went: {routes:?}");
+    assert!(
+        routes
+            .iter()
+            .any(|route| route.host_pattern == "app.example" && route.mode.is_none()),
+        "the HTTP row is still there: {routes:?}"
+    );
 }

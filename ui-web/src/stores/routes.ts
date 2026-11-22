@@ -45,22 +45,15 @@ export async function addRoute(request: RouteRequest): Promise<void> {
 }
 
 /**
- * Removes a route.
+ * Removes the route the list named by `id`.
  *
- * The route is named by its host pattern and its path pattern, which is how
- * the instance knows it: two routes on the same host are two routes, and
- * removing one of them leaves the other one alone.
+ * The id is the row's place in the table the console is showing. Two routes
+ * may share a host and a path when their modes or backends differ, and the
+ * id is what lets the instance remove exactly the row that was selected.
  */
-export async function removeRoute(
-  hostPattern: string,
-  pathPattern: string | null,
-): Promise<void> {
+export async function removeRoute(id: number): Promise<void> {
   try {
-    const answer = await apiWrite<RoutesAnswer>(
-      `${API.routes}/${encodeURIComponent(hostPattern)}` +
-        `?path_pattern=${encodeURIComponent(pathPattern ?? '/')}`,
-      'DELETE',
-    );
+    const answer = await apiWrite<RoutesAnswer>(`${API.routes}/${id}`, 'DELETE');
     routes.value = answer.routes ?? [];
     error.value = null;
   } catch (cause) {

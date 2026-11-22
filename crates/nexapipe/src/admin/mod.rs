@@ -342,10 +342,14 @@ pub(super) async fn status_json(state: &Arc<AdminState>) -> serde_json::Value {
 }
 
 /// `GET /v1/routes`: the table as it is now, including what a reload changed.
+///
+/// Each row carries the `RouteId` a write or a removal names it by. The id
+/// is the row's place in this table, which is the order the configuration
+/// holds its routes in and the order the store reads them back in.
 pub(super) async fn routes_json(routes: &Arc<RoutingTable>) -> serde_json::Value {
     let mut out = Vec::new();
 
-    for route in routes.routes().await {
+    for (id, route) in routes.routes().await.into_iter().enumerate() {
         let modes: Vec<&str> = route.modes().iter().map(|mode| mode.name()).collect();
         let backends: Vec<serde_json::Value> = route
             .backend_pool()
@@ -356,6 +360,7 @@ pub(super) async fn routes_json(routes: &Arc<RoutingTable>) -> serde_json::Value
             .collect();
 
         out.push(serde_json::json!({
+            "id": id,
             "host_pattern": route.host_pattern(),
             "path_pattern": route.path_pattern(),
             "modes": modes,

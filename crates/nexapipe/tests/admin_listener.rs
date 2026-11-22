@@ -509,10 +509,12 @@ mod console {
             reply.body
         );
 
+        // The route list hands out an id with each row; the one just written
+        // is the first and only row in this store.
         let reply = ask(
             &admin,
             "DELETE",
-            "/api/routes/console.example",
+            "/api/routes/0",
             Some(TOKEN),
             "localhost",
             true,
@@ -549,7 +551,7 @@ mod console {
         let reply = ask(
             &admin,
             "DELETE",
-            "/api/routes/nowhere.example",
+            "/api/routes/7",
             Some(TOKEN),
             "localhost",
             true,
@@ -599,6 +601,48 @@ mod console {
         )
         .await;
         assert_eq!(reply.status, 400, "the route was refused: {}", reply.body);
+
+        let stored = stored(&config).await;
+        assert!(
+            stored.routes.unwrap_or_default().is_empty(),
+            "nothing was written"
+        );
+        admin.stop();
+    }
+
+    /// A validation error that quotes a backend with credentials quotes the
+    /// backend without the credentials: the reason never becomes a place the
+    /// password is written down.
+    #[tokio::test]
+    async fn a_validation_error_does_not_echo_backend_credentials() {
+        let bundle = bundle();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let config = config_file(&dir);
+        let admin =
+            spawn_admin_with_console(Vec::new(), Some(TOKEN), Some(console(&bundle, &config)))
+                .await;
+
+        let reply = ask(
+            &admin,
+            "POST",
+            "/api/routes",
+            Some(TOKEN),
+            "localhost",
+            true,
+            r#"{"host_pattern":"console.example","backends":["ftp://alice:s3cr3t@example.test:21"]}"#,
+        )
+        .await;
+        assert_eq!(reply.status, 400, "the backend was refused: {}", reply.body);
+        assert!(
+            !reply.body.contains("s3cr3t"),
+            "the password is not in the reason: {}",
+            reply.body
+        );
+        assert!(
+            reply.body.contains("***@"),
+            "the reason still names the backend it refused: {}",
+            reply.body
+        );
 
         let stored = stored(&config).await;
         assert!(
@@ -902,6 +946,10 @@ async fn routes_are_listed_with_their_modes_and_backends() {
     let body: serde_json::Value = serde_json::from_str(&reply.body).expect("valid JSON");
     let routes = body["routes"].as_array().expect("a routes array");
     assert_eq!(routes.len(), 1, "{body}");
+    assert_eq!(
+        routes[0]["id"], 0,
+        "each row names the id a write addresses: {body}"
+    );
     assert_eq!(routes[0]["host_pattern"], "app.test");
     assert_eq!(routes[0]["modes"][0], "http");
     assert_eq!(routes[0]["health_checked"], true);

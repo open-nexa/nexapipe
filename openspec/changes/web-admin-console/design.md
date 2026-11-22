@@ -93,6 +93,8 @@ The five reads the instance already answers, and the two writes:
 
 The clients are already entities in the `Storage` trait: `write_client_secret`, `write_device_credential`, `remove_client`, `remove_device`. The routes are not — the trait has no way to write one — so it grows `write_route` and `remove_route`.
 
+**A route is addressed by the id the route list gives it.** The schema permits two entries with the same host and path when their modes or backends differ, so a name made of host and path alone cannot say which one a removal or an edit means. `GET /api/routes` puts an id on each row, and both stores resolve it to exactly that row.
+
 **Why through the seam:** the server reads the configuration through the seam, so a change the console makes has to be a change the seam can see. A write that went around the trait would be a write the server's watcher does not know about, and the console would show a change the instance has not made.
 
 **Why the trait grows rather than the console rewriting the configuration:** a write that re-rendered the whole configuration would take a route somebody added while the server was running with it — the reason the SQLite store writes by entity in the first place.
