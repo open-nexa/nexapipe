@@ -40,7 +40,7 @@
 
 ## 6. Shipping and verification
 
-- [ ] 6.1 Copy `ui-web/dist` into the container image and point `[admin] console_dir` at it, and verify the image serves the console and that an image without the console still starts
+- [ ] 6.1 Mount `ui-web/dist` into the container at `/app/console` — read-only, and built on the host rather than baked into the image — and point `[admin] console_dir` at it, and verify the container serves the console and that a deployment without a console still starts
 - [x] 6.2 Run `cargo fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings` and `cargo test --workspace --locked`, and verify they pass
 - [x] 6.3 Document the console in `README.md` and `README.zh-CN.md` — what it is, how to turn it on, and that it is served from the loopback listener — and verify the documented configuration is the one the binary accepts
 - [x] 6.4 Note the console in `CHANGELOG.md`, and verify the note says which release it arrives in

@@ -245,6 +245,7 @@ cargo run -p nexapipe -- secret   # only to move an identity between hosts
 mkdir -p config secrets logs
 cp config.toml.example config/config.toml   # config.toml is gitignored
 sudo chown -R 1000:1000 config secrets logs # the image runs as uid 1000
+cd ui-web && npm ci && npm run build && cd ..  # the console lands in ui-web/dist
 docker compose up -d --build
 # The example starts with 2FA on, so nothing can connect until a client is
 # enrolled. This one prints the expiring device invitation to scan.
@@ -278,9 +279,28 @@ the same mount, so the configuration and its counters are backed up together.
 on the Docker host are reachable. Moving an existing deployment over is one
 command: `mkdir -p config && mv config.toml config/config.toml`.
 
+The **console is mounted, not baked in**. `ui-web/dist` is built on the host
+and mounted read-only at `/app/console`, and one line in
+`config/config.toml` turns it on:
+
+```toml
+[admin]
+console_dir = "/app/console"
+```
+
+Build the console **before** the first `docker compose up`: a `ui-web/dist`
+that does not exist yet is created as an empty directory by the container
+runtime, and the build then fails on the ownership.
+
+The console is served by the admin listener, which binds the **container's own
+loopback** — so it is answered from inside the container
+(`docker compose exec nexapipe wget -qO- http://127.0.0.1:9090/`) and not
+through a published port, which targets the container's outside. To open it in
+a browser on the host, forward the container's loopback into it.
+
 The image runs as **uid 1000, not root** — the proxy needs no privileges, and a
 server reachable from the internet holding the 2FA seeds and the endpoint
-identity should not be root. The three mounted directories therefore have to be
+identity should not be root. The three writable mounts therefore have to be
 writable by that uid, which is what the `chown` above is for: `mkdir` leaves
 them owned by whoever ran it, and that is uid 1000 only by coincidence.
 **Upgrading a deployment that ran the root image** needs the same command

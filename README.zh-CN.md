@@ -215,6 +215,7 @@ cargo run -p nexapipe -- secret
 mkdir -p config secrets logs
 cp config.toml.example config/config.toml   # config.toml 已被 gitignore
 sudo chown -R 1000:1000 config secrets logs # 镜像以 uid 1000 运行
+cd ui-web && npm ci && npm run build && cd ..  # 控制台落在 ui-web/dist
 docker compose up -d --build
 # 示例出厂即开启 2FA，所以在 enrolled 一个客户端之前没有任何连接能进来。
 # 这一条会打印可扫描的邀请链接。
@@ -242,8 +243,23 @@ logs 卷。`secrets/` 挂载配合 `NEXAPIPE_IROH_SECRET_KEY_FILE=/app/secrets/i
 已配置好，因此运行在 Docker 宿主机上的后端可以被访问到。已有部署迁移过来只需一条：
 `mkdir -p config && mv config.toml config/config.toml`。
 
+**控制台是挂载进去的，不是烤进镜像的。** `ui-web/dist` 在宿主机上构建，然后只读挂载
+到 `/app/console`；在 `config/config.toml` 里加一行就能打开它：
+
+```toml
+[admin]
+console_dir = "/app/console"
+```
+
+请在**第一次** `docker compose up` **之前**构建控制台：还不存在的 `ui-web/dist` 会被
+容器运行时建成一个空目录，之后的构建就会因为属主而失败。控制台由 admin 监听器提供，
+而它绑定的是**容器自己的 loopback** —— 因此要从容器内部访问
+（`docker compose exec nexapipe wget -qO- http://127.0.0.1:9090/`），发布端口是到不了
+它的（发布端口指向的是容器的外部）。要在宿主机的浏览器里打开它，需要把容器的
+loopback 转发出来。
+
 镜像以 **uid 1000 运行，不是 root** —— 这个代理不需要特权，而一个从公网可达、
-手里握着 2FA 种子和端点身份的服务器不该是 root。上面挂载的三个目录因此必须对该
+手里握着 2FA 种子和端点身份的服务器不该是 root。上面挂载的三个可写目录因此必须对该
 uid 可写，这正是上面那条 `chown` 的作用：`mkdir` 建出的目录属于执行它的用户，恰好是
 uid 1000 只是巧合。**从旧的 root 镜像升级**也要在首次启动前执行同一条命令，而且必须
 加 `sudo` —— 旧镜像写下的文件属于 root：

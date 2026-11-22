@@ -101,7 +101,9 @@ The clients are already entities in the `Storage` trait: `write_client_secret`, 
 
 ### The bundle ships beside the binary
 
-The container image copies `ui-web/dist` into the image and the configuration points `[admin] console_dir` at it. The release scripts do the same for the packages they build.
+The bundle is a directory of files, and it is **mounted** rather than copied into the image: `ui-web/dist` is built on the host, mounted read-only at `/app/console`, and the configuration points `[admin] console_dir` at it.
+
+**Why mounted and not copied in:** the image would otherwise carry a node toolchain to build a bundle that changes with every commit, and the build context would carry the console's `node_modules` — tens of megabytes the image has no use for. Mounted, the image is the same image whether or not a console is wanted, the bundle is rebuilt with `npm run build` rather than with the release, and a deployment that does not configure `console_dir` serves no console.
 
 **Why not embed:** see above — an npm build inside every cargo build.
 
@@ -110,6 +112,6 @@ The container image copies `ui-web/dist` into the image and the configuration po
 - **The token sits in the browser's local storage.** → Any script running on the console's origin could read it. The console serves nothing but itself, loads nothing from another origin, and is sent a content security policy that says so; the loopback listener is the only origin it has.
 - **A write from another local process is possible with the token.** → The token is the same authority `nexapipe status` already has, and the token file's permissions are the perimeter, exactly as they are today. A process that cannot read the token file cannot write.
 - **The console and the command line can write at the same time.** → The stores already take a lock per write and move a revision with it; the console's writes go through the same methods the command line uses, so they serialize the same way.
-- **The bundle has to be built and shipped.** → A build step in the image and in the release scripts, and a configuration key that points at the result. A deployment that does not configure `console_dir` serves no console, and nothing else changes.
+- **The bundle has to be built and shipped.** → A build step on the host and a mount into the container, and a configuration key that points at the result. A deployment that does not configure `console_dir` serves no console, and nothing else changes.
 - **The console can only manage an instance on this machine.** → That is the listener's own rule, and the design keeps it rather than widening it.
 - **The routes a console writes have to survive the configuration model.** → The console writes the same route type the configuration file holds, so a route written in the console and a route written in the file are the same thing.

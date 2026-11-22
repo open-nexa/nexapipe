@@ -86,6 +86,9 @@ and its meaning.
   and the comments beside them are left alone.
   Absent `console_dir`, the listener serves no page and no `/api/*` and is
   exactly what it was before.
+  The container image does not carry the console: it is a directory the
+  operator builds and mounts, and `docker-compose.yaml` mounts `ui-web/dist`
+  read-only at `/app/console` for the `[admin] console_dir` that points at it.
   A request to the console's API is answered only when it was **addressed to a
   loopback host** (the DNS-rebinding guard), **carries the admin token** (the
   same one `nexapipe status` uses), and — for a write — **carries
